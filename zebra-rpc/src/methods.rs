@@ -198,6 +198,35 @@ pub trait Rpc {
         address_strings: GetAddressBalanceRequest,
     ) -> Result<GetAddressBalanceResponse>;
 
+    /// Returns the total number of addresses with balances in the finalized state.
+    ///
+    /// method: post
+    /// tags: address
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    #[method(name = "getaddresscount")]
+    async fn get_address_count(&self) -> Result<GetAddressCountResponse>;
+
+    /// Returns the top N addresses by balance in the finalized state.
+    ///
+    /// method: post
+    /// tags: address
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: (number, optional, default=10) Maximum number of addresses to return
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    #[method(name = "gettopaddresses")]
+    async fn get_top_addresses(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetTopAddressesResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1078,6 +1107,52 @@ where
                 Ok(GetAddressBalanceResponse {
                     balance: u64::from(balance),
                     received,
+                })
+            }
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+    }
+
+    async fn get_address_count(&self) -> Result<GetAddressCountResponse> {
+        let request = zebra_state::ReadRequest::AddressCount;
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .map_misc_error()?;
+
+        match response {
+            zebra_state::ReadResponse::AddressCount { count } => {
+                Ok(GetAddressCountResponse { count })
+            }
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+    }
+
+    async fn get_top_addresses(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetTopAddressesResponse> {
+        let limit = limit.unwrap_or(10);
+        let request = zebra_state::ReadRequest::TopAddressesByBalance { limit };
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .map_misc_error()?;
+
+        match response {
+            zebra_state::ReadResponse::TopAddressesByBalance { addresses } => {
+                Ok(GetTopAddressesResponse {
+                    addresses: addresses
+                        .into_iter()
+                        .map(|(address, balance)| TopAddress {
+                            address: address.to_string(),
+                            balance: u64::from(balance),
+                        })
+                        .collect(),
                 })
             }
             _ => unreachable!("Unexpected response from state service: {response:?}"),
@@ -3366,6 +3441,57 @@ pub struct GetAddressBalanceResponse {
 
 #[deprecated(note = "Use `GetAddressBalanceResponse` instead.")]
 pub use self::GetAddressBalanceResponse as AddressBalance;
+
+/// Response to [`RpcServer::get_address_count`] RPC method.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetAddressCountResponse {
+    /// The total number of addresses with balances.
+    pub count: usize,
+}
+
+/// A single address with its balance for [`GetTopAddressesResponse`].
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct TopAddress {
+    /// The address string.
+    pub address: String,
+    /// The balance in zatoshis.
+    pub balance: u64,
+}
+
+/// Response to [`RpcServer::get_top_addresses`] RPC method.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetTopAddressesResponse {
+    /// List of top addresses with their balances, sorted by balance descending.
+    pub addresses: Vec<TopAddress>,
+}
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Getters, new)]

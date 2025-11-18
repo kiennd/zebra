@@ -125,6 +125,92 @@ paths:
                   error:
                     type: string
                     default: Invalid parameters
+  /getaddresscount:
+    post:
+      tags:
+      - address
+      description: |-
+        Returns the total number of addresses with balances in the finalized state.
+
+        **Warning:** This operation scans the entire balance column family and may be slow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method:
+                  type: string
+                  default: getaddresscount
+                id:
+                  type: string
+                  default: addressCountId
+                params:
+                  type: array
+                  items: {}
+                  default: '[]'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    default: '{"count":0}'
+  /gettopaddresses:
+    post:
+      tags:
+      - address
+      description: |-
+        Returns the top N addresses by balance in the finalized state.
+
+        **Request body `params` arguments:**
+
+        - `limit` - (number, optional, default=10) Maximum number of addresses to return
+
+        **Warning:** This operation scans the entire balance column family and may be slow.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method:
+                  type: string
+                  default: gettopaddresses
+                id:
+                  type: string
+                  default: topAddressesId
+                params:
+                  type: array
+                  items: {}
+                  default: '[10]'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    default: '{"addresses":[{"address":"tmYXBYJj1K7vhejSec5osXK2QsGa5MTisUQ","balance":0}]}'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    default: Invalid parameters
   /sendrawtransaction:
     post:
       tags:

@@ -398,6 +398,18 @@ pub enum ReadResponse {
         received: u64,
     },
 
+    /// Response to [`ReadRequest::AddressCount`] with the total number of addresses.
+    AddressCount {
+        /// The total number of addresses with balances.
+        count: usize,
+    },
+
+    /// Response to [`ReadRequest::TopAddressesByBalance`] with the top addresses by balance.
+    TopAddressesByBalance {
+        /// List of addresses with their balances, sorted by balance descending.
+        addresses: Vec<(transparent::Address, Amount<NonNegative>)>,
+    },
+
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]
     /// with the obtained transaction ids, in the order they appear in blocks.
     AddressesTransactionIds(BTreeMap<TransactionLocation, transaction::Hash>),
@@ -523,6 +535,8 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::SaplingSubtrees(_)
             | ReadResponse::OrchardSubtrees(_)
             | ReadResponse::AddressBalance { .. }
+            | ReadResponse::AddressCount { .. }
+            | ReadResponse::TopAddressesByBalance { .. }
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)

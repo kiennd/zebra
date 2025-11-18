@@ -1933,6 +1933,44 @@ impl Service<ReadRequest> for ReadStateService {
                 .wait_for_panics()
             }
 
+            // For the get_address_count RPC.
+            ReadRequest::AddressCount => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let count = state.db.address_count();
+
+                        // The work is done in the future.
+                        timer.finish(module_path!(), line!(), "ReadRequest::AddressCount");
+
+                        Ok(ReadResponse::AddressCount { count })
+                    })
+                })
+                .wait_for_panics()
+            }
+
+            // For the get_top_addresses RPC.
+            ReadRequest::TopAddressesByBalance { limit } => {
+                let state = self.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        let addresses = state.db.top_addresses_by_balance(limit);
+
+                        // The work is done in the future.
+                        timer.finish(
+                            module_path!(),
+                            line!(),
+                            "ReadRequest::TopAddressesByBalance",
+                        );
+
+                        Ok(ReadResponse::TopAddressesByBalance { addresses })
+                    })
+                })
+                .wait_for_panics()
+            }
+
             // For the get_address_tx_ids RPC.
             ReadRequest::TransactionIdsByAddresses {
                 addresses,

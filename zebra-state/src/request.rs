@@ -1258,6 +1258,23 @@ pub enum ReadRequest {
     /// balance of the set of addresses.
     AddressBalance(HashSet<transparent::Address>),
 
+    /// Returns the total number of addresses with balances in the finalized state.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    AddressCount,
+
+    /// Returns the top N addresses by balance in the finalized state.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    TopAddressesByBalance {
+        /// Maximum number of addresses to return.
+        limit: usize,
+    },
+
     /// Looks up transaction hashes that were sent or received from addresses,
     /// in an inclusive blockchain height range.
     ///
@@ -1368,6 +1385,8 @@ impl ReadRequest {
             ReadRequest::SaplingSubtrees { .. } => "sapling_subtrees",
             ReadRequest::OrchardSubtrees { .. } => "orchard_subtrees",
             ReadRequest::AddressBalance { .. } => "address_balance",
+            ReadRequest::AddressCount => "address_count",
+            ReadRequest::TopAddressesByBalance { .. } => "top_addresses_by_balance",
             ReadRequest::TransactionIdsByAddresses { .. } => "transaction_ids_by_addresses",
             ReadRequest::UtxosByAddresses(_) => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {

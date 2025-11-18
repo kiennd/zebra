@@ -376,6 +376,57 @@ impl ZebraDb {
             .collect()
     }
 
+    /// Returns the total number of addresses with balances in the finalized state.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    pub fn address_count(&self) -> usize {
+        let balance_by_transparent_addr = self.address_balance_cf();
+        self.db
+            .zs_forward_range_iter(&balance_by_transparent_addr, ..)
+            .count()
+    }
+
+    /// Returns the top N addresses by balance in the finalized state.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: Maximum number of addresses to return
+    pub fn top_addresses_by_balance(
+        &self,
+        limit: usize,
+    ) -> Vec<(transparent::Address, Amount<NonNegative>)> {
+        let balance_by_transparent_addr = self.address_balance_cf();
+
+        let mut addresses_with_balances: Vec<(transparent::Address, Amount<NonNegative>)> = self
+            .db
+            .zs_forward_range_iter(&balance_by_transparent_addr, ..)
+            .filter_map(|(address, balance_location): (transparent::Address, AddressBalanceLocation)| {
+                let balance = balance_location.balance();
+                if balance > Amount::zero() {
+                    Some((address, balance))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by balance descending
+        addresses_with_balances.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Take top N
+        addresses_with_balances.truncate(limit);
+
+        addresses_with_balances
+    }
+
     /// Returns the transaction IDs that sent or received funds to `addresses`,
     /// in the finalized chain `query_height_range`.
     ///
