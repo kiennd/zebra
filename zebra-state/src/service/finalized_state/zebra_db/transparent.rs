@@ -385,7 +385,7 @@ impl ZebraDb {
     pub fn address_count(&self) -> usize {
         let balance_by_transparent_addr = self.address_balance_cf();
         self.db
-            .zs_forward_range_iter(&balance_by_transparent_addr, ..)
+            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
             .count()
     }
 
@@ -407,10 +407,10 @@ impl ZebraDb {
 
         let mut addresses_with_balances: Vec<(transparent::Address, Amount<NonNegative>)> = self
             .db
-            .zs_forward_range_iter(&balance_by_transparent_addr, ..)
+            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
             .filter_map(|(address, balance_location): (transparent::Address, AddressBalanceLocation)| {
                 let balance = balance_location.balance();
-                if balance > Amount::zero() {
+                if balance > Amount::<NonNegative>::zero() {
                     Some((address, balance))
                 } else {
                     None
