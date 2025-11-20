@@ -1275,6 +1275,16 @@ pub enum ReadRequest {
         limit: usize,
     },
 
+    /// Returns holder count snapshots stored in the database.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire holder count column family and may be slow.
+    HolderCountSnapshots {
+        /// Maximum number of snapshots to return.
+        limit: usize,
+    },
+
     /// Looks up transaction hashes that were sent or received from addresses,
     /// in an inclusive blockchain height range.
     ///
@@ -1387,6 +1397,7 @@ impl ReadRequest {
             ReadRequest::AddressBalance { .. } => "address_balance",
             ReadRequest::AddressCount => "address_count",
             ReadRequest::TopAddressesByBalance { .. } => "top_addresses_by_balance",
+            ReadRequest::HolderCountSnapshots { .. } => "holder_count_snapshots",
             ReadRequest::TransactionIdsByAddresses { .. } => "transaction_ids_by_addresses",
             ReadRequest::UtxosByAddresses(_) => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {

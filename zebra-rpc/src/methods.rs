@@ -227,6 +227,27 @@ pub trait Rpc {
         limit: Option<usize>,
     ) -> Result<GetTopAddressesResponse>;
 
+    /// Returns holder count snapshots stored in the database.
+    ///
+    /// method: post
+    /// tags: address
+    ///
+    /// Returns a list of (height, holder_count) pairs for blocks where
+    /// the height is divisible by 1000, sorted by height.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire holder count column family and may be slow.
+    #[method(name = "getholdercountsnapshots")]
+    async fn get_holder_count_snapshots(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetHolderCountSnapshotsResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1151,6 +1172,35 @@ where
                         .map(|(address, balance)| TopAddress {
                             address: address.to_string(),
                             balance: u64::from(balance),
+                        })
+                        .collect(),
+                })
+            }
+            _ => unreachable!("Unexpected response from state service: {response:?}"),
+        }
+    }
+
+    async fn get_holder_count_snapshots(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetHolderCountSnapshotsResponse> {
+        let limit = limit.unwrap_or(100);
+        let request = zebra_state::ReadRequest::HolderCountSnapshots { limit };
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(request)
+            .await
+            .map_misc_error()?;
+
+        match response {
+            zebra_state::ReadResponse::HolderCountSnapshots { snapshots } => {
+                Ok(GetHolderCountSnapshotsResponse {
+                    snapshots: snapshots
+                        .into_iter()
+                        .map(|(height, count)| HolderCountSnapshot {
+                            height: height.0,
+                            holder_count: count,
                         })
                         .collect(),
                 })
@@ -3491,6 +3541,42 @@ pub struct TopAddress {
 pub struct GetTopAddressesResponse {
     /// List of top addresses with their balances, sorted by balance descending.
     pub addresses: Vec<TopAddress>,
+}
+
+/// A single holder count snapshot entry.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct HolderCountSnapshot {
+    /// The block height at which this snapshot was taken.
+    #[getter(copy)]
+    pub height: u32,
+    /// The number of holders (addresses with non-zero balances) at this height.
+    #[getter(copy)]
+    pub holder_count: u64,
+}
+
+/// Response to [`RpcServer::get_holder_count_snapshots`] RPC method.
+#[derive(
+    Clone,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetHolderCountSnapshotsResponse {
+    /// List of holder count snapshots, sorted by height.
+    pub snapshots: Vec<HolderCountSnapshot>,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.

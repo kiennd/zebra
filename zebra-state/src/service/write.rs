@@ -291,9 +291,15 @@ impl WriteBlockWorkerTask {
             {
                 Ok((finalized, note_commitment_trees)) => {
                     let tip_block = ChainTipBlock::from(finalized);
+                    let block_height = tip_block.height;
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
 
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
+
+                    // Store holder count snapshot when block height is divisible by 1000
+                    if block_height.0 % 1000 == 0 {
+                        store_holder_count_snapshot(&finalized_state.db, block_height);
+                    }
 
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
@@ -452,6 +458,25 @@ impl WriteBlockWorkerTask {
         finalized_state.db.shutdown(true);
         std::mem::drop(self.finalized_state);
     }
+}
+
+/// Store holder count snapshot when block height is divisible by 1000.
+///
+/// This operation scans the entire balance column family and may be slow,
+/// so it runs in a background blocking task to avoid blocking block commits.
+/// Uses `tokio::task::spawn_blocking` which uses a thread pool for CPU-intensive work.
+fn store_holder_count_snapshot(db: &ZebraDb, height: Height) {
+    // Store the snapshot in a blocking task to avoid blocking the async runtime
+    let db_clone = db.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = db_clone.store_holder_count_snapshot(height) {
+            tracing::warn!(
+                ?height,
+                error = ?e,
+                "failed to store holder count snapshot to RocksDB"
+            );
+        }
+    });
 }
 
 /// Log a message if this block was mined by Zebra.

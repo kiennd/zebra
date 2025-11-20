@@ -1951,6 +1951,19 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // For the get_top_addresses RPC.
+            ReadRequest::HolderCountSnapshots { limit } => {
+                let timer = CodeTimer::start();
+                let state = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        // Use efficient reverse iteration to get only the last N snapshots
+                        let snapshots = state.db.recent_holder_count_snapshots(limit);
+                        timer.finish(module_path!(), line!(), "ReadRequest::HolderCountSnapshots");
+                        Ok(ReadResponse::HolderCountSnapshots { snapshots })
+                    })
+                })
+                .wait_for_panics()
+            }
             ReadRequest::TopAddressesByBalance { limit } => {
                 let state = self.clone();
 

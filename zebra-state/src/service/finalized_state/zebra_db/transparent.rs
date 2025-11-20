@@ -54,6 +54,28 @@ pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 /// The name of the [`BALANCE_BY_TRANSPARENT_ADDR`] column family's merge operator
 pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_received";
 
+/// The name of the holder count by block height column family.
+pub const HOLDER_COUNT_BY_HEIGHT: &str = "holder_count_by_height";
+
+/// Holder count stored in RocksDB (8 bytes, u64).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct HolderCount(u64);
+
+impl IntoDisk for HolderCount {
+    type Bytes = [u8; 8];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        self.0.to_be_bytes()
+    }
+}
+
+impl FromDisk for HolderCount {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let array: [u8; 8] = bytes.as_ref().try_into().expect("holder count must be 8 bytes");
+        HolderCount(u64::from_be_bytes(array))
+    }
+}
+
 /// A RocksDB merge operator for the [`BALANCE_BY_TRANSPARENT_ADDR`] column family.
 pub fn fetch_add_balance_and_received(
     _: &[u8],
@@ -104,6 +126,11 @@ impl ZebraDb {
     /// Returns a handle to the `balance_by_transparent_addr` RocksDB column family.
     pub fn address_balance_cf(&self) -> &ColumnFamily {
         self.db.cf_handle(BALANCE_BY_TRANSPARENT_ADDR).unwrap()
+    }
+
+    /// Returns a handle to the `holder_count_by_height` RocksDB column family.
+    pub fn holder_count_by_height_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(HOLDER_COUNT_BY_HEIGHT).unwrap()
     }
 
     /// Returns the [`AddressBalanceLocation`] for a [`transparent::Address`],
@@ -387,6 +414,100 @@ impl ZebraDb {
         self.db
             .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
             .count()
+    }
+
+    /// Returns the number of holders (addresses with non-zero balances) in the finalized state.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    pub fn holder_count(&self) -> usize {
+        let balance_by_transparent_addr = self.address_balance_cf();
+        self.db
+            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
+            .filter(|(_address, balance_location): &(transparent::Address, AddressBalanceLocation)| {
+                balance_location.balance() > Amount::<NonNegative>::zero()
+            })
+            .count()
+    }
+
+    /// Stores the holder count (number of addresses with balances) to RocksDB at the given block height.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    ///
+    /// # Parameters
+    ///
+    /// - `height`: The block height at which this snapshot is taken
+    pub fn store_holder_count_snapshot(
+        &self,
+        height: Height,
+    ) -> Result<(), BoxError> {
+        // Count holders (addresses with non-zero balances)
+        let holder_count = self.holder_count();
+
+        // Store in RocksDB using a write batch
+        let holder_count_cf = self.holder_count_by_height_cf();
+        let mut batch = DiskWriteBatch::new();
+        
+        // Store holder count
+        let holder_count_value = HolderCount(holder_count as u64);
+        batch.zs_insert(holder_count_cf, &height, &holder_count_value);
+
+        // Write the batch
+        self.db.write(batch)?;
+
+        tracing::info!(
+            ?height,
+            holder_count,
+            "stored holder count snapshot to RocksDB"
+        );
+
+        Ok(())
+    }
+
+    /// Returns the holder count for a given block height, if it was stored.
+    ///
+    /// Returns `None` if no snapshot was stored at that height.
+    pub fn holder_count_at_height(&self, height: Height) -> Option<u64> {
+        let holder_count_cf = self.holder_count_by_height_cf();
+        let holder_count: HolderCount = self.db.zs_get(holder_count_cf, &height)?;
+        Some(holder_count.0)
+    }
+
+    /// Returns the most recent holder count snapshots, limited to the specified count.
+    ///
+    /// Returns a vector of (height, holder_count) pairs, sorted by height (ascending).
+    /// Uses reverse iteration to efficiently get only the most recent snapshots.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: Maximum number of snapshots to return
+    ///
+    /// # Performance
+    ///
+    /// This method uses reverse iteration to only read the last N snapshots,
+    /// avoiding a full scan of the column family.
+    pub fn recent_holder_count_snapshots(&self, limit: usize) -> Vec<(Height, u64)> {
+        let typed_cf = TypedColumnFamily::<Height, HolderCount>::new(
+            &self.db,
+            HOLDER_COUNT_BY_HEIGHT,
+        )
+        .expect("column family was created when database was created");
+
+        // Use reverse iteration to get the most recent snapshots first
+        let mut snapshots: Vec<(Height, u64)> = typed_cf
+            .zs_reverse_range_iter(..)
+            .take(limit)
+            .map(|(height, holder_count)| (height, holder_count.0))
+            .collect();
+
+        // Reverse to get ascending order by height
+        snapshots.reverse();
+        snapshots
     }
 
     /// Returns the top N addresses by balance in the finalized state.

@@ -410,6 +410,12 @@ pub enum ReadResponse {
         addresses: Vec<(transparent::Address, Amount<NonNegative>)>,
     },
 
+    /// Response to [`ReadRequest::HolderCountSnapshots`] with all holder count snapshots.
+    HolderCountSnapshots {
+        /// List of (height, holder_count) pairs, sorted by height.
+        snapshots: Vec<(block::Height, u64)>,
+    },
+
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]
     /// with the obtained transaction ids, in the order they appear in blocks.
     AddressesTransactionIds(BTreeMap<TransactionLocation, transaction::Hash>),
@@ -537,6 +543,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::AddressBalance { .. }
             | ReadResponse::AddressCount { .. }
             | ReadResponse::TopAddressesByBalance { .. }
+            | ReadResponse::HolderCountSnapshots { .. }
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)
