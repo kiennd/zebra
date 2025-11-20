@@ -463,12 +463,11 @@ impl WriteBlockWorkerTask {
 /// Store holder count snapshot when block height is divisible by 1000.
 ///
 /// This operation scans the entire balance column family and may be slow,
-/// so it runs in a background blocking task to avoid blocking block commits.
-/// Uses `tokio::task::spawn_blocking` which uses a thread pool for CPU-intensive work.
+/// so it runs in a background thread to avoid blocking block commits.
 fn store_holder_count_snapshot(db: &ZebraDb, height: Height) {
-    // Store the snapshot in a blocking task to avoid blocking the async runtime
+    // Store the snapshot in a background thread to avoid blocking block commits
     let db_clone = db.clone();
-    tokio::task::spawn_blocking(move || {
+    std::thread::spawn(move || {
         if let Err(e) = db_clone.store_holder_count_snapshot(height) {
             tracing::warn!(
                 ?height,
