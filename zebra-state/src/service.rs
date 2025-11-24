@@ -1959,7 +1959,7 @@ impl Service<ReadRequest> for ReadStateService {
                         // Reuse snapshot data logic and extract holder_count
                         let snapshots = state.db.recent_snapshot_data(limit)
                             .into_iter()
-                            .map(|(height, snapshot_data)| (height, snapshot_data.holder_count()))
+                            .map(|(date_key, snapshot_data)| (date_key, snapshot_data.holder_count()))
                             .collect();
                         timer.finish(module_path!(), line!(), "ReadRequest::HolderCountSnapshots");
                         Ok(ReadResponse::HolderCountSnapshots { snapshots })

@@ -319,9 +319,27 @@ impl WriteBlockWorkerTask {
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
 
                     // Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
-                    // on the first block of each UTC day
-                    // Always snapshot block 0 (genesis block)
-                    let should_snapshot = if block_height.0 == 0 {
+                    // 1. Always snapshot block 0 (genesis block)
+                    // 2. Snapshot on the first block of each UTC day
+                    // 3. When fully synced, snapshot every confirmed block (using current date)
+                    //    Only snapshot if we're at least 10 blocks behind the tip to avoid reorgs
+                    let current_time = chrono::Utc::now().timestamp();
+                    let is_recent_block = (current_time - block_timestamp) < 3600; // Block is within last hour
+                    let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
+                    let is_fully_synced = is_recent_block && non_finalized_len > 0;
+                    
+                    // When fully synced, snapshot every confirmed block if we're at least 10 blocks behind the tip
+                    // The tip is approximately: finalized_height + non_finalized_len
+                    let should_realtime_snapshot = if is_fully_synced {
+                        let estimated_tip_height = block_height.0 + non_finalized_len as u32;
+                        // Only snapshot if we're at least 10 blocks behind the estimated tip
+                        let blocks_behind_tip = estimated_tip_height.saturating_sub(block_height.0);
+                        blocks_behind_tip >= 10
+                    } else {
+                        false
+                    };
+                    
+                    let should_daily_snapshot = if block_height.0 == 0 {
                         true
                     } else {
                         match next_snapshot_timestamp {
@@ -336,35 +354,41 @@ impl WriteBlockWorkerTask {
                         }
                     };
                     
+                    let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
+                    
                     if should_snapshot {
                         let network = non_finalized_state.network.clone();
-                        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network) {
+                        // Use current date for real-time snapshots, block date for daily snapshots
+                        let use_current_date = should_realtime_snapshot;
+                        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
                             tracing::warn!(
                                 ?block_height,
                                 error = ?e,
                                 "failed to store snapshot data to RocksDB"
                             );
                         } else {
-                            // Calculate the start of the next UTC day (00:00:00 UTC)
-                            let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
-                                .unwrap_or_else(|| {
-                                    // Fallback: if timestamp conversion fails, use epoch
-                                    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
-                                });
-                            
-                            // Get the start of the current UTC day (00:00:00 UTC)
-                            let current_date = current_datetime.date_naive();
-                            
-                            // Get the start of the next day at 00:00:00 UTC
-                            let next_date = current_date + chrono::Duration::days(1);
-                            let next_datetime = next_date.and_hms_opt(0, 0, 0)
-                                .expect("00:00:00 should always be valid");
-                            let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                                next_datetime,
-                                chrono::Utc,
-                            ).timestamp();
-                            
-                            next_snapshot_timestamp = Some(next_timestamp);
+                            if should_daily_snapshot {
+                                // Calculate the start of the next UTC day (00:00:00 UTC)
+                                let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                                    .unwrap_or_else(|| {
+                                        // Fallback: if timestamp conversion fails, use epoch
+                                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                                    });
+                                
+                                // Get the start of the current UTC day (00:00:00 UTC)
+                                let current_date = current_datetime.date_naive();
+                                
+                                // Get the start of the next day at 00:00:00 UTC
+                                let next_date = current_date + chrono::Duration::days(1);
+                                let next_datetime = next_date.and_hms_opt(0, 0, 0)
+                                    .expect("00:00:00 should always be valid");
+                                let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                    next_datetime,
+                                    chrono::Utc,
+                                ).timestamp();
+                                
+                                next_snapshot_timestamp = Some(next_timestamp);
+                            }
                         }
                     }
 

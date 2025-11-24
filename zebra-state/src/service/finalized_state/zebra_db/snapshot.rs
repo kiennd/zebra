@@ -35,9 +35,69 @@ use crate::{
 
 use super::super::TypedColumnFamily;
 
-/// The name of the snapshot data by block height column family.
+/// The name of the snapshot data by date column family.
 /// Stores holder count, pool values, difficulty, issuance, inflation rate, and timestamp.
-pub const SNAPSHOT_DATA_BY_HEIGHT: &str = "snapshot_data_by_height";
+/// Key format: YY:MM:DD (year, month, day) as 3 bytes: [year, month, day]
+pub const SNAPSHOT_DATA_BY_DATE: &str = "snapshot_data_by_date";
+
+/// Snapshot date key in format YY:MM:DD (year, month, day)
+/// Stored as 3 bytes: [year (0-99), month (1-12), day (1-31)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotDateKey {
+    /// Year (0-99, representing 2000-2099)
+    pub year: u8,
+    /// Month (1-12)
+    pub month: u8,
+    /// Day (1-31)
+    pub day: u8,
+}
+
+impl SnapshotDateKey {
+    /// Create a new SnapshotDateKey from year, month, day
+    pub fn new(year: u8, month: u8, day: u8) -> Self {
+        SnapshotDateKey { year, month, day }
+    }
+    
+    /// Create a SnapshotDateKey from a timestamp
+    pub fn from_timestamp(timestamp: i64) -> Self {
+        let datetime = chrono::DateTime::from_timestamp(timestamp, 0)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap());
+        let date = datetime.date_naive();
+        // Use format to extract date components
+        let year_str = date.format("%y").to_string();
+        let month_str = date.format("%m").to_string();
+        let day_str = date.format("%d").to_string();
+        SnapshotDateKey {
+            year: year_str.parse::<u8>().unwrap_or(0),
+            month: month_str.parse::<u8>().unwrap_or(1),
+            day: day_str.parse::<u8>().unwrap_or(1),
+        }
+    }
+    
+    /// Format as string "YY:MM:DD"
+    pub fn to_string(&self) -> String {
+        format!("{:02}:{:02}:{:02}", self.year, self.month, self.day)
+    }
+}
+
+impl IntoDisk for SnapshotDateKey {
+    type Bytes = [u8; 3];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        [self.year, self.month, self.day]
+    }
+}
+
+impl FromDisk for SnapshotDateKey {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        SnapshotDateKey {
+            year: bytes[0],
+            month: bytes[1],
+            day: bytes[2],
+        }
+    }
+}
 
 /// Snapshot data stored in RocksDB containing holder count, pool values, difficulty, issuance, timestamp, and transaction counts.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -55,8 +115,17 @@ pub struct SnapshotData {
     inflation_rate_bps: u32,
     /// Block timestamp (Unix timestamp in seconds).
     block_timestamp: i64,
-    /// Number of transparent transactions (from previous snapshot to this snapshot).
+    /// Block height at which this snapshot was taken.
+    block_height: u32,
+    /// Number of regular transparent transactions (from previous snapshot to this snapshot).
+    /// Excludes coinbase transactions.
     transparent_tx_count: u32,
+    /// Number of transparent coinbase transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase transactions.
+    transparent_coinbase_tx_count: u32,
+    /// Number of shielded coinbase migration transactions (from previous snapshot to this snapshot).
+    /// These are transactions that spend coinbase UTXOs and send to shielded addresses.
+    shielded_coinbase_migration_tx_count: u32,
     /// Number of sprout transactions (from previous snapshot to this snapshot).
     sprout_tx_count: u32,
     /// Number of sapling transactions (from previous snapshot to this snapshot).
@@ -97,7 +166,10 @@ impl SnapshotData {
         total_issuance: Amount<NonNegative>,
         inflation_rate_percent: f64,
         block_timestamp: i64,
+        block_height: u32,
         transparent_tx_count: u32,
+        transparent_coinbase_tx_count: u32,
+        shielded_coinbase_migration_tx_count: u32,
         sprout_tx_count: u32,
         sapling_tx_count: u32,
         orchard_tx_count: u32,
@@ -123,7 +195,10 @@ impl SnapshotData {
             total_issuance: total_issuance.zatoshis() as u64,
             inflation_rate_bps,
             block_timestamp,
+            block_height,
             transparent_tx_count,
+            transparent_coinbase_tx_count,
+            shielded_coinbase_migration_tx_count,
             sprout_tx_count,
             sapling_tx_count,
             orchard_tx_count,
@@ -165,8 +240,20 @@ impl SnapshotData {
         self.block_timestamp
     }
     
+    pub fn block_height(&self) -> u32 {
+        self.block_height
+    }
+    
     pub fn transparent_tx_count(&self) -> u32 {
         self.transparent_tx_count
+    }
+    
+    pub fn transparent_coinbase_tx_count(&self) -> u32 {
+        self.transparent_coinbase_tx_count
+    }
+    
+    pub fn shielded_coinbase_migration_tx_count(&self) -> u32 {
+        self.shielded_coinbase_migration_tx_count
     }
     
     pub fn sprout_tx_count(&self) -> u32 {
@@ -230,15 +317,18 @@ impl IntoDisk for SnapshotData {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
-        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 196 bytes total
-        let mut bytes = Vec::with_capacity(196);
+        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 208 bytes total
+        let mut bytes = Vec::with_capacity(208);
         bytes.extend_from_slice(&self.holder_count.to_be_bytes());
         bytes.extend_from_slice(&self.pool_values.as_bytes());
         bytes.extend_from_slice(&self.difficulty);
         bytes.extend_from_slice(&self.total_issuance.to_be_bytes());
         bytes.extend_from_slice(&self.inflation_rate_bps.to_be_bytes());
         bytes.extend_from_slice(&self.block_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.block_height.to_be_bytes());
         bytes.extend_from_slice(&self.transparent_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.transparent_coinbase_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.shielded_coinbase_migration_tx_count.to_be_bytes());
         bytes.extend_from_slice(&self.sprout_tx_count.to_be_bytes());
         bytes.extend_from_slice(&self.sapling_tx_count.to_be_bytes());
         bytes.extend_from_slice(&self.orchard_tx_count.to_be_bytes());
@@ -260,12 +350,18 @@ impl IntoDisk for SnapshotData {
 impl FromDisk for SnapshotData {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref();
-        // Support old formats: 100 bytes (original), 116 bytes (with tx counts), 180 bytes (with inflow/outflow), 
-        // 184 bytes (with avg block time), 196 bytes (with avg fee and block size)
-        let has_tx_counts = bytes.len() >= 116;
-        let has_inflow_outflow = bytes.len() >= 180;
-        let has_avg_block_time = bytes.len() >= 184;
-        let has_avg_fee_size = bytes.len() >= 196;
+        // Current format: 208 bytes
+        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 208 bytes
+        
+        // Validate byte length
+        if bytes.len() != 208 {
+            panic!(
+                "SnapshotData deserialization error: expected 208 bytes, got {} bytes. \
+                This may indicate old database format or corrupted data. \
+                Please clear the database and resync.",
+                bytes.len()
+            );
+        }
         
         let holder_count = u64::from_be_bytes(
             bytes[0..8].try_into().expect("holder count must be 8 bytes")
@@ -282,52 +378,34 @@ impl FromDisk for SnapshotData {
         let block_timestamp = i64::from_be_bytes(
             bytes[92..100].try_into().expect("block timestamp must be 8 bytes")
         );
+        let block_height = u32::from_be_bytes(
+            bytes[100..104].try_into().expect("block height must be 4 bytes")
+        );
         
-        // Transaction counts (new fields, default to 0 for old format)
-        let (transparent_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) = if has_tx_counts {
-            (
-                u32::from_be_bytes(bytes[100..104].try_into().expect("transparent tx count must be 4 bytes")),
-                u32::from_be_bytes(bytes[104..108].try_into().expect("sprout tx count must be 4 bytes")),
-                u32::from_be_bytes(bytes[108..112].try_into().expect("sapling tx count must be 4 bytes")),
-                u32::from_be_bytes(bytes[112..116].try_into().expect("orchard tx count must be 4 bytes")),
-            )
-        } else {
-            (0, 0, 0, 0)
-        };
+        // Transaction counts
+        let transparent_tx_count = u32::from_be_bytes(bytes[104..108].try_into().expect("transparent tx count must be 4 bytes"));
+        let transparent_coinbase_tx_count = u32::from_be_bytes(bytes[108..112].try_into().expect("transparent coinbase tx count must be 4 bytes"));
+        let shielded_coinbase_migration_tx_count = u32::from_be_bytes(bytes[112..116].try_into().expect("shielded coinbase migration tx count must be 4 bytes"));
+        let sprout_tx_count = u32::from_be_bytes(bytes[116..120].try_into().expect("sprout tx count must be 4 bytes"));
+        let sapling_tx_count = u32::from_be_bytes(bytes[120..124].try_into().expect("sapling tx count must be 4 bytes"));
+        let orchard_tx_count = u32::from_be_bytes(bytes[124..128].try_into().expect("orchard tx count must be 4 bytes"));
         
-        // Inflow/outflow (new fields, default to 0 for old format)
-        let (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
-             sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow) = if has_inflow_outflow {
-            (
-                u64::from_be_bytes(bytes[116..124].try_into().expect("transparent inflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[124..132].try_into().expect("transparent outflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[132..140].try_into().expect("sprout inflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[140..148].try_into().expect("sprout outflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[148..156].try_into().expect("sapling inflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[156..164].try_into().expect("sapling outflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[164..172].try_into().expect("orchard inflow must be 8 bytes")),
-                u64::from_be_bytes(bytes[172..180].try_into().expect("orchard outflow must be 8 bytes")),
-            )
-        } else {
-            (0, 0, 0, 0, 0, 0, 0, 0)
-        };
+        // Inflow/outflow
+        let transparent_inflow = u64::from_be_bytes(bytes[128..136].try_into().expect("transparent inflow must be 8 bytes"));
+        let transparent_outflow = u64::from_be_bytes(bytes[136..144].try_into().expect("transparent outflow must be 8 bytes"));
+        let sprout_inflow = u64::from_be_bytes(bytes[144..152].try_into().expect("sprout inflow must be 8 bytes"));
+        let sprout_outflow = u64::from_be_bytes(bytes[152..160].try_into().expect("sprout outflow must be 8 bytes"));
+        let sapling_inflow = u64::from_be_bytes(bytes[160..168].try_into().expect("sapling inflow must be 8 bytes"));
+        let sapling_outflow = u64::from_be_bytes(bytes[168..176].try_into().expect("sapling outflow must be 8 bytes"));
+        let orchard_inflow = u64::from_be_bytes(bytes[176..184].try_into().expect("orchard inflow must be 8 bytes"));
+        let orchard_outflow = u64::from_be_bytes(bytes[184..192].try_into().expect("orchard outflow must be 8 bytes"));
         
-        // Average block time (new field, default to 0.0 for old format)
-        let average_block_time = if has_avg_block_time {
-            f32::from_be_bytes(bytes[180..184].try_into().expect("average block time must be 4 bytes"))
-        } else {
-            0.0
-        };
+        // Average block time
+        let average_block_time = f32::from_be_bytes(bytes[192..196].try_into().expect("average block time must be 4 bytes"));
         
-        // Average fee and block size (new fields, default to 0 for old format)
-        let (average_fee_zat, average_block_size) = if has_avg_fee_size {
-            (
-                u64::from_be_bytes(bytes[184..192].try_into().expect("average fee must be 8 bytes")),
-                u32::from_be_bytes(bytes[192..196].try_into().expect("average block size must be 4 bytes")),
-            )
-        } else {
-            (0, 0)
-        };
+        // Average fee and block size
+        let average_fee_zat = u64::from_be_bytes(bytes[196..204].try_into().expect("average fee must be 8 bytes"));
+        let average_block_size = u32::from_be_bytes(bytes[204..208].try_into().expect("average block size must be 4 bytes"));
         
         SnapshotData {
             holder_count,
@@ -336,7 +414,10 @@ impl FromDisk for SnapshotData {
             total_issuance,
             inflation_rate_bps,
             block_timestamp,
+            block_height,
             transparent_tx_count,
+            transparent_coinbase_tx_count,
+            shielded_coinbase_migration_tx_count,
             sprout_tx_count,
             sapling_tx_count,
             orchard_tx_count,
@@ -356,9 +437,9 @@ impl FromDisk for SnapshotData {
 }
 
 impl ZebraDb {
-    /// Returns a handle to the `snapshot_data_by_height` RocksDB column family.
-    pub fn snapshot_data_by_height_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle(SNAPSHOT_DATA_BY_HEIGHT).unwrap()
+    /// Returns a handle to the `snapshot_data_by_date` RocksDB column family.
+    pub fn snapshot_data_by_date_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(SNAPSHOT_DATA_BY_DATE).unwrap()
     }
 
     /// Returns the holder count for a given block height, if it was stored in a snapshot.
@@ -384,10 +465,10 @@ impl ZebraDb {
     ///
     /// This method uses reverse iteration to only read the last N snapshots,
     /// avoiding a full scan of the column family.
-    pub fn recent_holder_count_snapshots(&self, limit: usize) -> Vec<(Height, u64)> {
+    pub fn recent_holder_count_snapshots(&self, limit: usize) -> Vec<(SnapshotDateKey, u64)> {
         self.recent_snapshot_data(limit)
             .into_iter()
-            .map(|(height, snapshot_data)| (height, snapshot_data.holder_count()))
+            .map(|(date_key, snapshot_data)| (date_key, snapshot_data.holder_count()))
             .collect()
     }
 
@@ -483,14 +564,29 @@ impl ZebraDb {
     
     /// Count transactions per pool between two heights (inclusive).
     /// 
-    /// Returns (transparent_count, sprout_count, sapling_count, orchard_count).
-    /// Counts transactions that have any activity in each pool type.
+    /// Returns (transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count).
+    /// 
+    /// Each transaction is counted exactly once using the following priority:
+    /// 1. Transparent coinbase (is_coinbase && has_transparent)
+    /// 2. Shielded coinbase migration (!is_coinbase && has_transparent_inputs && has_shielded_outputs)
+    /// 3. Orchard (has_orchard_outputs)
+    /// 4. Sapling (has_sapling_outputs)
+    /// 5. Sprout (has_sprout_joinsplit_data)
+    /// 6. Transparent (has_transparent)
+    /// 
+    /// This ensures: transparent_count + transparent_coinbase_count + shielded_coinbase_migration_count +
+    ///              sprout_count + sapling_count + orchard_count = total_transactions
+    /// 
+    /// Note: Shielded coinbase migration count is an approximation - it counts transactions with
+    /// transparent inputs and shielded outputs. This may include some non-migration transactions.
     fn count_transactions_by_pool(
         &self,
         start_height: Height,
         end_height: Height,
-    ) -> Result<(u32, u32, u32, u32), BoxError> {
+    ) -> Result<(u32, u32, u32, u32, u32, u32), BoxError> {
         let mut transparent_count = 0u32;
+        let mut transparent_coinbase_count = 0u32;
+        let mut shielded_coinbase_migration_count = 0u32;
         let mut sprout_count = 0u32;
         let mut sapling_count = 0u32;
         let mut orchard_count = 0u32;
@@ -506,36 +602,61 @@ impl ZebraDb {
                 }
             };
             
-            // Count transactions in each pool
-            for transaction in &block.transactions {
-                // A transaction can belong to multiple pools, so we check each one
-                if transaction.has_transparent_inputs() || transaction.has_transparent_outputs() {
+            // Count transactions in each pool - each transaction is counted exactly once
+            for (tx_idx, transaction) in block.transactions.iter().enumerate() {
+                // Check if this is a coinbase transaction (first transaction in block)
+                let is_coinbase = tx_idx == 0;
+                
+                // Check for transparent activity
+                let has_transparent = transaction.has_transparent_inputs() || transaction.has_transparent_outputs();
+                let has_transparent_inputs = transaction.has_transparent_inputs();
+                
+                // Check for shielded outputs (sapling or orchard)
+                let has_sapling_outputs = transaction.has_sapling_shielded_data();
+                let has_orchard_outputs = transaction.has_orchard_shielded_data();
+                let has_shielded_outputs = has_sapling_outputs || has_orchard_outputs;
+                
+                // Check for sprout joinsplit
+                let has_sprout = transaction.has_sprout_joinsplit_data();
+                
+                // Count each transaction exactly once using priority order
+                if is_coinbase && has_transparent {
+                    // Priority 1: Transparent coinbase
+                    transparent_coinbase_count = transparent_coinbase_count
+                        .checked_add(1)
+                        .ok_or_else(|| "transparent coinbase transaction count overflow")?;
+                } else if !is_coinbase && has_transparent_inputs && has_shielded_outputs {
+                    // Priority 2: Shielded coinbase migration (transparent inputs -> shielded outputs)
+                    shielded_coinbase_migration_count = shielded_coinbase_migration_count
+                        .checked_add(1)
+                        .ok_or_else(|| "shielded coinbase migration transaction count overflow")?;
+                } else if has_orchard_outputs {
+                    // Priority 3: Orchard transactions
+                    orchard_count = orchard_count
+                        .checked_add(1)
+                        .ok_or_else(|| "orchard transaction count overflow")?;
+                } else if has_sapling_outputs {
+                    // Priority 4: Sapling transactions
+                    sapling_count = sapling_count
+                        .checked_add(1)
+                        .ok_or_else(|| "sapling transaction count overflow")?;
+                } else if has_sprout {
+                    // Priority 5: Sprout transactions
+                    sprout_count = sprout_count
+                        .checked_add(1)
+                        .ok_or_else(|| "sprout transaction count overflow")?;
+                } else if has_transparent {
+                    // Priority 6: Regular transparent transactions
                     transparent_count = transparent_count
                         .checked_add(1)
                         .ok_or_else(|| "transparent transaction count overflow")?;
                 }
-                
-                if transaction.has_sprout_joinsplit_data() {
-                    sprout_count = sprout_count
-                        .checked_add(1)
-                        .ok_or_else(|| "sprout transaction count overflow")?;
-                }
-                
-                if transaction.has_sapling_shielded_data() {
-                    sapling_count = sapling_count
-                        .checked_add(1)
-                        .ok_or_else(|| "sapling transaction count overflow")?;
-                }
-                
-                if transaction.has_orchard_shielded_data() {
-                    orchard_count = orchard_count
-                        .checked_add(1)
-                        .ok_or_else(|| "orchard transaction count overflow")?;
-                }
+                // Note: If a transaction has none of the above, it's not counted in any category.
+                // This should be extremely rare (possibly only empty coinbase transactions without transparent outputs).
             }
         }
         
-        Ok((transparent_count, sprout_count, sapling_count, orchard_count))
+        Ok((transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count))
     }
     
     /// Calculate inflow and outflow for each pool between two heights (inclusive).
@@ -857,6 +978,7 @@ impl ZebraDb {
         &self,
         height: Height,
         network: &Network,
+        use_current_date: bool,
     ) -> Result<(), BoxError> {
         // 1. Count holders
         let holder_count = self.holder_count();
@@ -908,26 +1030,56 @@ impl ZebraDb {
         // 8. Convert difficulty to bytes (big-endian)
         let difficulty_bytes = difficulty.bytes_in_serialized_order();
         
-        // 9. Count transactions per pool from previous snapshot to current snapshot
-        // Previous snapshot is at height - 1000 (or 0 if this is the first snapshot)
-        let previous_snapshot_height = if height.0 >= 1000 {
-            Height(height.0 - 1000)
+        // 9. Find the previous snapshot height to avoid double counting blocks
+        // We need to find the most recent snapshot with height < current height
+        let previous_snapshot_height = {
+            // Get recent snapshots (up to 100 should be enough to find the previous one)
+            let recent_snapshots = self.recent_snapshot_data(100);
+            // Find the most recent snapshot with height < current height
+            recent_snapshots
+                .iter()
+                .rev() // Start from most recent
+                .find_map(|(_, snapshot_data)| {
+                    let prev_height = snapshot_data.block_height();
+                    if prev_height < height.0 {
+                        Some(Height(prev_height))
+                    } else {
+                        None
+                    }
+                })
+        };
+        
+        // Calculate range: from (previous_snapshot_height + 1) to height (inclusive)
+        // This ensures we don't double count the previous snapshot block
+        // For the first snapshot (height 0), start_height will be 0 (no previous snapshot)
+        let start_height = if let Some(prev_height) = previous_snapshot_height {
+            // We have a previous snapshot, so start from the next block to avoid double counting
+            if prev_height.0 < height.0 {
+                Height(prev_height.0 + 1)
+            } else {
+                // Shouldn't happen, but handle it
+                height
+            }
         } else {
+            // No previous snapshot found, start from height 0 (first snapshot)
             Height(0)
         };
-        let (transparent_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) =
-            self.count_transactions_by_pool(previous_snapshot_height, height)?;
         
-        // 10. Calculate inflow/outflow for each pool
+        // 10. Count transactions per pool from previous snapshot to current snapshot
+        // Range is exclusive on start to avoid double counting
+        let (transparent_tx_count, transparent_coinbase_tx_count, shielded_coinbase_migration_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) =
+            self.count_transactions_by_pool(start_height, height)?;
+        
+        // 11. Calculate inflow/outflow for each pool
         let (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
              sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow) =
-            self.calculate_pool_flows(previous_snapshot_height, height)?;
+            self.calculate_pool_flows(start_height, height)?;
         
-        // 11. Calculate average block time, average fee, and average block size
+        // 12. Calculate average block time, average fee, and average block size
         let (average_block_time, average_fee_zat, average_block_size) = 
-            self.calculate_block_metrics(previous_snapshot_height, height, block_timestamp)?;
+            self.calculate_block_metrics(start_height, height, block_timestamp)?;
         
-        // 12. Create snapshot data
+        // 13. Create snapshot data
         let snapshot_data = SnapshotData::new(
             holder_count as u64,
             pool_values,
@@ -935,7 +1087,10 @@ impl ZebraDb {
             total_issuance,
             inflation_rate,
             block_timestamp,
+            height.0,
             transparent_tx_count,
+            transparent_coinbase_tx_count,
+            shielded_coinbase_migration_tx_count,
             sprout_tx_count,
             sapling_tx_count,
             orchard_tx_count,
@@ -952,14 +1107,22 @@ impl ZebraDb {
             average_block_size,
         );
 
-        // 14. Store in RocksDB
-        let snapshot_cf = self.snapshot_data_by_height_cf();
+        // 14. Store in RocksDB using date key
+        // Use current date if requested (for real-time snapshots), otherwise use block's date
+        let date_key = if use_current_date {
+            SnapshotDateKey::from_timestamp(chrono::Utc::now().timestamp())
+        } else {
+            SnapshotDateKey::from_timestamp(block_timestamp)
+        };
+        let snapshot_cf = self.snapshot_data_by_date_cf();
         let mut batch = DiskWriteBatch::new();
-        batch.zs_insert(snapshot_cf, &height, &snapshot_data);
+        batch.zs_insert(snapshot_cf, &date_key, &snapshot_data);
         self.db.write(batch)?;
 
         tracing::info!(
             ?height,
+            ?date_key,
+            use_current_date,
             holder_count,
             ?pool_values,
             ?difficulty,
@@ -967,6 +1130,8 @@ impl ZebraDb {
             inflation_rate_percent = inflation_rate,
             block_timestamp,
             transparent_tx_count,
+            transparent_coinbase_tx_count,
+            shielded_coinbase_migration_tx_count,
             sprout_tx_count,
             sapling_tx_count,
             orchard_tx_count,
@@ -987,17 +1152,28 @@ impl ZebraDb {
         Ok(())
     }
 
+    /// Returns the snapshot data for a given date key, if it was stored.
+    ///
+    /// Returns `None` if no snapshot was stored for that date.
+    pub fn snapshot_data_at_date(&self, date_key: SnapshotDateKey) -> Option<SnapshotData> {
+        let snapshot_cf = self.snapshot_data_by_date_cf();
+        self.db.zs_get(snapshot_cf, &date_key)
+    }
+    
     /// Returns the snapshot data for a given block height, if it was stored.
+    /// This is a convenience method that converts height to date.
     ///
     /// Returns `None` if no snapshot was stored at that height.
     pub fn snapshot_data_at_height(&self, height: Height) -> Option<SnapshotData> {
-        let snapshot_cf = self.snapshot_data_by_height_cf();
-        self.db.zs_get(snapshot_cf, &height)
+        let block = self.block(height.into())?;
+        let timestamp = block.header.time.timestamp();
+        let date_key = SnapshotDateKey::from_timestamp(timestamp);
+        self.snapshot_data_at_date(date_key)
     }
 
     /// Returns the most recent snapshot data, limited to the specified count.
     ///
-    /// Returns a vector of (height, snapshot_data) pairs, sorted by height (ascending).
+    /// Returns a vector of (date_key, snapshot_data) pairs, sorted by date (ascending).
     /// Uses reverse iteration to efficiently get only the most recent snapshots.
     ///
     /// # Parameters
@@ -1008,20 +1184,20 @@ impl ZebraDb {
     ///
     /// This method uses reverse iteration to only read the last N snapshots,
     /// avoiding a full scan of the column family.
-    pub fn recent_snapshot_data(&self, limit: usize) -> Vec<(Height, SnapshotData)> {
-        let typed_cf = TypedColumnFamily::<Height, SnapshotData>::new(
+    pub fn recent_snapshot_data(&self, limit: usize) -> Vec<(SnapshotDateKey, SnapshotData)> {
+        let typed_cf = TypedColumnFamily::<SnapshotDateKey, SnapshotData>::new(
             &self.db,
-            SNAPSHOT_DATA_BY_HEIGHT,
+            SNAPSHOT_DATA_BY_DATE,
         )
         .expect("column family was created when database was created");
 
         // Use reverse iteration to get the most recent snapshots first
-        let mut snapshots: Vec<(Height, SnapshotData)> = typed_cf
+        let mut snapshots: Vec<(SnapshotDateKey, SnapshotData)> = typed_cf
             .zs_reverse_range_iter(..)
             .take(limit)
             .collect();
 
-        // Reverse to get ascending order by height
+        // Reverse to get ascending order by date
         snapshots.reverse();
         snapshots
     }

@@ -412,14 +412,14 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::HolderCountSnapshots`] with all holder count snapshots.
     HolderCountSnapshots {
-        /// List of (height, holder_count) pairs, sorted by height.
-        snapshots: Vec<(block::Height, u64)>,
+        /// List of (date_key, holder_count) pairs, sorted by date.
+        snapshots: Vec<(crate::service::finalized_state::SnapshotDateKey, u64)>,
     },
 
     /// Response to [`ReadRequest::SnapshotData`] with all snapshot data.
     SnapshotData {
-        /// List of (height, snapshot_data) pairs, sorted by height.
-        snapshots: Vec<(block::Height, crate::service::finalized_state::SnapshotData)>,
+        /// List of (date_key, snapshot_data) pairs, sorted by date.
+        snapshots: Vec<(crate::service::finalized_state::SnapshotDateKey, crate::service::finalized_state::SnapshotData)>,
     },
 
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]

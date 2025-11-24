@@ -1219,6 +1219,7 @@ where
                 .snapshots()
                 .iter()
                 .map(|snapshot| HolderCountSnapshot {
+                    date_key: snapshot.date_key().clone(),
                     height: snapshot.height(),
                     holder_count: snapshot.holder_count(),
                 })
@@ -1244,9 +1245,10 @@ where
                 Ok(GetSnapshotDataResponse {
                     snapshots: snapshots
                         .into_iter()
-                        .map(|(height, snapshot_data)| {
+                        .map(|(date_key, snapshot_data)| {
                             SnapshotDataEntry {
-                                height: height.0,
+                                date_key: format!("{:02}:{:02}:{:02}", date_key.year, date_key.month, date_key.day),
+                                height: snapshot_data.block_height(),
                                 holder_count: snapshot_data.holder_count(),
                                 pool_transparent: snapshot_data.pool_values().transparent_amount(),
                                 pool_sprout: snapshot_data.pool_values().sprout_amount(),
@@ -1258,6 +1260,8 @@ where
                                 inflation_rate_percent: snapshot_data.inflation_rate_percent(),
                                 block_timestamp: snapshot_data.block_timestamp(),
                                 transparent_tx_count: snapshot_data.transparent_tx_count(),
+                                transparent_coinbase_tx_count: snapshot_data.transparent_coinbase_tx_count(),
+                                shielded_coinbase_migration_tx_count: snapshot_data.shielded_coinbase_migration_tx_count(),
                                 sprout_tx_count: snapshot_data.sprout_tx_count(),
                                 sapling_tx_count: snapshot_data.sapling_tx_count(),
                                 orchard_tx_count: snapshot_data.orchard_tx_count(),
@@ -3627,6 +3631,8 @@ pub struct GetTopAddressesResponse {
     new,
 )]
 pub struct HolderCountSnapshot {
+    /// The date key at which this snapshot was taken (format: "YY:MM:DD").
+    pub date_key: String,
     /// The block height at which this snapshot was taken.
     #[getter(copy)]
     pub height: u32,
@@ -3662,6 +3668,8 @@ pub struct GetHolderCountSnapshotsResponse {
     new,
 )]
 pub struct SnapshotDataEntry {
+    /// The date key at which this snapshot was taken (format: "YY:MM:DD").
+    pub date_key: String,
     /// The block height at which this snapshot was taken.
     #[getter(copy)]
     pub height: u32,
@@ -3694,16 +3702,28 @@ pub struct SnapshotDataEntry {
     /// Block timestamp (Unix timestamp in seconds).
     #[getter(copy)]
     pub block_timestamp: i64,
-    /// Number of transparent transactions (from previous snapshot to this snapshot).
+    /// Number of regular transparent transactions (from previous snapshot to this snapshot).
+    /// Excludes coinbase transactions.
     #[getter(copy)]
     pub transparent_tx_count: u32,
+    /// Number of transparent coinbase transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase transactions.
+    #[getter(copy)]
+    pub transparent_coinbase_tx_count: u32,
+    /// Number of shielded coinbase migration transactions (from previous snapshot to this snapshot).
+    /// These are transactions that spend coinbase UTXOs and send to shielded addresses.
+    /// Note: This is an approximation and may include some non-migration transactions.
+    #[getter(copy)]
+    pub shielded_coinbase_migration_tx_count: u32,
     /// Number of sprout transactions (from previous snapshot to this snapshot).
     #[getter(copy)]
     pub sprout_tx_count: u32,
     /// Number of sapling transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase migration transactions to avoid double counting.
     #[getter(copy)]
     pub sapling_tx_count: u32,
     /// Number of orchard transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase migration transactions to avoid double counting.
     #[getter(copy)]
     pub orchard_tx_count: u32,
     /// Transparent pool inflow (from previous snapshot to this snapshot, in zatoshis).
