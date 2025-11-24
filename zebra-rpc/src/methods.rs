@@ -1274,7 +1274,7 @@ where
                                 orchard_inflow: snapshot_data.orchard_inflow(),
                                 orchard_outflow: snapshot_data.orchard_outflow(),
                                 average_block_time: snapshot_data.average_block_time(),
-                                average_fee_zat: snapshot_data.average_fee_zat(),
+                                average_block_fee_zat: snapshot_data.average_block_fee_zat(),
                                 average_block_size: snapshot_data.average_block_size(),
                             }
                         })
@@ -3755,7 +3755,7 @@ pub struct SnapshotDataEntry {
     pub average_block_time: f32,
     /// Average transaction fee in zatoshis per block (from previous snapshot to this snapshot).
     #[getter(copy)]
-    pub average_fee_zat: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub average_block_fee_zat: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
     /// Average block size in bytes (from previous snapshot to this snapshot).
     #[getter(copy)]
     pub average_block_size: u32,

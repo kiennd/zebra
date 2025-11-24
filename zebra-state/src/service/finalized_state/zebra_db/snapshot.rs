@@ -152,7 +152,7 @@ pub struct SnapshotData {
     /// Stored as f32 (4 bytes) to save space, precision is sufficient for block time.
     average_block_time: f32,
     /// Average transaction fee in zatoshis per block (from previous snapshot to this snapshot).
-    average_fee_zat: u64,
+    average_block_fee_zat: u64,
     /// Average block size in bytes (from previous snapshot to this snapshot).
     average_block_size: u32,
 }
@@ -182,7 +182,7 @@ impl SnapshotData {
         orchard_inflow: Amount<NonNegative>,
         orchard_outflow: Amount<NonNegative>,
         average_block_time: f32,
-        average_fee_zat: Amount<NonNegative>,
+        average_block_fee_zat: Amount<NonNegative>,
         average_block_size: u32,
     ) -> Self {
         // Convert inflation rate to basis points (hundredths of a percent)
@@ -211,7 +211,7 @@ impl SnapshotData {
             orchard_inflow: orchard_inflow.zatoshis() as u64,
             orchard_outflow: orchard_outflow.zatoshis() as u64,
             average_block_time,
-            average_fee_zat: average_fee_zat.zatoshis() as u64,
+            average_block_fee_zat: average_block_fee_zat.zatoshis() as u64,
             average_block_size,
         }
     }
@@ -304,8 +304,8 @@ impl SnapshotData {
         self.average_block_time
     }
     
-    pub fn average_fee_zat(&self) -> Amount<NonNegative> {
-        Amount::try_from(self.average_fee_zat).expect("average_fee_zat should be valid")
+    pub fn average_block_fee_zat(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.average_block_fee_zat).expect("average_block_fee_zat should be valid")
     }
     
     pub fn average_block_size(&self) -> u32 {
@@ -341,7 +341,7 @@ impl IntoDisk for SnapshotData {
         bytes.extend_from_slice(&self.orchard_inflow.to_be_bytes());
         bytes.extend_from_slice(&self.orchard_outflow.to_be_bytes());
         bytes.extend_from_slice(&self.average_block_time.to_be_bytes());
-        bytes.extend_from_slice(&self.average_fee_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.average_block_fee_zat.to_be_bytes());
         bytes.extend_from_slice(&self.average_block_size.to_be_bytes());
         bytes
     }
@@ -404,7 +404,7 @@ impl FromDisk for SnapshotData {
         let average_block_time = f32::from_be_bytes(bytes[192..196].try_into().expect("average block time must be 4 bytes"));
         
         // Average fee and block size
-        let average_fee_zat = u64::from_be_bytes(bytes[196..204].try_into().expect("average fee must be 8 bytes"));
+        let average_block_fee_zat = u64::from_be_bytes(bytes[196..204].try_into().expect("average block fee must be 8 bytes"));
         let average_block_size = u32::from_be_bytes(bytes[204..208].try_into().expect("average block size must be 4 bytes"));
         
         SnapshotData {
@@ -430,7 +430,7 @@ impl FromDisk for SnapshotData {
             orchard_inflow,
             orchard_outflow,
             average_block_time,
-            average_fee_zat,
+            average_block_fee_zat,
             average_block_size,
         }
     }
@@ -823,7 +823,7 @@ impl ZebraDb {
     
     /// Calculate average block time, average fee, and average block size between two heights (inclusive).
     /// 
-    /// Returns (average_block_time_seconds, average_fee_zat, average_block_size_bytes).
+    /// Returns (average_block_time_seconds, average_block_fee_zat, average_block_size_bytes).
     fn calculate_block_metrics(
         &self,
         start_height: Height,
@@ -1076,7 +1076,7 @@ impl ZebraDb {
             self.calculate_pool_flows(start_height, height)?;
         
         // 12. Calculate average block time, average fee, and average block size
-        let (average_block_time, average_fee_zat, average_block_size) = 
+        let (average_block_time, average_block_fee_zat, average_block_size) = 
             self.calculate_block_metrics(start_height, height, block_timestamp)?;
         
         // 13. Create snapshot data
@@ -1103,7 +1103,7 @@ impl ZebraDb {
             orchard_inflow,
             orchard_outflow,
             average_block_time,
-            average_fee_zat,
+            average_block_fee_zat,
             average_block_size,
         );
 
@@ -1144,7 +1144,7 @@ impl ZebraDb {
             orchard_inflow_zat = orchard_inflow.zatoshis(),
             orchard_outflow_zat = orchard_outflow.zatoshis(),
             average_block_time_seconds = average_block_time,
-            average_fee_zat = average_fee_zat.zatoshis(),
+            average_block_fee_zat = average_block_fee_zat.zatoshis(),
             average_block_size_bytes = average_block_size,
             "stored snapshot data to RocksDB"
         );
