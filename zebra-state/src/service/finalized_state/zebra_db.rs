@@ -36,6 +36,7 @@ pub mod chain;
 pub mod metrics;
 pub mod shielded;
 pub mod transparent;
+pub mod snapshot;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 // TODO: when the database is split out of zebra-state, always expose these methods.

@@ -54,7 +54,7 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub use zebra_db::ZebraDb;
-pub use zebra_db::transparent::SnapshotData;
+pub use zebra_db::snapshot::SnapshotData;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
@@ -98,7 +98,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "tip_chain_value_pool",
     BLOCK_INFO,
     // Snapshot data (holder count + pool values + difficulty + issuance + inflation + timestamp)
-    zebra_db::transparent::SNAPSHOT_DATA_BY_HEIGHT,
+    zebra_db::snapshot::SNAPSHOT_DATA_BY_HEIGHT,
 ];
 
 /// The finalized part of the chain state, stored in the db.

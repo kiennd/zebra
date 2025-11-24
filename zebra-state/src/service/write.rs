@@ -248,6 +248,26 @@ impl WriteBlockWorkerTask {
 
         let mut last_zebra_mined_log_height = None;
         let mut prev_finalized_note_commitment_trees = None;
+        
+        // Initialize next_snapshot_timestamp from the most recent snapshot in the database
+        // This handles the case where the node is restarted
+        let mut next_snapshot_timestamp: Option<i64> = finalized_state
+            .db
+            .recent_snapshot_data(1)
+            .first()
+            .and_then(|(_, snapshot_data)| {
+                let last_snapshot_timestamp = snapshot_data.block_timestamp();
+                // Calculate the start of the next UTC day after the last snapshot
+                let last_datetime = chrono::DateTime::from_timestamp(last_snapshot_timestamp, 0)?;
+                let last_date = last_datetime.date_naive();
+                let next_date = last_date + chrono::Duration::days(1);
+                let next_datetime = next_date.and_hms_opt(0, 0, 0)?;
+                let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    next_datetime,
+                    chrono::Utc,
+                ).timestamp();
+                Some(next_timestamp)
+            });
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -290,6 +310,8 @@ impl WriteBlockWorkerTask {
                 .commit_finalized(ordered_block, prev_finalized_note_commitment_trees.take())
             {
                 Ok((finalized, note_commitment_trees)) => {
+                    // Extract timestamp before moving finalized
+                    let block_timestamp = finalized.block.header.time.timestamp();
                     let tip_block = ChainTipBlock::from(finalized);
                     let block_height = tip_block.height;
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
@@ -297,10 +319,53 @@ impl WriteBlockWorkerTask {
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
 
                     // Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
-                    // when block height is divisible by 1000
-                    if block_height.0 % 1000 == 0 {
+                    // on the first block of each UTC day
+                    // Always snapshot block 0 (genesis block)
+                    let should_snapshot = if block_height.0 == 0 {
+                        true
+                    } else {
+                        match next_snapshot_timestamp {
+                            None => {
+                                // First snapshot after restart (but not block 0) - calculate next snapshot timestamp
+                                true
+                            }
+                            Some(next_ts) => {
+                                // Snapshot if we've reached or passed the next snapshot timestamp
+                                block_timestamp >= next_ts
+                            }
+                        }
+                    };
+                    
+                    if should_snapshot {
                         let network = non_finalized_state.network.clone();
-                        store_snapshot_data(&finalized_state.db, block_height, network);
+                        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network) {
+                            tracing::warn!(
+                                ?block_height,
+                                error = ?e,
+                                "failed to store snapshot data to RocksDB"
+                            );
+                        } else {
+                            // Calculate the start of the next UTC day (00:00:00 UTC)
+                            let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                                .unwrap_or_else(|| {
+                                    // Fallback: if timestamp conversion fails, use epoch
+                                    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                                });
+                            
+                            // Get the start of the current UTC day (00:00:00 UTC)
+                            let current_date = current_datetime.date_naive();
+                            
+                            // Get the start of the next day at 00:00:00 UTC
+                            let next_date = current_date + chrono::Duration::days(1);
+                            let next_datetime = next_date.and_hms_opt(0, 0, 0)
+                                .expect("00:00:00 should always be valid");
+                            let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                next_datetime,
+                                chrono::Utc,
+                            ).timestamp();
+                            
+                            next_snapshot_timestamp = Some(next_timestamp);
+                        }
                     }
 
                     chain_tip_sender.set_finalized_tip(tip_block);
@@ -462,24 +527,6 @@ impl WriteBlockWorkerTask {
     }
 }
 
-/// Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
-/// when block height is divisible by 1000.
-///
-/// This operation scans the entire balance column family and may be slow,
-/// so it runs in a background thread to avoid blocking block commits.
-fn store_snapshot_data(db: &ZebraDb, height: Height, network: zebra_chain::parameters::Network) {
-    // Store the snapshot in a background thread to avoid blocking block commits
-    let db_clone = db.clone();
-    std::thread::spawn(move || {
-        if let Err(e) = db_clone.store_snapshot_data(height, &network) {
-            tracing::warn!(
-                ?height,
-                error = ?e,
-                "failed to store snapshot data to RocksDB"
-            );
-        }
-    });
-}
 
 /// Log a message if this block was mined by Zebra.
 ///
