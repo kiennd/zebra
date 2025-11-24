@@ -419,24 +419,7 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::SnapshotData`] with all snapshot data.
     SnapshotData {
         /// List of (height, snapshot_data) pairs, sorted by height.
-        /// SnapshotData is a tuple containing:
-        /// - holder_count: u64
-        /// - pool_values: ValueBalance<NonNegative>
-        /// - difficulty: [u8; 32]
-        /// - total_issuance: Amount<NonNegative>
-        /// - inflation_rate_percent: f64
-        /// - block_timestamp: i64
-        snapshots: Vec<(
-            block::Height,
-            (
-                u64, // holder_count
-                ValueBalance<NonNegative>, // pool_values
-                [u8; 32], // difficulty
-                Amount<NonNegative>, // total_issuance
-                f64, // inflation_rate_percent
-                i64, // block_timestamp
-            ),
-        )>,
+        snapshots: Vec<(block::Height, crate::service::finalized_state::SnapshotData)>,
     },
 
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]

@@ -1241,23 +1241,34 @@ where
 
         match response {
             zebra_state::ReadResponse::SnapshotData { snapshots } => {
-                use hex;
                 Ok(GetSnapshotDataResponse {
                     snapshots: snapshots
                         .into_iter()
-                        .map(|(height, (holder_count, pool_values, difficulty_bytes, total_issuance, inflation_rate_percent, block_timestamp))| {
+                        .map(|(height, snapshot_data)| {
                             SnapshotDataEntry {
                                 height: height.0,
-                                holder_count,
-                                pool_transparent: pool_values.transparent_amount(),
-                                pool_sprout: pool_values.sprout_amount(),
-                                pool_sapling: pool_values.sapling_amount(),
-                                pool_orchard: pool_values.orchard_amount(),
-                                pool_deferred: pool_values.deferred_amount(),
-                                difficulty: hex::encode(difficulty_bytes),
-                                total_issuance,
-                                inflation_rate_percent,
-                                block_timestamp,
+                                holder_count: snapshot_data.holder_count(),
+                                pool_transparent: snapshot_data.pool_values().transparent_amount(),
+                                pool_sprout: snapshot_data.pool_values().sprout_amount(),
+                                pool_sapling: snapshot_data.pool_values().sapling_amount(),
+                                pool_orchard: snapshot_data.pool_values().orchard_amount(),
+                                pool_deferred: snapshot_data.pool_values().deferred_amount(),
+                                difficulty: hex::encode(snapshot_data.difficulty_bytes()),
+                                total_issuance: snapshot_data.total_issuance(),
+                                inflation_rate_percent: snapshot_data.inflation_rate_percent(),
+                                block_timestamp: snapshot_data.block_timestamp(),
+                                transparent_tx_count: snapshot_data.transparent_tx_count(),
+                                sprout_tx_count: snapshot_data.sprout_tx_count(),
+                                sapling_tx_count: snapshot_data.sapling_tx_count(),
+                                orchard_tx_count: snapshot_data.orchard_tx_count(),
+                                transparent_inflow: snapshot_data.transparent_inflow(),
+                                transparent_outflow: snapshot_data.transparent_outflow(),
+                                sprout_inflow: snapshot_data.sprout_inflow(),
+                                sprout_outflow: snapshot_data.sprout_outflow(),
+                                sapling_inflow: snapshot_data.sapling_inflow(),
+                                sapling_outflow: snapshot_data.sapling_outflow(),
+                                orchard_inflow: snapshot_data.orchard_inflow(),
+                                orchard_outflow: snapshot_data.orchard_outflow(),
                             }
                         })
                         .collect(),
@@ -3680,6 +3691,42 @@ pub struct SnapshotDataEntry {
     /// Block timestamp (Unix timestamp in seconds).
     #[getter(copy)]
     pub block_timestamp: i64,
+    /// Number of transparent transactions (from previous snapshot to this snapshot).
+    #[getter(copy)]
+    pub transparent_tx_count: u32,
+    /// Number of sprout transactions (from previous snapshot to this snapshot).
+    #[getter(copy)]
+    pub sprout_tx_count: u32,
+    /// Number of sapling transactions (from previous snapshot to this snapshot).
+    #[getter(copy)]
+    pub sapling_tx_count: u32,
+    /// Number of orchard transactions (from previous snapshot to this snapshot).
+    #[getter(copy)]
+    pub orchard_tx_count: u32,
+    /// Transparent pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub transparent_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Transparent pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub transparent_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sprout pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub sprout_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sprout pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub sprout_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sapling pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub sapling_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sapling pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub sapling_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Orchard pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub orchard_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Orchard pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    #[getter(copy)]
+    pub orchard_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
 }
 
 /// Response to [`RpcServer::get_snapshot_data`] RPC method.

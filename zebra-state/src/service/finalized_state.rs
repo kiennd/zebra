@@ -54,6 +54,7 @@ pub use disk_format::{
     MAX_ON_DISK_HEIGHT,
 };
 pub use zebra_db::ZebraDb;
+pub use zebra_db::transparent::SnapshotData;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;

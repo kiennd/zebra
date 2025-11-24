@@ -63,7 +63,7 @@ pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_re
 /// Stores holder count, pool values, difficulty, issuance, inflation rate, and timestamp.
 pub const SNAPSHOT_DATA_BY_HEIGHT: &str = "snapshot_data_by_height";
 
-/// Snapshot data stored in RocksDB containing holder count, pool values, difficulty, issuance, and timestamp.
+/// Snapshot data stored in RocksDB containing holder count, pool values, difficulty, issuance, timestamp, and transaction counts.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotData {
     /// Number of holders (addresses with non-zero balances).
@@ -79,6 +79,30 @@ pub struct SnapshotData {
     inflation_rate_bps: u32,
     /// Block timestamp (Unix timestamp in seconds).
     block_timestamp: i64,
+    /// Number of transparent transactions (from previous snapshot to this snapshot).
+    transparent_tx_count: u32,
+    /// Number of sprout transactions (from previous snapshot to this snapshot).
+    sprout_tx_count: u32,
+    /// Number of sapling transactions (from previous snapshot to this snapshot).
+    sapling_tx_count: u32,
+    /// Number of orchard transactions (from previous snapshot to this snapshot).
+    orchard_tx_count: u32,
+    /// Transparent pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    transparent_inflow: u64,
+    /// Transparent pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    transparent_outflow: u64,
+    /// Sprout pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    sprout_inflow: u64,
+    /// Sprout pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    sprout_outflow: u64,
+    /// Sapling pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    sapling_inflow: u64,
+    /// Sapling pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    sapling_outflow: u64,
+    /// Orchard pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    orchard_inflow: u64,
+    /// Orchard pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    orchard_outflow: u64,
 }
 
 impl SnapshotData {
@@ -90,6 +114,18 @@ impl SnapshotData {
         total_issuance: Amount<NonNegative>,
         inflation_rate_percent: f64,
         block_timestamp: i64,
+        transparent_tx_count: u32,
+        sprout_tx_count: u32,
+        sapling_tx_count: u32,
+        orchard_tx_count: u32,
+        transparent_inflow: Amount<NonNegative>,
+        transparent_outflow: Amount<NonNegative>,
+        sprout_inflow: Amount<NonNegative>,
+        sprout_outflow: Amount<NonNegative>,
+        sapling_inflow: Amount<NonNegative>,
+        sapling_outflow: Amount<NonNegative>,
+        orchard_inflow: Amount<NonNegative>,
+        orchard_outflow: Amount<NonNegative>,
     ) -> Self {
         // Convert inflation rate to basis points (hundredths of a percent)
         let inflation_rate_bps = (inflation_rate_percent * 100.0).round() as u32;
@@ -101,6 +137,18 @@ impl SnapshotData {
             total_issuance: total_issuance.zatoshis() as u64,
             inflation_rate_bps,
             block_timestamp,
+            transparent_tx_count,
+            sprout_tx_count,
+            sapling_tx_count,
+            orchard_tx_count,
+            transparent_inflow: transparent_inflow.zatoshis() as u64,
+            transparent_outflow: transparent_outflow.zatoshis() as u64,
+            sprout_inflow: sprout_inflow.zatoshis() as u64,
+            sprout_outflow: sprout_outflow.zatoshis() as u64,
+            sapling_inflow: sapling_inflow.zatoshis() as u64,
+            sapling_outflow: sapling_outflow.zatoshis() as u64,
+            orchard_inflow: orchard_inflow.zatoshis() as u64,
+            orchard_outflow: orchard_outflow.zatoshis() as u64,
         }
     }
 
@@ -127,19 +175,80 @@ impl SnapshotData {
     pub fn block_timestamp(&self) -> i64 {
         self.block_timestamp
     }
+    
+    pub fn transparent_tx_count(&self) -> u32 {
+        self.transparent_tx_count
+    }
+    
+    pub fn sprout_tx_count(&self) -> u32 {
+        self.sprout_tx_count
+    }
+    
+    pub fn sapling_tx_count(&self) -> u32 {
+        self.sapling_tx_count
+    }
+    
+    pub fn orchard_tx_count(&self) -> u32 {
+        self.orchard_tx_count
+    }
+    
+    pub fn transparent_inflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.transparent_inflow).expect("transparent_inflow should be valid")
+    }
+    
+    pub fn transparent_outflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.transparent_outflow).expect("transparent_outflow should be valid")
+    }
+    
+    pub fn sprout_inflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.sprout_inflow).expect("sprout_inflow should be valid")
+    }
+    
+    pub fn sprout_outflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.sprout_outflow).expect("sprout_outflow should be valid")
+    }
+    
+    pub fn sapling_inflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.sapling_inflow).expect("sapling_inflow should be valid")
+    }
+    
+    pub fn sapling_outflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.sapling_outflow).expect("sapling_outflow should be valid")
+    }
+    
+    pub fn orchard_inflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.orchard_inflow).expect("orchard_inflow should be valid")
+    }
+    
+    pub fn orchard_outflow(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.orchard_outflow).expect("orchard_outflow should be valid")
+    }
 }
 
 impl IntoDisk for SnapshotData {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
-        let mut bytes = Vec::with_capacity(8 + 40 + 32 + 8 + 4 + 8); // 100 bytes total
+        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 8*8 = 180 bytes total
+        let mut bytes = Vec::with_capacity(180);
         bytes.extend_from_slice(&self.holder_count.to_be_bytes());
         bytes.extend_from_slice(&self.pool_values.as_bytes());
         bytes.extend_from_slice(&self.difficulty);
         bytes.extend_from_slice(&self.total_issuance.to_be_bytes());
         bytes.extend_from_slice(&self.inflation_rate_bps.to_be_bytes());
         bytes.extend_from_slice(&self.block_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.transparent_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.sprout_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.sapling_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.orchard_tx_count.to_be_bytes());
+        bytes.extend_from_slice(&self.transparent_inflow.to_be_bytes());
+        bytes.extend_from_slice(&self.transparent_outflow.to_be_bytes());
+        bytes.extend_from_slice(&self.sprout_inflow.to_be_bytes());
+        bytes.extend_from_slice(&self.sprout_outflow.to_be_bytes());
+        bytes.extend_from_slice(&self.sapling_inflow.to_be_bytes());
+        bytes.extend_from_slice(&self.sapling_outflow.to_be_bytes());
+        bytes.extend_from_slice(&self.orchard_inflow.to_be_bytes());
+        bytes.extend_from_slice(&self.orchard_outflow.to_be_bytes());
         bytes
     }
 }
@@ -147,7 +256,9 @@ impl IntoDisk for SnapshotData {
 impl FromDisk for SnapshotData {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref();
-        assert!(bytes.len() >= 100, "snapshot data must be at least 100 bytes");
+        // Support old formats: 100 bytes (original), 116 bytes (with tx counts), 180 bytes (with inflow/outflow)
+        let has_tx_counts = bytes.len() >= 116;
+        let has_inflow_outflow = bytes.len() >= 180;
         
         let holder_count = u64::from_be_bytes(
             bytes[0..8].try_into().expect("holder count must be 8 bytes")
@@ -165,6 +276,35 @@ impl FromDisk for SnapshotData {
             bytes[92..100].try_into().expect("block timestamp must be 8 bytes")
         );
         
+        // Transaction counts (new fields, default to 0 for old format)
+        let (transparent_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) = if has_tx_counts {
+            (
+                u32::from_be_bytes(bytes[100..104].try_into().expect("transparent tx count must be 4 bytes")),
+                u32::from_be_bytes(bytes[104..108].try_into().expect("sprout tx count must be 4 bytes")),
+                u32::from_be_bytes(bytes[108..112].try_into().expect("sapling tx count must be 4 bytes")),
+                u32::from_be_bytes(bytes[112..116].try_into().expect("orchard tx count must be 4 bytes")),
+            )
+        } else {
+            (0, 0, 0, 0)
+        };
+        
+        // Inflow/outflow (new fields, default to 0 for old format)
+        let (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+             sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow) = if has_inflow_outflow {
+            (
+                u64::from_be_bytes(bytes[116..124].try_into().expect("transparent inflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[124..132].try_into().expect("transparent outflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[132..140].try_into().expect("sprout inflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[140..148].try_into().expect("sprout outflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[148..156].try_into().expect("sapling inflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[156..164].try_into().expect("sapling outflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[164..172].try_into().expect("orchard inflow must be 8 bytes")),
+                u64::from_be_bytes(bytes[172..180].try_into().expect("orchard outflow must be 8 bytes")),
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0)
+        };
+        
         SnapshotData {
             holder_count,
             pool_values,
@@ -172,6 +312,18 @@ impl FromDisk for SnapshotData {
             total_issuance,
             inflation_rate_bps,
             block_timestamp,
+            transparent_tx_count,
+            sprout_tx_count,
+            sapling_tx_count,
+            orchard_tx_count,
+            transparent_inflow,
+            transparent_outflow,
+            sprout_inflow,
+            sprout_outflow,
+            sapling_inflow,
+            sapling_outflow,
+            orchard_inflow,
+            orchard_outflow,
         }
     }
 }
@@ -651,6 +803,226 @@ impl ZebraDb {
         
         Ok(inflation_rate)
     }
+    
+    /// Count transactions per pool between two heights (inclusive).
+    /// 
+    /// Returns (transparent_count, sprout_count, sapling_count, orchard_count).
+    /// Counts transactions that have any activity in each pool type.
+    fn count_transactions_by_pool(
+        &self,
+        start_height: Height,
+        end_height: Height,
+    ) -> Result<(u32, u32, u32, u32), BoxError> {
+        let mut transparent_count = 0u32;
+        let mut sprout_count = 0u32;
+        let mut sapling_count = 0u32;
+        let mut orchard_count = 0u32;
+        
+        // Iterate through all blocks from start_height to end_height (inclusive)
+        for h in start_height.0..=end_height.0 {
+            let block_height = Height(h);
+            let block = match self.block(block_height.into()) {
+                Some(b) => b,
+                None => {
+                    tracing::debug!(?block_height, "block not found, skipping transaction count");
+                    continue;
+                }
+            };
+            
+            // Count transactions in each pool
+            for transaction in &block.transactions {
+                // A transaction can belong to multiple pools, so we check each one
+                if transaction.has_transparent_inputs() || transaction.has_transparent_outputs() {
+                    transparent_count = transparent_count
+                        .checked_add(1)
+                        .ok_or_else(|| "transparent transaction count overflow")?;
+                }
+                
+                if transaction.has_sprout_joinsplit_data() {
+                    sprout_count = sprout_count
+                        .checked_add(1)
+                        .ok_or_else(|| "sprout transaction count overflow")?;
+                }
+                
+                if transaction.has_sapling_shielded_data() {
+                    sapling_count = sapling_count
+                        .checked_add(1)
+                        .ok_or_else(|| "sapling transaction count overflow")?;
+                }
+                
+                if transaction.has_orchard_shielded_data() {
+                    orchard_count = orchard_count
+                        .checked_add(1)
+                        .ok_or_else(|| "orchard transaction count overflow")?;
+                }
+            }
+        }
+        
+        Ok((transparent_count, sprout_count, sapling_count, orchard_count))
+    }
+    
+    /// Calculate inflow and outflow for each pool between two heights (inclusive).
+    /// 
+    /// Returns (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+    ///          sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow).
+    /// 
+    /// Inflow = value entering the pool
+    /// Outflow = value leaving the pool
+    fn calculate_pool_flows(
+        &self,
+        start_height: Height,
+        end_height: Height,
+    ) -> Result<(
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+        Amount<NonNegative>,
+    ), BoxError> {
+        use std::ops::Add;
+        use zebra_chain::transparent::Utxo;
+        use std::collections::HashMap;
+        
+        let mut transparent_inflow = Amount::<NonNegative>::zero();
+        let mut transparent_outflow = Amount::<NonNegative>::zero();
+        let mut sprout_inflow = Amount::<NonNegative>::zero();
+        let mut sprout_outflow = Amount::<NonNegative>::zero();
+        let mut sapling_inflow = Amount::<NonNegative>::zero();
+        let mut sapling_outflow = Amount::<NonNegative>::zero();
+        let mut orchard_inflow = Amount::<NonNegative>::zero();
+        let mut orchard_outflow = Amount::<NonNegative>::zero();
+        
+        // Iterate through all blocks from start_height to end_height (inclusive)
+        for h in start_height.0..=end_height.0 {
+            let block_height = Height(h);
+            let block = match self.block(block_height.into()) {
+                Some(b) => b,
+                None => {
+                    tracing::debug!(?block_height, "block not found, skipping flow calculation");
+                    continue;
+                }
+            };
+            
+            // Build UTXO map for transparent value balance calculation
+            // We need to track UTXOs created in previous transactions in this block
+            let mut block_utxos = HashMap::new();
+            for (tx_idx, tx) in block.transactions.iter().enumerate() {
+                for (out_idx, output) in tx.outputs().iter().enumerate() {
+                    let outpoint = zebra_chain::transparent::OutPoint {
+                        hash: tx.hash(),
+                        index: out_idx as u32,
+                    };
+                    let utxo = Utxo::from_location(
+                        output.clone(),
+                        block_height,
+                        tx_idx,
+                    );
+                    block_utxos.insert(outpoint, utxo);
+                }
+            }
+            
+            // Calculate flows for each transaction
+            for transaction in &block.transactions {
+                // Transparent pool: sum outputs (inflow) and inputs (outflow)
+                for output in transaction.outputs() {
+                    let value = output.value();
+                    transparent_inflow = transparent_inflow
+                        .add(value)
+                        .map_err(|e| format!("overflow calculating transparent inflow: {}", e))?;
+                }
+                
+                // Try block UTXOs first (for same-block references), then database
+                for input in transaction.inputs() {
+                    if let Some(outpoint) = input.outpoint() {
+                        let input_value = if let Some(utxo) = block_utxos.get(&outpoint) {
+                            // UTXO from earlier transaction in same block
+                            Some(utxo.output.value())
+                        } else {
+                            // UTXO from previous blocks - look up from database
+                            self.utxo(&outpoint)
+                                .map(|ordered_utxo| ordered_utxo.utxo.output.value())
+                        };
+                        
+                        if let Some(value) = input_value {
+                            transparent_outflow = transparent_outflow
+                                .add(value)
+                                .map_err(|e| format!("overflow calculating transparent outflow: {}", e))?;
+                        }
+                    }
+                }
+                
+                // Sprout pool: vpub_new (inflow) and vpub_old (outflow)
+                for vpub_new in transaction.input_values_from_sprout() {
+                    sprout_inflow = sprout_inflow
+                        .add(*vpub_new)
+                        .map_err(|e| format!("overflow calculating sprout inflow: {}", e))?;
+                }
+                
+                for vpub_old in transaction.output_values_to_sprout() {
+                    sprout_outflow = sprout_outflow
+                        .add(*vpub_old)
+                        .map_err(|e| format!("overflow calculating sprout outflow: {}", e))?;
+                }
+                
+                // Sapling pool: value_balance represents net change
+                // Negative value_balance = net inflow, positive = net outflow
+                let sapling_vb = transaction.sapling_value_balance();
+                let sapling_net = sapling_vb.sapling_amount();
+                let sapling_zatoshis = sapling_net.zatoshis();
+                if sapling_zatoshis < 0 {
+                    // Net inflow: value entering sapling pool
+                    // Convert negative to positive for NonNegative
+                    if let Ok(neg_amount) = Amount::<NonNegative>::try_from((-sapling_zatoshis) as u64) {
+                        sapling_inflow = sapling_inflow
+                            .add(neg_amount)
+                            .map_err(|e| format!("overflow calculating sapling inflow: {}", e))?;
+                    }
+                } else if sapling_zatoshis > 0 {
+                    // Net outflow: value leaving sapling pool
+                    if let Ok(pos_amount) = Amount::<NonNegative>::try_from(sapling_zatoshis as u64) {
+                        sapling_outflow = sapling_outflow
+                            .add(pos_amount)
+                            .map_err(|e| format!("overflow calculating sapling outflow: {}", e))?;
+                    }
+                }
+                
+                // Orchard pool: value_balance represents net change
+                // Negative value_balance = net inflow, positive = net outflow
+                let orchard_vb = transaction.orchard_value_balance();
+                let orchard_net = orchard_vb.orchard_amount();
+                let orchard_zatoshis = orchard_net.zatoshis();
+                if orchard_zatoshis < 0 {
+                    // Net inflow: value entering orchard pool
+                    if let Ok(neg_amount) = Amount::<NonNegative>::try_from((-orchard_zatoshis) as u64) {
+                        orchard_inflow = orchard_inflow
+                            .add(neg_amount)
+                            .map_err(|e| format!("overflow calculating orchard inflow: {}", e))?;
+                    }
+                } else if orchard_zatoshis > 0 {
+                    // Net outflow: value leaving orchard pool
+                    if let Ok(pos_amount) = Amount::<NonNegative>::try_from(orchard_zatoshis as u64) {
+                        orchard_outflow = orchard_outflow
+                            .add(pos_amount)
+                            .map_err(|e| format!("overflow calculating orchard outflow: {}", e))?;
+                    }
+                }
+            }
+        }
+        
+        Ok((
+            transparent_inflow,
+            transparent_outflow,
+            sprout_inflow,
+            sprout_outflow,
+            sapling_inflow,
+            sapling_outflow,
+            orchard_inflow,
+            orchard_outflow,
+        ))
+    }
 
     /// Stores snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
     /// to RocksDB at the given block height.
@@ -707,7 +1079,22 @@ impl ZebraDb {
         // 8. Convert difficulty to bytes (big-endian)
         let difficulty_bytes = difficulty.bytes_in_serialized_order();
         
-        // 9. Create snapshot data
+        // 9. Count transactions per pool from previous snapshot to current snapshot
+        // Previous snapshot is at height - 1000 (or 0 if this is the first snapshot)
+        let previous_snapshot_height = if height.0 >= 1000 {
+            Height(height.0 - 1000)
+        } else {
+            Height(0)
+        };
+        let (transparent_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) =
+            self.count_transactions_by_pool(previous_snapshot_height, height)?;
+        
+        // 10. Calculate inflow/outflow for each pool
+        let (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+             sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow) =
+            self.calculate_pool_flows(previous_snapshot_height, height)?;
+        
+        // 11. Create snapshot data
         let snapshot_data = SnapshotData::new(
             holder_count as u64,
             pool_values,
@@ -715,9 +1102,21 @@ impl ZebraDb {
             total_issuance,
             inflation_rate,
             block_timestamp,
+            transparent_tx_count,
+            sprout_tx_count,
+            sapling_tx_count,
+            orchard_tx_count,
+            transparent_inflow,
+            transparent_outflow,
+            sprout_inflow,
+            sprout_outflow,
+            sapling_inflow,
+            sapling_outflow,
+            orchard_inflow,
+            orchard_outflow,
         );
 
-        // 10. Store in RocksDB
+        // 12. Store in RocksDB
         let snapshot_cf = self.snapshot_data_by_height_cf();
         let mut batch = DiskWriteBatch::new();
         batch.zs_insert(snapshot_cf, &height, &snapshot_data);
@@ -731,6 +1130,18 @@ impl ZebraDb {
             total_issuance_zat = total_issuance.zatoshis(),
             inflation_rate_percent = inflation_rate,
             block_timestamp,
+            transparent_tx_count,
+            sprout_tx_count,
+            sapling_tx_count,
+            orchard_tx_count,
+            transparent_inflow_zat = transparent_inflow.zatoshis(),
+            transparent_outflow_zat = transparent_outflow.zatoshis(),
+            sprout_inflow_zat = sprout_inflow.zatoshis(),
+            sprout_outflow_zat = sprout_outflow.zatoshis(),
+            sapling_inflow_zat = sapling_inflow.zatoshis(),
+            sapling_outflow_zat = sapling_outflow.zatoshis(),
+            orchard_inflow_zat = orchard_inflow.zatoshis(),
+            orchard_outflow_zat = orchard_outflow.zatoshis(),
             "stored snapshot data to RocksDB"
         );
 
