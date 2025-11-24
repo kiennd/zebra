@@ -248,6 +248,33 @@ pub trait Rpc {
         limit: Option<usize>,
     ) -> Result<GetHolderCountSnapshotsResponse>;
 
+    /// Returns snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
+    ///
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// Returns a list of snapshot data for blocks where the height is divisible by 1000, sorted by height.
+    /// Each snapshot contains:
+    /// - holder_count: Number of addresses with non-zero balances
+    /// - pool_values: All 5 value pool balances (transparent, sprout, sapling, orchard, deferred)
+    /// - difficulty: Mining difficulty at that height
+    /// - total_issuance: Total ZEC issued up to that height
+    /// - inflation_rate: Annual inflation rate percentage
+    /// - block_timestamp: Unix timestamp of the block
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the snapshot data column family and may be slow.
+    #[method(name = "getsnapshotdata")]
+    async fn get_snapshot_data(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetSnapshotDataResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1184,8 +1211,27 @@ where
         &self,
         limit: Option<usize>,
     ) -> Result<GetHolderCountSnapshotsResponse> {
+        // Reuse the snapshot data API and extract holder_count
+        let snapshot_response = self.get_snapshot_data(limit).await?;
+        
+        Ok(GetHolderCountSnapshotsResponse {
+            snapshots: snapshot_response
+                .snapshots()
+                .iter()
+                .map(|snapshot| HolderCountSnapshot {
+                    height: snapshot.height(),
+                    holder_count: snapshot.holder_count(),
+                })
+                .collect(),
+        })
+    }
+
+    async fn get_snapshot_data(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetSnapshotDataResponse> {
         let limit = limit.unwrap_or(100);
-        let request = zebra_state::ReadRequest::HolderCountSnapshots { limit };
+        let request = zebra_state::ReadRequest::SnapshotData { limit };
         let response = self
             .read_state
             .clone()
@@ -1194,13 +1240,25 @@ where
             .map_misc_error()?;
 
         match response {
-            zebra_state::ReadResponse::HolderCountSnapshots { snapshots } => {
-                Ok(GetHolderCountSnapshotsResponse {
+            zebra_state::ReadResponse::SnapshotData { snapshots } => {
+                use hex;
+                Ok(GetSnapshotDataResponse {
                     snapshots: snapshots
                         .into_iter()
-                        .map(|(height, count)| HolderCountSnapshot {
-                            height: height.0,
-                            holder_count: count,
+                        .map(|(height, (holder_count, pool_values, difficulty_bytes, total_issuance, inflation_rate_percent, block_timestamp))| {
+                            SnapshotDataEntry {
+                                height: height.0,
+                                holder_count,
+                                pool_transparent: pool_values.transparent_amount(),
+                                pool_sprout: pool_values.sprout_amount(),
+                                pool_sapling: pool_values.sapling_amount(),
+                                pool_orchard: pool_values.orchard_amount(),
+                                pool_deferred: pool_values.deferred_amount(),
+                                difficulty: hex::encode(difficulty_bytes),
+                                total_issuance,
+                                inflation_rate_percent,
+                                block_timestamp,
+                            }
                         })
                         .collect(),
                 })
@@ -3577,6 +3635,66 @@ pub struct HolderCountSnapshot {
 pub struct GetHolderCountSnapshotsResponse {
     /// List of holder count snapshots, sorted by height.
     pub snapshots: Vec<HolderCountSnapshot>,
+}
+
+/// A single snapshot data entry.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct SnapshotDataEntry {
+    /// The block height at which this snapshot was taken.
+    #[getter(copy)]
+    pub height: u32,
+    /// The number of holders (addresses with non-zero balances) at this height.
+    #[getter(copy)]
+    pub holder_count: u64,
+    /// Transparent pool value (in zatoshis).
+    #[getter(copy)]
+    pub pool_transparent: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sprout pool value (in zatoshis).
+    #[getter(copy)]
+    pub pool_sprout: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Sapling pool value (in zatoshis).
+    #[getter(copy)]
+    pub pool_sapling: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Orchard pool value (in zatoshis).
+    #[getter(copy)]
+    pub pool_orchard: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Deferred pool value (in zatoshis).
+    #[getter(copy)]
+    pub pool_deferred: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Mining difficulty (expanded difficulty as 32 bytes in big-endian, hex encoded).
+    pub difficulty: String,
+    /// Total ZEC issuance up to this height (in zatoshis).
+    #[getter(copy)]
+    pub total_issuance: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Annual inflation rate as a percentage (e.g., 2.5 means 2.5%).
+    #[getter(copy)]
+    pub inflation_rate_percent: f64,
+    /// Block timestamp (Unix timestamp in seconds).
+    #[getter(copy)]
+    pub block_timestamp: i64,
+}
+
+/// Response to [`RpcServer::get_snapshot_data`] RPC method.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetSnapshotDataResponse {
+    /// List of snapshot data entries, sorted by height.
+    pub snapshots: Vec<SnapshotDataEntry>,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.

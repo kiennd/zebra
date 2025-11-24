@@ -1956,10 +1956,39 @@ impl Service<ReadRequest> for ReadStateService {
                 let state = self.clone();
                 tokio::task::spawn_blocking(move || {
                     span.in_scope(move || {
-                        // Use efficient reverse iteration to get only the last N snapshots
-                        let snapshots = state.db.recent_holder_count_snapshots(limit);
+                        // Reuse snapshot data logic and extract holder_count
+                        let snapshots = state.db.recent_snapshot_data(limit)
+                            .into_iter()
+                            .map(|(height, snapshot_data)| (height, snapshot_data.holder_count()))
+                            .collect();
                         timer.finish(module_path!(), line!(), "ReadRequest::HolderCountSnapshots");
                         Ok(ReadResponse::HolderCountSnapshots { snapshots })
+                    })
+                })
+                .wait_for_panics()
+            }
+            ReadRequest::SnapshotData { limit } => {
+                let timer = CodeTimer::start();
+                let state = self.clone();
+                tokio::task::spawn_blocking(move || {
+                    span.in_scope(move || {
+                        // Use efficient reverse iteration to get only the last N snapshots
+                        let snapshots = state.db.recent_snapshot_data(limit)
+                            .into_iter()
+                            .map(|(height, snapshot_data)| (
+                                height,
+                                (
+                                    snapshot_data.holder_count(),
+                                    snapshot_data.pool_values(),
+                                    snapshot_data.difficulty_bytes(),
+                                    snapshot_data.total_issuance(),
+                                    snapshot_data.inflation_rate_percent(),
+                                    snapshot_data.block_timestamp(),
+                                )
+                            ))
+                            .collect();
+                        timer.finish(module_path!(), line!(), "ReadRequest::SnapshotData");
+                        Ok(ReadResponse::SnapshotData { snapshots })
                     })
                 })
                 .wait_for_panics()

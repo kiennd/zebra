@@ -21,9 +21,14 @@ use rocksdb::ColumnFamily;
 use zebra_chain::{
     amount::{self, Amount, Constraint, NonNegative},
     block::Height,
-    parameters::Network,
+    parameters::{
+        subsidy::block_subsidy,
+        Network, NetworkUpgrade,
+    },
+    serialization::BytesInDisplayOrder,
     transaction::{self, Transaction},
     transparent::{self, Input},
+    value_balance::ValueBalance,
 };
 
 use crate::{
@@ -54,25 +59,120 @@ pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 /// The name of the [`BALANCE_BY_TRANSPARENT_ADDR`] column family's merge operator
 pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_received";
 
-/// The name of the holder count by block height column family.
-pub const HOLDER_COUNT_BY_HEIGHT: &str = "holder_count_by_height";
+/// The name of the snapshot data by block height column family.
+/// Stores holder count, pool values, difficulty, issuance, inflation rate, and timestamp.
+pub const SNAPSHOT_DATA_BY_HEIGHT: &str = "snapshot_data_by_height";
 
-/// Holder count stored in RocksDB (8 bytes, u64).
+/// Snapshot data stored in RocksDB containing holder count, pool values, difficulty, issuance, and timestamp.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct HolderCount(u64);
+pub struct SnapshotData {
+    /// Number of holders (addresses with non-zero balances).
+    holder_count: u64,
+    /// Pool values (value balance) at this height.
+    pool_values: ValueBalance<NonNegative>,
+    /// Mining difficulty (expanded difficulty as U256, stored as 32 bytes in big-endian).
+    difficulty: [u8; 32],
+    /// Total ZEC issuance up to this height (in zatoshis).
+    total_issuance: u64,
+    /// Inflation rate per year (in basis points, e.g., 200 = 2.00%).
+    /// Stored as u32: 0 = 0%, 10000 = 100.00%.
+    inflation_rate_bps: u32,
+    /// Block timestamp (Unix timestamp in seconds).
+    block_timestamp: i64,
+}
 
-impl IntoDisk for HolderCount {
-    type Bytes = [u8; 8];
+impl SnapshotData {
+    /// Creates a new SnapshotData.
+    pub fn new(
+        holder_count: u64,
+        pool_values: ValueBalance<NonNegative>,
+        difficulty_bytes: [u8; 32],
+        total_issuance: Amount<NonNegative>,
+        inflation_rate_percent: f64,
+        block_timestamp: i64,
+    ) -> Self {
+        // Convert inflation rate to basis points (hundredths of a percent)
+        let inflation_rate_bps = (inflation_rate_percent * 100.0).round() as u32;
+        
+        SnapshotData {
+            holder_count,
+            pool_values,
+            difficulty: difficulty_bytes,
+            total_issuance: total_issuance.zatoshis() as u64,
+            inflation_rate_bps,
+            block_timestamp,
+        }
+    }
 
-    fn as_bytes(&self) -> Self::Bytes {
-        self.0.to_be_bytes()
+    pub fn holder_count(&self) -> u64 {
+        self.holder_count
+    }
+
+    pub fn pool_values(&self) -> ValueBalance<NonNegative> {
+        self.pool_values
+    }
+    
+    pub fn difficulty_bytes(&self) -> [u8; 32] {
+        self.difficulty
+    }
+    
+    pub fn total_issuance(&self) -> Amount<NonNegative> {
+        Amount::try_from(self.total_issuance).expect("total_issuance should be valid")
+    }
+    
+    pub fn inflation_rate_percent(&self) -> f64 {
+        self.inflation_rate_bps as f64 / 100.0
+    }
+    
+    pub fn block_timestamp(&self) -> i64 {
+        self.block_timestamp
     }
 }
 
-impl FromDisk for HolderCount {
+impl IntoDisk for SnapshotData {
+    type Bytes = Vec<u8>;
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = Vec::with_capacity(8 + 40 + 32 + 8 + 4 + 8); // 100 bytes total
+        bytes.extend_from_slice(&self.holder_count.to_be_bytes());
+        bytes.extend_from_slice(&self.pool_values.as_bytes());
+        bytes.extend_from_slice(&self.difficulty);
+        bytes.extend_from_slice(&self.total_issuance.to_be_bytes());
+        bytes.extend_from_slice(&self.inflation_rate_bps.to_be_bytes());
+        bytes.extend_from_slice(&self.block_timestamp.to_be_bytes());
+        bytes
+    }
+}
+
+impl FromDisk for SnapshotData {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let array: [u8; 8] = bytes.as_ref().try_into().expect("holder count must be 8 bytes");
-        HolderCount(u64::from_be_bytes(array))
+        let bytes = bytes.as_ref();
+        assert!(bytes.len() >= 100, "snapshot data must be at least 100 bytes");
+        
+        let holder_count = u64::from_be_bytes(
+            bytes[0..8].try_into().expect("holder count must be 8 bytes")
+        );
+        let pool_values = ValueBalance::<NonNegative>::from_bytes(&bytes[8..48])
+            .expect("pool values must be 40 bytes");
+        let difficulty: [u8; 32] = bytes[48..80].try_into().expect("difficulty must be 32 bytes");
+        let total_issuance = u64::from_be_bytes(
+            bytes[80..88].try_into().expect("total issuance must be 8 bytes")
+        );
+        let inflation_rate_bps = u32::from_be_bytes(
+            bytes[88..92].try_into().expect("inflation rate must be 4 bytes")
+        );
+        let block_timestamp = i64::from_be_bytes(
+            bytes[92..100].try_into().expect("block timestamp must be 8 bytes")
+        );
+        
+        SnapshotData {
+            holder_count,
+            pool_values,
+            difficulty,
+            total_issuance,
+            inflation_rate_bps,
+            block_timestamp,
+        }
     }
 }
 
@@ -128,9 +228,9 @@ impl ZebraDb {
         self.db.cf_handle(BALANCE_BY_TRANSPARENT_ADDR).unwrap()
     }
 
-    /// Returns a handle to the `holder_count_by_height` RocksDB column family.
-    pub fn holder_count_by_height_cf(&self) -> &ColumnFamily {
-        self.db.cf_handle(HOLDER_COUNT_BY_HEIGHT).unwrap()
+    /// Returns a handle to the `snapshot_data_by_height` RocksDB column family.
+    pub fn snapshot_data_by_height_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(SNAPSHOT_DATA_BY_HEIGHT).unwrap()
     }
 
     /// Returns the [`AddressBalanceLocation`] for a [`transparent::Address`],
@@ -432,56 +532,20 @@ impl ZebraDb {
             .count()
     }
 
-    /// Stores the holder count (number of addresses with balances) to RocksDB at the given block height.
-    ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
-    /// It should be run in a blocking thread to avoid hanging the tokio executor.
-    ///
-    /// # Parameters
-    ///
-    /// - `height`: The block height at which this snapshot is taken
-    pub fn store_holder_count_snapshot(
-        &self,
-        height: Height,
-    ) -> Result<(), BoxError> {
-        // Count holders (addresses with non-zero balances)
-        let holder_count = self.holder_count();
-
-        // Store in RocksDB using a write batch
-        let holder_count_cf = self.holder_count_by_height_cf();
-        let mut batch = DiskWriteBatch::new();
-        
-        // Store holder count
-        let holder_count_value = HolderCount(holder_count as u64);
-        batch.zs_insert(holder_count_cf, &height, &holder_count_value);
-
-        // Write the batch
-        self.db.write(batch)?;
-
-        tracing::info!(
-            ?height,
-            holder_count,
-            "stored holder count snapshot to RocksDB"
-        );
-
-        Ok(())
-    }
-
-    /// Returns the holder count for a given block height, if it was stored.
+    /// Returns the holder count for a given block height, if it was stored in a snapshot.
     ///
     /// Returns `None` if no snapshot was stored at that height.
+    /// This reads from the snapshot data column family.
     pub fn holder_count_at_height(&self, height: Height) -> Option<u64> {
-        let holder_count_cf = self.holder_count_by_height_cf();
-        let holder_count: HolderCount = self.db.zs_get(holder_count_cf, &height)?;
-        Some(holder_count.0)
+        let snapshot_data = self.snapshot_data_at_height(height)?;
+        Some(snapshot_data.holder_count())
     }
 
     /// Returns the most recent holder count snapshots, limited to the specified count.
     ///
     /// Returns a vector of (height, holder_count) pairs, sorted by height (ascending).
     /// Uses reverse iteration to efficiently get only the most recent snapshots.
+    /// This reads from the snapshot data column family.
     ///
     /// # Parameters
     ///
@@ -492,17 +556,219 @@ impl ZebraDb {
     /// This method uses reverse iteration to only read the last N snapshots,
     /// avoiding a full scan of the column family.
     pub fn recent_holder_count_snapshots(&self, limit: usize) -> Vec<(Height, u64)> {
-        let typed_cf = TypedColumnFamily::<Height, HolderCount>::new(
+        self.recent_snapshot_data(limit)
+            .into_iter()
+            .map(|(height, snapshot_data)| (height, snapshot_data.holder_count()))
+            .collect()
+    }
+
+    /// Calculate total ZEC issuance up to a given height.
+    /// This sums all block subsidies from the end of slow start interval to the given height.
+    /// 
+    /// Note: Blocks in the slow start interval (height 0 to slow_start_interval) are not included
+    /// because block_subsidy() doesn't support those heights. The slow start period represents
+    /// a small portion of total issuance and is handled through checkpointing.
+    fn calculate_total_issuance(
+        &self,
+        height: Height,
+        network: &Network,
+    ) -> Result<Amount<NonNegative>, BoxError> {
+        use std::ops::Add;
+        
+        let mut total = Amount::zero();
+        let slow_start_end = network.slow_start_interval();
+        
+        // Start from the end of slow start interval since block_subsidy doesn't support
+        // heights in the slow start period (0 to slow_start_interval)
+        let start_height = if height < slow_start_end {
+            // If we're still in slow start, return zero (no supported subsidies yet)
+            return Ok(Amount::zero());
+        } else {
+            slow_start_end.0
+        };
+        
+        // Sum block subsidies from end of slow start to the given height
+        for h in start_height..=height.0 {
+            let block_height = Height(h);
+            match block_subsidy(block_height, network) {
+                Ok(subsidy) => {
+                    total = total
+                        .add(subsidy)
+                        .map_err(|e| format!("overflow calculating total issuance at height {}: {}", h, e))?;
+                }
+                Err(e) => {
+                    // Skip heights that don't support subsidy calculation
+                    // This handles edge cases and future network upgrades
+                    tracing::debug!(
+                        ?block_height,
+                        error = ?e,
+                        "skipping block subsidy calculation for unsupported height"
+                    );
+                }
+            }
+        }
+        
+        Ok(total)
+    }
+    
+    /// Calculate annual inflation rate at a given height.
+    /// 
+    /// Formula: (block_subsidy_at_height * blocks_per_year / total_supply) * 100
+    /// 
+    /// Blocks per year:
+    /// - Before Blossom: 210240 blocks/year (150 seconds per block)
+    /// - After Blossom: 420480 blocks/year (75 seconds per block)
+    fn calculate_inflation_rate(
+        &self,
+        height: Height,
+        network: &Network,
+        total_supply: Amount<NonNegative>,
+    ) -> Result<f64, BoxError> {
+        // Determine blocks per year based on network upgrade
+        let blocks_per_year = if let Some(blossom_height) = NetworkUpgrade::Blossom.activation_height(network) {
+            if height >= blossom_height {
+                420_480.0 // 75 seconds per block after Blossom
+            } else {
+                210_240.0 // 150 seconds per block before Blossom
+            }
+        } else {
+            210_240.0 // Default to pre-Blossom if Blossom is not activated
+        };
+        
+        let block_subsidy_amount = block_subsidy(height, network)
+            .map_err(|e| format!("failed to get block subsidy: {}", e))?;
+        
+        // Avoid division by zero
+        if total_supply == Amount::<NonNegative>::zero() {
+            return Ok(0.0);
+        }
+        
+        // Calculate annual inflation rate as percentage
+        let annual_issuance_zat = (block_subsidy_amount.zatoshis() as f64) * blocks_per_year;
+        let total_supply_zat = total_supply.zatoshis() as f64;
+        
+        let inflation_rate = (annual_issuance_zat / total_supply_zat) * 100.0;
+        
+        Ok(inflation_rate)
+    }
+
+    /// Stores snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
+    /// to RocksDB at the given block height.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the entire balance column family and may be slow.
+    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    ///
+    /// # Parameters
+    ///
+    /// - `height`: The block height at which this snapshot is taken
+    /// - `network`: The network (mainnet/testnet/regtest) for subsidy calculations
+    pub fn store_snapshot_data(
+        &self,
+        height: Height,
+        network: &Network,
+    ) -> Result<(), BoxError> {
+        // 1. Count holders
+        let holder_count = self.holder_count();
+        
+        // 2. Get pool values
+        let pool_values = self.finalized_value_pool();
+        
+        // 3. Get block header for difficulty and timestamp
+        let block = self.block(height.into())
+            .ok_or_else(|| format!("block at height {:?} not found", height))?;
+        let header = &block.header;
+        
+        // 4. Get mining difficulty (expanded difficulty)
+        let difficulty = header.difficulty_threshold
+            .to_expanded()
+            .ok_or_else(|| "invalid difficulty threshold".to_string())?;
+        
+        // 5. Get block timestamp (Unix timestamp in seconds)
+        let block_timestamp = header.time.timestamp();
+        
+        // 6. Calculate total issuance up to this height
+        // Note: This only includes blocks from slow_start_interval onwards,
+        // as block_subsidy() doesn't support heights in the slow start period.
+        let total_issuance = self.calculate_total_issuance(height, network)?;
+        
+        // 7. Calculate inflation rate using pool values as total supply
+        // Pool values represent the actual monetary base (all ZEC in circulation),
+        // which is more accurate than calculated issuance (which excludes slow start).
+        let total_supply = (pool_values.transparent_amount()
+            + pool_values.sprout_amount()
+            + pool_values.sapling_amount()
+            + pool_values.orchard_amount()
+            + pool_values.deferred_amount())
+            .map_err(|e| format!("overflow calculating total supply from pool values: {}", e))?;
+        let inflation_rate = self.calculate_inflation_rate(height, network, total_supply)?;
+        
+        // 8. Convert difficulty to bytes (big-endian)
+        let difficulty_bytes = difficulty.bytes_in_serialized_order();
+        
+        // 9. Create snapshot data
+        let snapshot_data = SnapshotData::new(
+            holder_count as u64,
+            pool_values,
+            difficulty_bytes,
+            total_issuance,
+            inflation_rate,
+            block_timestamp,
+        );
+
+        // 10. Store in RocksDB
+        let snapshot_cf = self.snapshot_data_by_height_cf();
+        let mut batch = DiskWriteBatch::new();
+        batch.zs_insert(snapshot_cf, &height, &snapshot_data);
+        self.db.write(batch)?;
+
+        tracing::info!(
+            ?height,
+            holder_count,
+            ?pool_values,
+            ?difficulty,
+            total_issuance_zat = total_issuance.zatoshis(),
+            inflation_rate_percent = inflation_rate,
+            block_timestamp,
+            "stored snapshot data to RocksDB"
+        );
+
+        Ok(())
+    }
+
+    /// Returns the snapshot data for a given block height, if it was stored.
+    ///
+    /// Returns `None` if no snapshot was stored at that height.
+    pub fn snapshot_data_at_height(&self, height: Height) -> Option<SnapshotData> {
+        let snapshot_cf = self.snapshot_data_by_height_cf();
+        self.db.zs_get(snapshot_cf, &height)
+    }
+
+    /// Returns the most recent snapshot data, limited to the specified count.
+    ///
+    /// Returns a vector of (height, snapshot_data) pairs, sorted by height (ascending).
+    /// Uses reverse iteration to efficiently get only the most recent snapshots.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: Maximum number of snapshots to return
+    ///
+    /// # Performance
+    ///
+    /// This method uses reverse iteration to only read the last N snapshots,
+    /// avoiding a full scan of the column family.
+    pub fn recent_snapshot_data(&self, limit: usize) -> Vec<(Height, SnapshotData)> {
+        let typed_cf = TypedColumnFamily::<Height, SnapshotData>::new(
             &self.db,
-            HOLDER_COUNT_BY_HEIGHT,
+            SNAPSHOT_DATA_BY_HEIGHT,
         )
         .expect("column family was created when database was created");
 
         // Use reverse iteration to get the most recent snapshots first
-        let mut snapshots: Vec<(Height, u64)> = typed_cf
+        let mut snapshots: Vec<(Height, SnapshotData)> = typed_cf
             .zs_reverse_range_iter(..)
             .take(limit)
-            .map(|(height, holder_count)| (height, holder_count.0))
             .collect();
 
         // Reverse to get ascending order by height

@@ -1285,6 +1285,16 @@ pub enum ReadRequest {
         limit: usize,
     },
 
+    /// Returns snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
+    ///
+    /// # Warning
+    ///
+    /// This operation scans the snapshot data column family and may be slow.
+    SnapshotData {
+        /// Maximum number of snapshots to return.
+        limit: usize,
+    },
+
     /// Looks up transaction hashes that were sent or received from addresses,
     /// in an inclusive blockchain height range.
     ///
@@ -1398,6 +1408,7 @@ impl ReadRequest {
             ReadRequest::AddressCount => "address_count",
             ReadRequest::TopAddressesByBalance { .. } => "top_addresses_by_balance",
             ReadRequest::HolderCountSnapshots { .. } => "holder_count_snapshots",
+            ReadRequest::SnapshotData { .. } => "snapshot_data",
             ReadRequest::TransactionIdsByAddresses { .. } => "transaction_ids_by_addresses",
             ReadRequest::UtxosByAddresses(_) => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {

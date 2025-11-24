@@ -96,8 +96,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "history_tree",
     "tip_chain_value_pool",
     BLOCK_INFO,
-    // Holder counts
-    zebra_db::transparent::HOLDER_COUNT_BY_HEIGHT,
+    // Snapshot data (holder count + pool values + difficulty + issuance + inflation + timestamp)
+    zebra_db::transparent::SNAPSHOT_DATA_BY_HEIGHT,
 ];
 
 /// The finalized part of the chain state, stored in the db.

@@ -296,9 +296,11 @@ impl WriteBlockWorkerTask {
 
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
 
-                    // Store holder count snapshot when block height is divisible by 1000
+                    // Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
+                    // when block height is divisible by 1000
                     if block_height.0 % 1000 == 0 {
-                        store_holder_count_snapshot(&finalized_state.db, block_height);
+                        let network = non_finalized_state.network.clone();
+                        store_snapshot_data(&finalized_state.db, block_height, network);
                     }
 
                     chain_tip_sender.set_finalized_tip(tip_block);
@@ -460,19 +462,20 @@ impl WriteBlockWorkerTask {
     }
 }
 
-/// Store holder count snapshot when block height is divisible by 1000.
+/// Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
+/// when block height is divisible by 1000.
 ///
 /// This operation scans the entire balance column family and may be slow,
 /// so it runs in a background thread to avoid blocking block commits.
-fn store_holder_count_snapshot(db: &ZebraDb, height: Height) {
+fn store_snapshot_data(db: &ZebraDb, height: Height, network: zebra_chain::parameters::Network) {
     // Store the snapshot in a background thread to avoid blocking block commits
     let db_clone = db.clone();
     std::thread::spawn(move || {
-        if let Err(e) = db_clone.store_holder_count_snapshot(height) {
+        if let Err(e) = db_clone.store_snapshot_data(height, &network) {
             tracing::warn!(
                 ?height,
                 error = ?e,
-                "failed to store holder count snapshot to RocksDB"
+                "failed to store snapshot data to RocksDB"
             );
         }
     });
