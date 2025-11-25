@@ -367,23 +367,38 @@ impl WriteBlockWorkerTask {
                     
                     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
                     
-                    // Debug logging to verify snapshot conditions
+                    // Log snapshot decision for debugging (every 100 blocks or when snapshot is triggered)
                     if block_height.0 % 100 == 0 || should_snapshot {
-                        tracing::debug!(
-                            ?block_height,
-                            ?block_timestamp,
-                            ?current_time,
-                            ?block_date,
-                            ?current_date,
-                            is_current_date,
-                            is_recent_block,
-                            is_fully_synced,
-                            non_finalized_len,
-                            should_daily_snapshot,
-                            should_realtime_snapshot,
-                            should_snapshot,
-                            "snapshot decision"
-                        );
+                        if should_snapshot {
+                            tracing::info!(
+                                ?block_height,
+                                ?block_timestamp,
+                                ?block_date,
+                                ?current_date,
+                                is_current_date,
+                                is_recent_block,
+                                is_fully_synced,
+                                non_finalized_len,
+                                should_daily_snapshot,
+                                should_realtime_snapshot,
+                                "snapshot will be created"
+                            );
+                        } else {
+                            tracing::debug!(
+                                ?block_height,
+                                ?block_timestamp,
+                                ?current_time,
+                                ?block_date,
+                                ?current_date,
+                                is_current_date,
+                                is_recent_block,
+                                is_fully_synced,
+                                non_finalized_len,
+                                should_daily_snapshot,
+                                should_realtime_snapshot,
+                                "snapshot decision: no snapshot"
+                            );
+                        }
                     }
                     
                     if should_snapshot {
