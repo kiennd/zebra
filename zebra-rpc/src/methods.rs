@@ -275,6 +275,26 @@ pub trait Rpc {
         limit: Option<usize>,
     ) -> Result<GetSnapshotDataResponse>;
 
+    /// Returns dashboard data from snapshots filtered by date range.
+    ///
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `start_date`: (string, optional) Start date in format "YY:MM:DD" (e.g., "24:01:01"). If not provided, starts from earliest snapshot.
+    /// - `end_date`: (string, optional) End date in format "YY:MM:DD" (e.g., "24:12:31"). If not provided, ends at latest snapshot.
+    ///
+    /// # Notes
+    ///
+    /// Returns dashboard data including supply, holder count, transaction counts, and other metrics within the date range.
+    #[method(name = "getdashboarddata")]
+    async fn get_dashboard_data(
+        &self,
+        start_date: Option<String>,
+        end_date: Option<String>,
+    ) -> Result<GetDashboardDataResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -1224,6 +1244,132 @@ where
                     holder_count: snapshot.holder_count(),
                 })
                 .collect(),
+        })
+    }
+
+    async fn get_dashboard_data(
+        &self,
+        start_date: Option<String>,
+        end_date: Option<String>,
+    ) -> Result<GetDashboardDataResponse> {
+        // Helper function to parse date string "YY:MM:DD" to (year, month, day) tuple
+        fn parse_date_key(date_str: &str) -> std::result::Result<(u8, u8, u8), String> {
+            let parts: Vec<&str> = date_str.split(':').collect();
+            if parts.len() != 3 {
+                return Err(format!("Expected format YY:MM:DD, got: {}", date_str));
+            }
+            
+            let year = parts[0].parse::<u8>()
+                .map_err(|_| format!("Invalid year: {}", parts[0]))?;
+            let month = parts[1].parse::<u8>()
+                .map_err(|_| format!("Invalid month: {}", parts[1]))?;
+            let day = parts[2].parse::<u8>()
+                .map_err(|_| format!("Invalid day: {}", parts[2]))?;
+            
+            if month < 1 || month > 12 {
+                return Err(format!("Month must be 1-12, got: {}", month));
+            }
+            if day < 1 || day > 31 {
+                return Err(format!("Day must be 1-31, got: {}", day));
+            }
+            
+            Ok((year, month, day))
+        }
+        
+        // Parse date strings to (year, month, day) tuples for comparison
+        let start_date_tuple = if let Some(date_str) = start_date.as_ref() {
+            Some(parse_date_key(date_str)
+                .map_err(|e| ErrorObject::owned(
+                    ErrorCode::InvalidParams.code(),
+                    format!("Invalid start_date format: {}", e),
+                    None::<()>,
+                ))?)
+        } else {
+            None
+        };
+        
+        let end_date_tuple = if let Some(date_str) = end_date.as_ref() {
+            Some(parse_date_key(date_str)
+                .map_err(|e| ErrorObject::owned(
+                    ErrorCode::InvalidParams.code(),
+                    format!("Invalid end_date format: {}", e),
+                    None::<()>,
+                ))?)
+        } else {
+            None
+        };
+
+        // Get all snapshots (we'll filter by date range in memory)
+        // For better performance with large datasets, we could add a new ReadRequest type
+        let snapshot_request = zebra_state::ReadRequest::SnapshotData { limit: 10000 };
+        let snapshot_response = self
+            .read_state
+            .clone()
+            .oneshot(snapshot_request)
+            .await
+            .map_misc_error()?;
+
+        let all_snapshots = match snapshot_response {
+            zebra_state::ReadResponse::SnapshotData { snapshots } => snapshots,
+            _ => return Err(ErrorObject::owned(
+                ErrorCode::InternalError.code(),
+                "Unexpected response type".to_string(),
+                None::<()>,
+            ).into()),
+        };
+
+        // Filter by date range
+        let filtered_snapshots: Vec<_> = all_snapshots
+            .into_iter()
+            .filter(|(date_key, _)| {
+                let date_tuple = (date_key.year, date_key.month, date_key.day);
+                let matches_start = start_date_tuple.map_or(true, |start| date_tuple >= start);
+                let matches_end = end_date_tuple.map_or(true, |end| date_tuple <= end);
+                matches_start && matches_end
+            })
+            .collect();
+
+        // Build response entries with all dashboard data (reusing SnapshotDataEntry)
+        let entries: Vec<SnapshotDataEntry> = filtered_snapshots
+            .into_iter()
+            .map(|(date_key, snapshot_data)| {
+                let pool_values = snapshot_data.pool_values();
+                SnapshotDataEntry {
+                    date_key: format!("{:02}:{:02}:{:02}", date_key.year, date_key.month, date_key.day),
+                    height: snapshot_data.block_height(),
+                    holder_count: snapshot_data.holder_count(),
+                    pool_transparent: pool_values.transparent_amount(),
+                    pool_sprout: pool_values.sprout_amount(),
+                    pool_sapling: pool_values.sapling_amount(),
+                    pool_orchard: pool_values.orchard_amount(),
+                    pool_deferred: pool_values.deferred_amount(),
+                    difficulty: hex::encode(snapshot_data.difficulty_bytes()),
+                    total_issuance: snapshot_data.total_issuance(),
+                    inflation_rate_percent: snapshot_data.inflation_rate_percent(),
+                    block_timestamp: snapshot_data.block_timestamp(),
+                    transparent_tx_count: snapshot_data.transparent_tx_count(),
+                    transparent_coinbase_tx_count: snapshot_data.transparent_coinbase_tx_count(),
+                    shielded_coinbase_migration_tx_count: snapshot_data.shielded_coinbase_migration_tx_count(),
+                    sprout_tx_count: snapshot_data.sprout_tx_count(),
+                    sapling_tx_count: snapshot_data.sapling_tx_count(),
+                    orchard_tx_count: snapshot_data.orchard_tx_count(),
+                    transparent_inflow: snapshot_data.transparent_inflow(),
+                    transparent_outflow: snapshot_data.transparent_outflow(),
+                    sprout_inflow: snapshot_data.sprout_inflow(),
+                    sprout_outflow: snapshot_data.sprout_outflow(),
+                    sapling_inflow: snapshot_data.sapling_inflow(),
+                    sapling_outflow: snapshot_data.sapling_outflow(),
+                    orchard_inflow: snapshot_data.orchard_inflow(),
+                    orchard_outflow: snapshot_data.orchard_outflow(),
+                    average_block_time: snapshot_data.average_block_time(),
+                    average_block_fee_zat: snapshot_data.average_block_fee_zat(),
+                    average_block_size: snapshot_data.average_block_size(),
+                }
+            })
+            .collect();
+
+        Ok(GetDashboardDataResponse {
+            entries,
         })
     }
 
@@ -3774,6 +3920,21 @@ pub struct SnapshotDataEntry {
 pub struct GetSnapshotDataResponse {
     /// List of snapshot data entries, sorted by height.
     pub snapshots: Vec<SnapshotDataEntry>,
+}
+
+/// Response to [`RpcServer::get_dashboard_data`] RPC method.
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    Getters,
+    new,
+)]
+pub struct GetDashboardDataResponse {
+    /// List of dashboard data entries, sorted by date.
+    pub entries: Vec<SnapshotDataEntry>,
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.

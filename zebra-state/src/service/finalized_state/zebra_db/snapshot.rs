@@ -1191,5 +1191,49 @@ impl ZebraDb {
         snapshots.reverse();
         snapshots
     }
+
+    /// Returns snapshot data within a date range.
+    ///
+    /// Returns a vector of (date_key, snapshot_data) pairs, sorted by date (ascending).
+    ///
+    /// # Parameters
+    ///
+    /// - `start_date`: Optional start date (inclusive). If None, starts from the earliest snapshot.
+    /// - `end_date`: Optional end date (inclusive). If None, ends at the latest snapshot.
+    pub fn snapshot_data_by_date_range(
+        &self,
+        start_date: Option<SnapshotDateKey>,
+        end_date: Option<SnapshotDateKey>,
+    ) -> Vec<(SnapshotDateKey, SnapshotData)> {
+        let typed_cf = TypedColumnFamily::<SnapshotDateKey, SnapshotData>::new(
+            &self.db,
+            SNAPSHOT_DATA_BY_DATE,
+        )
+        .expect("column family was created when database was created");
+
+        // Iterate through the range based on what's provided
+        match (start_date, end_date) {
+            (Some(start), Some(end)) => {
+                typed_cf
+                    .zs_forward_range_iter(start..=end)
+                    .collect()
+            }
+            (Some(start), None) => {
+                typed_cf
+                    .zs_forward_range_iter(start..)
+                    .collect()
+            }
+            (None, Some(end)) => {
+                typed_cf
+                    .zs_forward_range_iter(..=end)
+                    .collect()
+            }
+            (None, None) => {
+                typed_cf
+                    .zs_forward_range_iter(..)
+                    .collect()
+            }
+        }
+    }
 }
 

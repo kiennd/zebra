@@ -326,15 +326,36 @@ impl WriteBlockWorkerTask {
                     let current_time = chrono::Utc::now().timestamp();
                     let is_recent_block = (current_time - block_timestamp) < 3600; // Block is within last hour
                     let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
-                    let is_fully_synced = is_recent_block && non_finalized_len > 0;
                     
-                    // When fully synced, snapshot every confirmed block if we're at least 10 blocks behind the tip
-                    // The tip is approximately: finalized_height + non_finalized_len
+                    // Determine if we're fully synced:
+                    // - Block is recent (within last hour) AND
+                    // - Either we have non-finalized blocks (actively syncing) OR
+                    //   the block timestamp is very close to current time (within 5 minutes, meaning we're caught up) OR
+                    //   non_finalized_len is 0 (all blocks are finalized, meaning we're fully synced)
+                    let is_fully_synced = is_recent_block && (
+                        non_finalized_len > 0 || 
+                        (current_time - block_timestamp) < 300 || // Block is within last 5 minutes
+                        non_finalized_len == 0 // All blocks finalized = fully synced
+                    );
+                    
+                    // When fully synced, snapshot every confirmed block
+                    // The original logic had a bug: it checked if non_finalized_len >= 10,
+                    // but when fully synced, non_finalized_len is typically 0-2 blocks,
+                    // so the condition was never true and realtime snapshots never happened.
+                    // 
+                    // Fixed logic: When fully synced, snapshot every block that's at least
+                    // 10 blocks behind the estimated tip (to avoid reorgs), OR if we're at
+                    // the tip (non_finalized_len <= 2), snapshot every block for real-time data.
                     let should_realtime_snapshot = if is_fully_synced {
+                        // Calculate estimated tip height
                         let estimated_tip_height = block_height.0 + non_finalized_len as u32;
-                        // Only snapshot if we're at least 10 blocks behind the estimated tip
                         let blocks_behind_tip = estimated_tip_height.saturating_sub(block_height.0);
-                        blocks_behind_tip >= 10
+                        
+                        // When at the tip (non_finalized_len <= 2), snapshot every block for real-time data
+                        // When further behind (blocks_behind_tip >= 10), snapshot to avoid reorgs
+                        // This covers both cases: fully caught up (non_finalized_len <= 2) and
+                        // safely behind (blocks_behind_tip >= 10, which equals non_finalized_len >= 10)
+                        non_finalized_len <= 2 || blocks_behind_tip >= 10
                     } else {
                         false
                     };
