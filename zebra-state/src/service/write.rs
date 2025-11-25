@@ -341,9 +341,10 @@ impl WriteBlockWorkerTask {
                     //   the block timestamp is very close to current time (within 5 minutes, meaning we're caught up) OR
                     //   non_finalized_len is 0 (all blocks are finalized, meaning we're fully synced)
                     let is_recent_block = (current_time - block_timestamp) < 3600; // Block is within last hour
+                    let time_diff_seconds = current_time - block_timestamp;
                     let is_fully_synced = is_recent_block && (
                         non_finalized_len > 0 || 
-                        (current_time - block_timestamp) < 300 || // Block is within last 5 minutes
+                        time_diff_seconds < 300 || // Block is within last 5 minutes
                         non_finalized_len == 0 // All blocks finalized = fully synced
                     );
                     
@@ -367,38 +368,37 @@ impl WriteBlockWorkerTask {
                     
                     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
                     
-                    // Log snapshot decision for debugging (every 100 blocks or when snapshot is triggered)
-                    if block_height.0 % 100 == 0 || should_snapshot {
-                        if should_snapshot {
-                            tracing::info!(
-                                ?block_height,
-                                ?block_timestamp,
-                                ?block_date,
-                                ?current_date,
-                                is_current_date,
-                                is_recent_block,
-                                is_fully_synced,
-                                non_finalized_len,
-                                should_daily_snapshot,
-                                should_realtime_snapshot,
-                                "snapshot will be created"
-                            );
-                        } else {
-                            tracing::debug!(
-                                ?block_height,
-                                ?block_timestamp,
-                                ?current_time,
-                                ?block_date,
-                                ?current_date,
-                                is_current_date,
-                                is_recent_block,
-                                is_fully_synced,
-                                non_finalized_len,
-                                should_daily_snapshot,
-                                should_realtime_snapshot,
-                                "snapshot decision: no snapshot"
-                            );
-                        }
+                    // Log snapshot decision for every block
+                    if should_snapshot {
+                        tracing::info!(
+                            ?block_height,
+                            ?block_timestamp,
+                            time_diff_seconds,
+                            ?block_date,
+                            ?current_date,
+                            is_current_date,
+                            is_recent_block,
+                            is_fully_synced,
+                            non_finalized_len,
+                            should_daily_snapshot,
+                            should_realtime_snapshot,
+                            "snapshot will be created"
+                        );
+                    } else {
+                        tracing::info!(
+                            ?block_height,
+                            ?block_timestamp,
+                            time_diff_seconds,
+                            ?block_date,
+                            ?current_date,
+                            is_current_date,
+                            is_recent_block,
+                            is_fully_synced,
+                            non_finalized_len,
+                            should_daily_snapshot,
+                            should_realtime_snapshot,
+                            "snapshot decision: no snapshot"
+                        );
                     }
                     
                     if should_snapshot {
