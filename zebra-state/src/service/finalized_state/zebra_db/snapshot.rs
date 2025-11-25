@@ -562,28 +562,29 @@ impl ZebraDb {
         Ok(inflation_rate)
     }
     
-    /// Count transactions per pool between two heights (inclusive).
-    /// 
-    /// Returns (transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count).
-    /// 
-    /// Each transaction is counted exactly once using the following priority:
-    /// 1. Transparent coinbase (is_coinbase && has_transparent)
-    /// 2. Shielded coinbase migration (!is_coinbase && has_transparent_inputs && has_shielded_outputs)
-    /// 3. Orchard (has_orchard_outputs)
-    /// 4. Sapling (has_sapling_outputs)
-    /// 5. Sprout (has_sprout_joinsplit_data)
-    /// 6. Transparent (has_transparent)
-    /// 
-    /// This ensures: transparent_count + transparent_coinbase_count + shielded_coinbase_migration_count +
-    ///              sprout_count + sapling_count + orchard_count = total_transactions
-    /// 
-    /// Note: Shielded coinbase migration count is an approximation - it counts transactions with
-    /// transparent inputs and shielded outputs. This may include some non-migration transactions.
-    fn count_transactions_by_pool(
+    /// Combined calculation of transaction counts, pool flows, and block metrics in a single pass.
+    /// This combines count_transactions_by_pool, calculate_pool_flows, and calculate_block_metrics
+    /// into one iteration for better performance, while maintaining identical calculation logic.
+    fn calculate_all_metrics_combined(
         &self,
         start_height: Height,
         end_height: Height,
-    ) -> Result<(u32, u32, u32, u32, u32, u32), BoxError> {
+        end_timestamp: i64,
+    ) -> Result<(
+        // Transaction counts: (transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count)
+        (u32, u32, u32, u32, u32, u32),
+        // Pool flows: (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+        //              sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow)
+        (Amount<NonNegative>, Amount<NonNegative>, Amount<NonNegative>, Amount<NonNegative>,
+         Amount<NonNegative>, Amount<NonNegative>, Amount<NonNegative>, Amount<NonNegative>),
+        // Block metrics: (average_block_time_seconds, average_block_fee_zat, average_block_size_bytes)
+        (f32, Amount<NonNegative>, u32),
+    ), BoxError> {
+        use std::ops::Add;
+        use zebra_chain::transparent::Utxo;
+        use zebra_chain::serialization::ZcashSerialize;
+        
+        // Transaction counts
         let mut transparent_count = 0u32;
         let mut transparent_coinbase_count = 0u32;
         let mut shielded_coinbase_migration_count = 0u32;
@@ -591,22 +592,75 @@ impl ZebraDb {
         let mut sapling_count = 0u32;
         let mut orchard_count = 0u32;
         
-        // Iterate through all blocks from start_height to end_height (inclusive)
+        // Pool flows
+        let mut transparent_inflow = Amount::<NonNegative>::zero();
+        let mut transparent_outflow = Amount::<NonNegative>::zero();
+        let mut sprout_inflow = Amount::<NonNegative>::zero();
+        let mut sprout_outflow = Amount::<NonNegative>::zero();
+        let mut sapling_inflow = Amount::<NonNegative>::zero();
+        let mut sapling_outflow = Amount::<NonNegative>::zero();
+        let mut orchard_inflow = Amount::<NonNegative>::zero();
+        let mut orchard_outflow = Amount::<NonNegative>::zero();
+        
+        // Block metrics
+        let mut total_fees = Amount::<NonNegative>::zero();
+        let mut total_block_size = 0u64;
+        let mut block_count = 0u32;
+        
+        // Get start timestamp for block time calculation
+        let start_timestamp = if start_height.0 < end_height.0 {
+            let start_block = self.block(start_height.into())
+                .ok_or_else(|| format!("block at height {:?} not found", start_height))?;
+            start_block.header.time.timestamp()
+        } else {
+            end_timestamp
+        };
+        
+        // UTXO cache to reduce database lookups
+        let mut utxo_cache: HashMap<zebra_chain::transparent::OutPoint, zebra_chain::transparent::Utxo> = HashMap::new();
+        
+        // Single pass through all blocks
         for h in start_height.0..=end_height.0 {
             let block_height = Height(h);
             let block = match self.block(block_height.into()) {
                 Some(b) => b,
                 None => {
-                    tracing::debug!(?block_height, "block not found, skipping transaction count");
+                    tracing::debug!(?block_height, "block not found, skipping");
                     continue;
                 }
             };
             
-            // Count transactions in each pool - each transaction is counted exactly once
+            // Calculate block size (same as calculate_block_metrics)
+            let block_size = block.zcash_serialize_to_vec()
+                .map_err(|e| format!("failed to serialize block at height {:?}: {}", block_height, e))?;
+            total_block_size = total_block_size
+                .checked_add(block_size.len() as u64)
+                .ok_or_else(|| "overflow calculating total block size")?;
+            
+            // Build UTXO map for this block (for same-block references)
+            // This is used in both pool flows and fee calculations
+            let mut block_utxos = HashMap::new();
+            for (tx_idx, tx) in block.transactions.iter().enumerate() {
+                for (out_idx, output) in tx.outputs().iter().enumerate() {
+                    let outpoint = zebra_chain::transparent::OutPoint {
+                        hash: tx.hash(),
+                        index: out_idx as u32,
+                    };
+                    let utxo = Utxo::from_location(
+                        output.clone(),
+                        block_height,
+                        tx_idx,
+                    );
+                    block_utxos.insert(outpoint, utxo);
+                }
+            }
+            
+            // Process all transactions in this block
             for (tx_idx, transaction) in block.transactions.iter().enumerate() {
                 // Check if this is a coinbase transaction (first transaction in block)
                 let is_coinbase = tx_idx == 0;
                 
+                // === TRANSACTION COUNTING (same logic as count_transactions_by_pool) ===
                 // Check for transparent activity
                 let has_transparent = transaction.has_transparent_inputs() || transaction.has_transparent_outputs();
                 let has_transparent_inputs = transaction.has_transparent_inputs();
@@ -651,78 +705,8 @@ impl ZebraDb {
                         .checked_add(1)
                         .ok_or_else(|| "transparent transaction count overflow")?;
                 }
-                // Note: If a transaction has none of the above, it's not counted in any category.
-                // This should be extremely rare (possibly only empty coinbase transactions without transparent outputs).
-            }
-        }
-        
-        Ok((transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count))
-    }
-    
-    /// Calculate inflow and outflow for each pool between two heights (inclusive).
-    /// 
-    /// Returns (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
-    ///          sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow).
-    /// 
-    /// Inflow = value entering the pool
-    /// Outflow = value leaving the pool
-    fn calculate_pool_flows(
-        &self,
-        start_height: Height,
-        end_height: Height,
-    ) -> Result<(
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-        Amount<NonNegative>,
-    ), BoxError> {
-        use std::ops::Add;
-        use zebra_chain::transparent::Utxo;
-        
-        let mut transparent_inflow = Amount::<NonNegative>::zero();
-        let mut transparent_outflow = Amount::<NonNegative>::zero();
-        let mut sprout_inflow = Amount::<NonNegative>::zero();
-        let mut sprout_outflow = Amount::<NonNegative>::zero();
-        let mut sapling_inflow = Amount::<NonNegative>::zero();
-        let mut sapling_outflow = Amount::<NonNegative>::zero();
-        let mut orchard_inflow = Amount::<NonNegative>::zero();
-        let mut orchard_outflow = Amount::<NonNegative>::zero();
-        
-        // Iterate through all blocks from start_height to end_height (inclusive)
-        for h in start_height.0..=end_height.0 {
-            let block_height = Height(h);
-            let block = match self.block(block_height.into()) {
-                Some(b) => b,
-                None => {
-                    tracing::debug!(?block_height, "block not found, skipping flow calculation");
-                    continue;
-                }
-            };
-            
-            // Build UTXO map for transparent value balance calculation
-            // We need to track UTXOs created in previous transactions in this block
-            let mut block_utxos = HashMap::new();
-            for (tx_idx, tx) in block.transactions.iter().enumerate() {
-                for (out_idx, output) in tx.outputs().iter().enumerate() {
-                    let outpoint = zebra_chain::transparent::OutPoint {
-                        hash: tx.hash(),
-                        index: out_idx as u32,
-                    };
-                    let utxo = Utxo::from_location(
-                        output.clone(),
-                        block_height,
-                        tx_idx,
-                    );
-                    block_utxos.insert(outpoint, utxo);
-                }
-            }
-            
-            // Calculate flows for each transaction
-            for transaction in &block.transactions {
+                
+                // === POOL FLOWS (same logic as calculate_pool_flows) ===
                 // Transparent pool: sum outputs (inflow) and inputs (outflow)
                 for output in transaction.outputs() {
                     let value = output.value();
@@ -731,16 +715,24 @@ impl ZebraDb {
                         .map_err(|e| format!("overflow calculating transparent inflow: {}", e))?;
                 }
                 
-                // Try block UTXOs first (for same-block references), then database
+                // Try block UTXOs first (for same-block references), then cache, then database
                 for input in transaction.inputs() {
                     if let Some(outpoint) = input.outpoint() {
                         let input_value = if let Some(utxo) = block_utxos.get(&outpoint) {
                             // UTXO from earlier transaction in same block
                             Some(utxo.output.value())
+                        } else if let Some(cached_utxo) = utxo_cache.get(&outpoint) {
+                            // UTXO from cache (previously looked up)
+                            Some(cached_utxo.output.value())
                         } else {
-                            // UTXO from previous blocks - look up from database
-                            self.utxo(&outpoint)
-                                .map(|ordered_utxo| ordered_utxo.utxo.output.value())
+                            // UTXO from previous blocks - look up from database and cache it
+                            if let Some(ordered_utxo) = self.utxo(&outpoint) {
+                                let value = ordered_utxo.utxo.output.value();
+                                utxo_cache.insert(outpoint, ordered_utxo.utxo);
+                                Some(value)
+                            } else {
+                                None
+                            }
                         };
                         
                         if let Some(value) = input_value {
@@ -806,194 +798,124 @@ impl ZebraDb {
                             .map_err(|e| format!("overflow calculating orchard outflow: {}", e))?;
                     }
                 }
-            }
-        }
-        
-        Ok((
-            transparent_inflow,
-            transparent_outflow,
-            sprout_inflow,
-            sprout_outflow,
-            sapling_inflow,
-            sapling_outflow,
-            orchard_inflow,
-            orchard_outflow,
-        ))
-    }
-    
-    /// Calculate average block time, average fee, and average block size between two heights (inclusive).
-    /// 
-    /// Returns (average_block_time_seconds, average_block_fee_zat, average_block_size_bytes).
-    fn calculate_block_metrics(
-        &self,
-        start_height: Height,
-        end_height: Height,
-        end_timestamp: i64,
-    ) -> Result<(f32, Amount<NonNegative>, u32), BoxError> {
-        use std::ops::Add;
-        use zebra_chain::transparent::Utxo;
-        use zebra_chain::serialization::ZcashSerialize;
-        
-        let mut total_fees = Amount::<NonNegative>::zero();
-        let mut total_block_size = 0u64;
-        let mut block_count = 0u32;
-        
-        // Get start timestamp for block time calculation
-        let start_timestamp = if start_height.0 < end_height.0 {
-            let start_block = self.block(start_height.into())
-                .ok_or_else(|| format!("block at height {:?} not found", start_height))?;
-            start_block.header.time.timestamp()
-        } else {
-            end_timestamp
-        };
-        
-        // Iterate through all blocks from start_height to end_height (inclusive)
-        for h in start_height.0..=end_height.0 {
-            let block_height = Height(h);
-            let block = match self.block(block_height.into()) {
-                Some(b) => b,
-                None => {
-                    tracing::debug!(?block_height, "block not found, skipping metrics calculation");
-                    continue;
-                }
-            };
-            
-            // Calculate block size
-            let block_size = block.zcash_serialize_to_vec()
-                .map_err(|e| format!("failed to serialize block at height {:?}: {}", block_height, e))?;
-            total_block_size = total_block_size
-                .checked_add(block_size.len() as u64)
-                .ok_or_else(|| "overflow calculating total block size")?;
-            
-            // Build UTXO map for fee calculation
-            let mut block_utxos = HashMap::new();
-            for (tx_idx, tx) in block.transactions.iter().enumerate() {
-                for (out_idx, output) in tx.outputs().iter().enumerate() {
-                    let outpoint = zebra_chain::transparent::OutPoint {
-                        hash: tx.hash(),
-                        index: out_idx as u32,
-                    };
-                    let utxo = Utxo::from_location(
-                        output.clone(),
-                        block_height,
-                        tx_idx,
-                    );
-                    block_utxos.insert(outpoint, utxo);
-                }
-            }
-            
-            // Calculate fees for each transaction (excluding coinbase)
-            for (tx_idx, transaction) in block.transactions.iter().enumerate() {
-                // Skip coinbase transaction (first transaction in block)
-                if tx_idx == 0 {
-                    continue;
-                }
                 
-                // Calculate transparent inputs value
-                let mut input_value = Amount::<NonNegative>::zero();
-                for input in transaction.inputs() {
-                    if let Some(outpoint) = input.outpoint() {
-                        let input_val = if let Some(utxo) = block_utxos.get(&outpoint) {
-                            Some(utxo.output.value())
-                        } else {
-                            self.utxo(&outpoint)
-                                .map(|ordered_utxo| ordered_utxo.utxo.output.value())
-                        };
-                        
-                        if let Some(value) = input_val {
-                            input_value = input_value
-                                .add(value)
-                                .map_err(|e| format!("overflow calculating input value: {}", e))?;
+                // === FEE CALCULATION (same logic as calculate_block_metrics) ===
+                // Calculate fees for each transaction (excluding coinbase)
+                if !is_coinbase {
+                    // Calculate transparent inputs value
+                    let mut input_value = Amount::<NonNegative>::zero();
+                    for input in transaction.inputs() {
+                        if let Some(outpoint) = input.outpoint() {
+                            let input_val = if let Some(utxo) = block_utxos.get(&outpoint) {
+                                Some(utxo.output.value())
+                            } else if let Some(cached_utxo) = utxo_cache.get(&outpoint) {
+                                Some(cached_utxo.output.value())
+                            } else {
+                                // Look up from database and cache it
+                                if let Some(ordered_utxo) = self.utxo(&outpoint) {
+                                    let value = ordered_utxo.utxo.output.value();
+                                    utxo_cache.insert(outpoint, ordered_utxo.utxo);
+                                    Some(value)
+                                } else {
+                                    None
+                                }
+                            };
+                            
+                            if let Some(value) = input_val {
+                                input_value = input_value
+                                    .add(value)
+                                    .map_err(|e| format!("overflow calculating input value: {}", e))?;
+                            }
                         }
                     }
-                }
-                
-                // Calculate transparent outputs value
-                let mut output_value = Amount::<NonNegative>::zero();
-                for output in transaction.outputs() {
-                    let value = output.value();
-                    output_value = output_value
-                        .add(value)
-                        .map_err(|e| format!("overflow calculating output value: {}", e))?;
-                }
-                
-                // Calculate fee for all transaction types
-                // General formula: fee = transparent_inputs - transparent_outputs - value_balance
-                // Where value_balance can be negative (shielding) or positive (deshielding)
-                
-                // Calculate sprout value balance: vpub_old (outputs to sprout) - vpub_new (inputs from sprout)
-                // Positive = value leaving sprout, Negative = value entering sprout
-                let mut sprout_vpub_old = Amount::<NonNegative>::zero();
-                for vpub_old in transaction.output_values_to_sprout() {
-                    sprout_vpub_old = sprout_vpub_old
-                        .add(*vpub_old)
-                        .map_err(|e| format!("overflow calculating sprout vpub_old: {}", e))?;
-                }
-                
-                let mut sprout_vpub_new = Amount::<NonNegative>::zero();
-                for vpub_new in transaction.input_values_from_sprout() {
-                    sprout_vpub_new = sprout_vpub_new
-                        .add(*vpub_new)
-                        .map_err(|e| format!("overflow calculating sprout vpub_new: {}", e))?;
-                }
-                
-                // Sprout value balance (signed): vpub_old - vpub_new
-                // Positive = value leaving sprout (deshielding), Negative = value entering sprout (shielding)
-                let sprout_value_balance_zatoshis = if sprout_vpub_old > sprout_vpub_new {
-                    // Value leaving sprout (positive)
-                    (sprout_vpub_old - sprout_vpub_new)
-                        .map_err(|e| format!("error calculating sprout value balance: {}", e))?
-                        .zatoshis() as i64
-                } else if sprout_vpub_new > sprout_vpub_old {
-                    // Value entering sprout (negative)
-                    -((sprout_vpub_new - sprout_vpub_old)
-                        .map_err(|e| format!("error calculating sprout value balance: {}", e))?
-                        .zatoshis() as i64)
-                } else {
-                    0i64
-                };
-                
-                // Sapling value balance: can be negative (shielding) or positive (deshielding)
-                let sapling_vb = transaction.sapling_value_balance();
-                let sapling_value_balance = sapling_vb.sapling_amount();
-                let sapling_zatoshis = sapling_value_balance.zatoshis();
-                
-                // Orchard value balance: can be negative (shielding) or positive (deshielding)
-                let orchard_vb = transaction.orchard_value_balance();
-                let orchard_value_balance = orchard_vb.orchard_amount();
-                let orchard_zatoshis = orchard_value_balance.zatoshis();
-                
-                // Calculate total value balance (signed)
-                // Formula: fee = transparent_inputs - transparent_outputs - (sapling_vb + orchard_vb + sprout_vb)
-                // value_balance: negative = shielding (value entering), positive = deshielding (value leaving)
-                
-                // Calculate total value balance in zatoshis (signed)
-                let total_value_balance_zatoshis = sapling_zatoshis
-                    .saturating_add(orchard_zatoshis)
-                    .saturating_add(sprout_value_balance_zatoshis);
-                
-                // Calculate fee: transparent_inputs - transparent_outputs - value_balance
-                // If transparent_inputs <= transparent_outputs, there's no fee from transparent component
-                // But we still need to account for value_balance (which can make fee positive even if transparent diff is 0)
-                let transparent_diff = if input_value > output_value {
-                    (input_value - output_value)
-                        .map_err(|e| format!("error calculating transparent diff: {}", e))?
-                        .zatoshis() as i64
-                } else {
-                    0i64
-                };
-                
-                // Fee = transparent_diff - total_value_balance
-                // If value_balance is negative (shielding), fee increases
-                // If value_balance is positive (deshielding), fee decreases
-                let fee_zatoshis = transparent_diff.saturating_sub(total_value_balance_zatoshis);
-                
-                // Only add positive fees
-                if fee_zatoshis > 0 {
-                    if let Ok(fee_amount) = Amount::<NonNegative>::try_from(fee_zatoshis as u64) {
-                        total_fees = total_fees
-                            .add(fee_amount)
-                            .map_err(|e| format!("overflow calculating total fees: {}", e))?;
+                    
+                    // Calculate transparent outputs value
+                    let mut output_value = Amount::<NonNegative>::zero();
+                    for output in transaction.outputs() {
+                        let value = output.value();
+                        output_value = output_value
+                            .add(value)
+                            .map_err(|e| format!("overflow calculating output value: {}", e))?;
+                    }
+                    
+                    // Calculate fee for all transaction types
+                    // General formula: fee = transparent_inputs - transparent_outputs - value_balance
+                    // Where value_balance can be negative (shielding) or positive (deshielding)
+                    
+                    // Calculate sprout value balance: vpub_old (outputs to sprout) - vpub_new (inputs from sprout)
+                    // Positive = value leaving sprout, Negative = value entering sprout
+                    let mut sprout_vpub_old = Amount::<NonNegative>::zero();
+                    for vpub_old in transaction.output_values_to_sprout() {
+                        sprout_vpub_old = sprout_vpub_old
+                            .add(*vpub_old)
+                            .map_err(|e| format!("overflow calculating sprout vpub_old: {}", e))?;
+                    }
+                    
+                    let mut sprout_vpub_new = Amount::<NonNegative>::zero();
+                    for vpub_new in transaction.input_values_from_sprout() {
+                        sprout_vpub_new = sprout_vpub_new
+                            .add(*vpub_new)
+                            .map_err(|e| format!("overflow calculating sprout vpub_new: {}", e))?;
+                    }
+                    
+                    // Sprout value balance (signed): vpub_old - vpub_new
+                    // Positive = value leaving sprout (deshielding), Negative = value entering sprout (shielding)
+                    let sprout_value_balance_zatoshis = if sprout_vpub_old > sprout_vpub_new {
+                        // Value leaving sprout (positive)
+                        (sprout_vpub_old - sprout_vpub_new)
+                            .map_err(|e| format!("error calculating sprout value balance: {}", e))?
+                            .zatoshis() as i64
+                    } else if sprout_vpub_new > sprout_vpub_old {
+                        // Value entering sprout (negative)
+                        -((sprout_vpub_new - sprout_vpub_old)
+                            .map_err(|e| format!("error calculating sprout value balance: {}", e))?
+                            .zatoshis() as i64)
+                    } else {
+                        0i64
+                    };
+                    
+                    // Sapling value balance: can be negative (shielding) or positive (deshielding)
+                    let sapling_vb_fee = transaction.sapling_value_balance();
+                    let sapling_value_balance = sapling_vb_fee.sapling_amount();
+                    let sapling_zatoshis = sapling_value_balance.zatoshis();
+                    
+                    // Orchard value balance: can be negative (shielding) or positive (deshielding)
+                    let orchard_vb_fee = transaction.orchard_value_balance();
+                    let orchard_value_balance = orchard_vb_fee.orchard_amount();
+                    let orchard_zatoshis = orchard_value_balance.zatoshis();
+                    
+                    // Calculate total value balance (signed)
+                    // Formula: fee = transparent_inputs - transparent_outputs - (sapling_vb + orchard_vb + sprout_vb)
+                    // value_balance: negative = shielding (value entering), positive = deshielding (value leaving)
+                    
+                    // Calculate total value balance in zatoshis (signed)
+                    let total_value_balance_zatoshis = sapling_zatoshis
+                        .saturating_add(orchard_zatoshis)
+                        .saturating_add(sprout_value_balance_zatoshis);
+                    
+                    // Calculate fee: transparent_inputs - transparent_outputs - value_balance
+                    // If transparent_inputs <= transparent_outputs, there's no fee from transparent component
+                    // But we still need to account for value_balance (which can make fee positive even if transparent diff is 0)
+                    let transparent_diff = if input_value > output_value {
+                        (input_value - output_value)
+                            .map_err(|e| format!("error calculating transparent diff: {}", e))?
+                            .zatoshis() as i64
+                    } else {
+                        0i64
+                    };
+                    
+                    // Fee = transparent_diff - total_value_balance
+                    // If value_balance is negative (shielding), fee increases
+                    // If value_balance is positive (deshielding), fee decreases
+                    let fee_zatoshis = transparent_diff.saturating_sub(total_value_balance_zatoshis);
+                    
+                    // Only add positive fees
+                    if fee_zatoshis > 0 {
+                        if let Ok(fee_amount) = Amount::<NonNegative>::try_from(fee_zatoshis as u64) {
+                            total_fees = total_fees
+                                .add(fee_amount)
+                                .map_err(|e| format!("overflow calculating total fees: {}", e))?;
+                        }
                     }
                 }
             }
@@ -1003,7 +925,7 @@ impl ZebraDb {
                 .ok_or_else(|| "block count overflow")?;
         }
         
-        // Calculate averages
+        // Calculate averages (same logic as calculate_block_metrics)
         let average_block_time = if block_count > 0 && start_height.0 < end_height.0 {
             let time_diff = end_timestamp - start_timestamp;
             (time_diff as f32) / (block_count as f32)
@@ -1028,7 +950,12 @@ impl ZebraDb {
             0
         };
         
-        Ok((average_block_time, average_fee, average_block_size))
+        Ok((
+            (transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count),
+            (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+             sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow),
+            (average_block_time, average_fee, average_block_size),
+        ))
     }
 
     /// Stores snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
@@ -1134,19 +1061,13 @@ impl ZebraDb {
             Height(0)
         };
         
-        // 10. Count transactions per pool from previous snapshot to current snapshot
-        // Range is exclusive on start to avoid double counting
-        let (transparent_tx_count, transparent_coinbase_tx_count, shielded_coinbase_migration_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count) =
-            self.count_transactions_by_pool(start_height, height)?;
-        
-        // 11. Calculate inflow/outflow for each pool
-        let (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
-             sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow) =
-            self.calculate_pool_flows(start_height, height)?;
-        
-        // 12. Calculate average block time, average fee, and average block size
-        let (average_block_time, average_block_fee_zat, average_block_size) = 
-            self.calculate_block_metrics(start_height, height, block_timestamp)?;
+        // 10-12. Calculate all metrics in a single pass for better performance
+        // This combines transaction counting, pool flows, and block metrics
+        let ((transparent_tx_count, transparent_coinbase_tx_count, shielded_coinbase_migration_tx_count, sprout_tx_count, sapling_tx_count, orchard_tx_count),
+             (transparent_inflow, transparent_outflow, sprout_inflow, sprout_outflow,
+              sapling_inflow, sapling_outflow, orchard_inflow, orchard_outflow),
+             (average_block_time, average_block_fee_zat, average_block_size)) =
+            self.calculate_all_metrics_combined(start_height, height, block_timestamp)?;
         
         // 13. Create snapshot data
         let snapshot_data = SnapshotData::new(
