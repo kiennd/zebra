@@ -367,15 +367,52 @@ impl WriteBlockWorkerTask {
                     
                     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
                     
+                    // Debug logging to verify snapshot conditions
+                    if block_height.0 % 100 == 0 || should_snapshot {
+                        tracing::debug!(
+                            ?block_height,
+                            ?block_timestamp,
+                            ?current_time,
+                            ?block_date,
+                            ?current_date,
+                            is_current_date,
+                            is_recent_block,
+                            is_fully_synced,
+                            non_finalized_len,
+                            should_daily_snapshot,
+                            should_realtime_snapshot,
+                            should_snapshot,
+                            "snapshot decision"
+                        );
+                    }
+                    
                     if should_snapshot {
                         let network = non_finalized_state.network.clone();
                         // Prioritize daily snapshots: use block date for daily snapshots,
                         // current date only for real-time snapshots when it's NOT a daily snapshot time
                         // This ensures daily snapshots always use the correct date (block's date)
                         let use_current_date = should_realtime_snapshot && !should_daily_snapshot;
+                        let snapshot_type = if should_daily_snapshot {
+                            "daily"
+                        } else if should_realtime_snapshot {
+                            "realtime"
+                        } else {
+                            "unknown"
+                        };
+                        
+                        tracing::info!(
+                            ?block_height,
+                            snapshot_type,
+                            should_daily_snapshot,
+                            should_realtime_snapshot,
+                            use_current_date,
+                            "creating snapshot"
+                        );
+                        
                         if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
                             tracing::warn!(
                                 ?block_height,
+                                snapshot_type,
                                 error = ?e,
                                 "failed to store snapshot data to RocksDB"
                             );
