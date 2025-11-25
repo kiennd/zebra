@@ -375,37 +375,37 @@ impl WriteBlockWorkerTask {
                     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
                     
                     // Log snapshot decision for every block
-                    if should_snapshot {
-                        tracing::info!(
-                            ?block_height,
-                            ?block_timestamp,
-                            time_diff_seconds,
-                            ?block_date,
-                            ?current_date,
-                            is_current_date,
-                            is_recent_block,
-                            is_fully_synced,
-                            non_finalized_len,
-                            should_daily_snapshot,
-                            should_realtime_snapshot,
-                            "snapshot will be created"
-                        );
-                    } else {
-                        tracing::info!(
-                            ?block_height,
-                            ?block_timestamp,
-                            time_diff_seconds,
-                            ?block_date,
-                            ?current_date,
-                            is_current_date,
-                            is_recent_block,
-                            is_fully_synced,
-                            non_finalized_len,
-                            should_daily_snapshot,
-                            should_realtime_snapshot,
-                            "snapshot decision: no snapshot"
-                        );
-                    }
+                    // if should_snapshot {
+                    //     tracing::info!(
+                    //         ?block_height,
+                    //         ?block_timestamp,
+                    //         time_diff_seconds,
+                    //         ?block_date,
+                    //         ?current_date,
+                    //         is_current_date,
+                    //         is_recent_block,
+                    //         is_fully_synced,
+                    //         non_finalized_len,
+                    //         should_daily_snapshot,
+                    //         should_realtime_snapshot,
+                    //         "snapshot will be created"
+                    //     );
+                    // } else {
+                    //     tracing::info!(
+                    //         ?block_height,
+                    //         ?block_timestamp,
+                    //         time_diff_seconds,
+                    //         ?block_date,
+                    //         ?current_date,
+                    //         is_current_date,
+                    //         is_recent_block,
+                    //         is_fully_synced,
+                    //         non_finalized_len,
+                    //         should_daily_snapshot,
+                    //         should_realtime_snapshot,
+                    //         "snapshot decision: no snapshot"
+                    //     );
+                    // }
                     
                     if should_snapshot {
                         let network = non_finalized_state.network.clone();
