@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use rocksdb::ColumnFamily;
 use zebra_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, MAX_MONEY, NonNegative},
     block::Height,
     parameters::{
         subsidy::block_subsidy,
@@ -592,15 +592,15 @@ impl ZebraDb {
         let mut sapling_count = 0u32;
         let mut orchard_count = 0u32;
         
-        // Pool flows
-        let mut transparent_inflow = Amount::<NonNegative>::zero();
-        let mut transparent_outflow = Amount::<NonNegative>::zero();
-        let mut sprout_inflow = Amount::<NonNegative>::zero();
-        let mut sprout_outflow = Amount::<NonNegative>::zero();
-        let mut sapling_inflow = Amount::<NonNegative>::zero();
-        let mut sapling_outflow = Amount::<NonNegative>::zero();
-        let mut orchard_inflow = Amount::<NonNegative>::zero();
-        let mut orchard_outflow = Amount::<NonNegative>::zero();
+        // Pool flows - use u64 to avoid overflow, cap at MAX_MONEY when converting to Amount
+        let mut transparent_inflow_zat = 0u64;
+        let mut transparent_outflow_zat = 0u64;
+        let mut sprout_inflow_zat = 0u64;
+        let mut sprout_outflow_zat = 0u64;
+        let mut sapling_inflow_zat = 0u64;
+        let mut sapling_outflow_zat = 0u64;
+        let mut orchard_inflow_zat = 0u64;
+        let mut orchard_outflow_zat = 0u64;
         
         // Block metrics
         let mut total_fees = Amount::<NonNegative>::zero();
@@ -709,10 +709,9 @@ impl ZebraDb {
                 // === POOL FLOWS (same logic as calculate_pool_flows) ===
                 // Transparent pool: sum outputs (inflow) and inputs (outflow)
                 for output in transaction.outputs() {
-                    let value = output.value();
-                    transparent_inflow = transparent_inflow
-                        .add(value)
-                        .map_err(|e| format!("overflow calculating transparent inflow: {}", e))?;
+                    let value_zat = output.value().zatoshis() as u64;
+                    transparent_inflow_zat = transparent_inflow_zat
+                        .saturating_add(value_zat);
                 }
                 
                 // Try block UTXOs first (for same-block references), then cache, then database
@@ -736,24 +735,24 @@ impl ZebraDb {
                         };
                         
                         if let Some(value) = input_value {
-                            transparent_outflow = transparent_outflow
-                                .add(value)
-                                .map_err(|e| format!("overflow calculating transparent outflow: {}", e))?;
+                            let value_zat = value.zatoshis() as u64;
+                            transparent_outflow_zat = transparent_outflow_zat
+                                .saturating_add(value_zat);
                         }
                     }
                 }
                 
                 // Sprout pool: vpub_new (inflow) and vpub_old (outflow)
                 for vpub_new in transaction.input_values_from_sprout() {
-                    sprout_inflow = sprout_inflow
-                        .add(*vpub_new)
-                        .map_err(|e| format!("overflow calculating sprout inflow: {}", e))?;
+                    let value_zat = vpub_new.zatoshis() as u64;
+                    sprout_inflow_zat = sprout_inflow_zat
+                        .saturating_add(value_zat);
                 }
                 
                 for vpub_old in transaction.output_values_to_sprout() {
-                    sprout_outflow = sprout_outflow
-                        .add(*vpub_old)
-                        .map_err(|e| format!("overflow calculating sprout outflow: {}", e))?;
+                    let value_zat = vpub_old.zatoshis() as u64;
+                    sprout_outflow_zat = sprout_outflow_zat
+                        .saturating_add(value_zat);
                 }
                 
                 // Sapling pool: value_balance represents net change
@@ -763,19 +762,15 @@ impl ZebraDb {
                 let sapling_zatoshis = sapling_net.zatoshis();
                 if sapling_zatoshis < 0 {
                     // Net inflow: value entering sapling pool
-                    // Convert negative to positive for NonNegative
-                    if let Ok(neg_amount) = Amount::<NonNegative>::try_from((-sapling_zatoshis) as u64) {
-                        sapling_inflow = sapling_inflow
-                            .add(neg_amount)
-                            .map_err(|e| format!("overflow calculating sapling inflow: {}", e))?;
-                    }
+                    // Convert negative to positive
+                    let value_zat = (-sapling_zatoshis) as u64;
+                    sapling_inflow_zat = sapling_inflow_zat
+                        .saturating_add(value_zat);
                 } else if sapling_zatoshis > 0 {
                     // Net outflow: value leaving sapling pool
-                    if let Ok(pos_amount) = Amount::<NonNegative>::try_from(sapling_zatoshis as u64) {
-                        sapling_outflow = sapling_outflow
-                            .add(pos_amount)
-                            .map_err(|e| format!("overflow calculating sapling outflow: {}", e))?;
-                    }
+                    let value_zat = sapling_zatoshis as u64;
+                    sapling_outflow_zat = sapling_outflow_zat
+                        .saturating_add(value_zat);
                 }
                 
                 // Orchard pool: value_balance represents net change
@@ -785,18 +780,14 @@ impl ZebraDb {
                 let orchard_zatoshis = orchard_net.zatoshis();
                 if orchard_zatoshis < 0 {
                     // Net inflow: value entering orchard pool
-                    if let Ok(neg_amount) = Amount::<NonNegative>::try_from((-orchard_zatoshis) as u64) {
-                        orchard_inflow = orchard_inflow
-                            .add(neg_amount)
-                            .map_err(|e| format!("overflow calculating orchard inflow: {}", e))?;
-                    }
+                    let value_zat = (-orchard_zatoshis) as u64;
+                    orchard_inflow_zat = orchard_inflow_zat
+                        .saturating_add(value_zat);
                 } else if orchard_zatoshis > 0 {
                     // Net outflow: value leaving orchard pool
-                    if let Ok(pos_amount) = Amount::<NonNegative>::try_from(orchard_zatoshis as u64) {
-                        orchard_outflow = orchard_outflow
-                            .add(pos_amount)
-                            .map_err(|e| format!("overflow calculating orchard outflow: {}", e))?;
-                    }
+                    let value_zat = orchard_zatoshis as u64;
+                    orchard_outflow_zat = orchard_outflow_zat
+                        .saturating_add(value_zat);
                 }
                 
                 // === FEE CALCULATION (same logic as calculate_block_metrics) ===
@@ -949,6 +940,27 @@ impl ZebraDb {
         } else {
             0
         };
+        
+        // Convert u64 values to Amount, capping at MAX_MONEY to prevent overflow
+        // Cumulative flow values can exceed MAX_MONEY when summing across many blocks,
+        // so we cap them at the maximum valid Amount value
+        let max_money_u64 = MAX_MONEY as u64;
+        let transparent_inflow = Amount::try_from(transparent_inflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create transparent_inflow amount: {}", e))?;
+        let transparent_outflow = Amount::try_from(transparent_outflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create transparent_outflow amount: {}", e))?;
+        let sprout_inflow = Amount::try_from(sprout_inflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create sprout_inflow amount: {}", e))?;
+        let sprout_outflow = Amount::try_from(sprout_outflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create sprout_outflow amount: {}", e))?;
+        let sapling_inflow = Amount::try_from(sapling_inflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create sapling_inflow amount: {}", e))?;
+        let sapling_outflow = Amount::try_from(sapling_outflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create sapling_outflow amount: {}", e))?;
+        let orchard_inflow = Amount::try_from(orchard_inflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create orchard_inflow amount: {}", e))?;
+        let orchard_outflow = Amount::try_from(orchard_outflow_zat.min(max_money_u64))
+            .map_err(|e| format!("failed to create orchard_outflow amount: {}", e))?;
         
         Ok((
             (transparent_count, transparent_coinbase_count, shielded_coinbase_migration_count, sprout_count, sapling_count, orchard_count),
