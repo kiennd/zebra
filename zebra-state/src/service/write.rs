@@ -314,6 +314,11 @@ impl WriteBlockWorkerTask {
                     let block_timestamp = finalized.block.header.time.timestamp();
                     let tip_block = ChainTipBlock::from(finalized);
                     let block_height = tip_block.height;
+                    
+                    tracing::info!(
+                        ?block_height,
+                        "committed finalized block - checking snapshot conditions"
+                    );
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
 
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
