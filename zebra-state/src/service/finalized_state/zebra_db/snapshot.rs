@@ -917,13 +917,82 @@ impl ZebraDb {
                         .map_err(|e| format!("overflow calculating output value: {}", e))?;
                 }
                 
-                // Fee = inputs - outputs (for transparent transactions)
-                if input_value > output_value {
-                    let fee = (input_value - output_value)
-                        .map_err(|e| format!("error calculating fee: {}", e))?;
-                    if let Ok(fee_non_neg) = Amount::<NonNegative>::try_from(fee.zatoshis() as u64) {
+                // Calculate fee for all transaction types
+                // General formula: fee = transparent_inputs - transparent_outputs - value_balance
+                // Where value_balance can be negative (shielding) or positive (deshielding)
+                
+                // Calculate sprout value balance: vpub_old (outputs to sprout) - vpub_new (inputs from sprout)
+                // Positive = value leaving sprout, Negative = value entering sprout
+                let mut sprout_vpub_old = Amount::<NonNegative>::zero();
+                for vpub_old in transaction.output_values_to_sprout() {
+                    sprout_vpub_old = sprout_vpub_old
+                        .add(*vpub_old)
+                        .map_err(|e| format!("overflow calculating sprout vpub_old: {}", e))?;
+                }
+                
+                let mut sprout_vpub_new = Amount::<NonNegative>::zero();
+                for vpub_new in transaction.input_values_from_sprout() {
+                    sprout_vpub_new = sprout_vpub_new
+                        .add(*vpub_new)
+                        .map_err(|e| format!("overflow calculating sprout vpub_new: {}", e))?;
+                }
+                
+                // Sprout value balance (signed): vpub_old - vpub_new
+                // Positive = value leaving sprout (deshielding), Negative = value entering sprout (shielding)
+                let sprout_value_balance_zatoshis = if sprout_vpub_old > sprout_vpub_new {
+                    // Value leaving sprout (positive)
+                    (sprout_vpub_old - sprout_vpub_new)
+                        .map_err(|e| format!("error calculating sprout value balance: {}", e))?
+                        .zatoshis() as i64
+                } else if sprout_vpub_new > sprout_vpub_old {
+                    // Value entering sprout (negative)
+                    -((sprout_vpub_new - sprout_vpub_old)
+                        .map_err(|e| format!("error calculating sprout value balance: {}", e))?
+                        .zatoshis() as i64)
+                } else {
+                    0i64
+                };
+                
+                // Sapling value balance: can be negative (shielding) or positive (deshielding)
+                let sapling_vb = transaction.sapling_value_balance();
+                let sapling_value_balance = sapling_vb.sapling_amount();
+                let sapling_zatoshis = sapling_value_balance.zatoshis();
+                
+                // Orchard value balance: can be negative (shielding) or positive (deshielding)
+                let orchard_vb = transaction.orchard_value_balance();
+                let orchard_value_balance = orchard_vb.orchard_amount();
+                let orchard_zatoshis = orchard_value_balance.zatoshis();
+                
+                // Calculate total value balance (signed)
+                // Formula: fee = transparent_inputs - transparent_outputs - (sapling_vb + orchard_vb + sprout_vb)
+                // value_balance: negative = shielding (value entering), positive = deshielding (value leaving)
+                
+                // Calculate total value balance in zatoshis (signed)
+                let total_value_balance_zatoshis = sapling_zatoshis
+                    .saturating_add(orchard_zatoshis)
+                    .saturating_add(sprout_value_balance_zatoshis);
+                
+                // Calculate fee: transparent_inputs - transparent_outputs - value_balance
+                // If transparent_inputs <= transparent_outputs, there's no fee from transparent component
+                // But we still need to account for value_balance (which can make fee positive even if transparent diff is 0)
+                let transparent_diff = if input_value > output_value {
+                    (input_value - output_value)
+                        .map_err(|e| format!("error calculating transparent diff: {}", e))?
+                        .zatoshis() as i64
+                } else {
+                    0i64
+                };
+                
+                // Fee = transparent_diff - total_value_balance
+                // If value_balance is negative (shielding), fee increases
+                // If value_balance is positive (deshielding), fee decreases
+                let fee_zatoshis = transparent_diff.saturating_sub(total_value_balance_zatoshis);
+                
+                // Only add positive fees
+                if fee_zatoshis > 0 {
+                    if let Ok(fee_amount) = Amount::<NonNegative>::try_from(fee_zatoshis as u64) {
                         total_fees = total_fees
-                            .add(fee_non_neg)
+                            .add(fee_amount)
                             .map_err(|e| format!("overflow calculating total fees: {}", e))?;
                     }
                 }
