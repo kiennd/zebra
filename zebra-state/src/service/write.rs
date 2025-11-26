@@ -15,7 +15,6 @@ use zebra_chain::{
 };
 
 use crate::{
-    constants::MAX_BLOCK_REORG_HEIGHT,
     service::{
         check,
         finalized_state::{FinalizedState, ZebraDb},
@@ -23,7 +22,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    MAX_BLOCK_REORG_HEIGHT, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -64,6 +63,121 @@ pub(crate) fn validate_and_commit_non_finalized(
     }
 
     Ok(())
+}
+
+/// Check snapshot conditions and create snapshots if needed.
+/// This function is called when blocks are finalized, either through the finalized block channel
+/// (during catch-up) or via commit_finalized_direct (when fully synced).
+fn check_and_create_snapshot(
+    finalized_state: &FinalizedState,
+    non_finalized_state: &NonFinalizedState,
+    block_height: Height,
+    block_timestamp: i64,
+    next_snapshot_timestamp: &mut Option<i64>,
+) {
+    let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
+        
+    // Determine if we're fully synced:
+    let is_fully_synced = non_finalized_len <= MAX_BLOCK_REORG_HEIGHT;
+    
+    // When fully synced AND block's date matches current date, snapshot every confirmed block
+    let should_realtime_snapshot = is_fully_synced;
+    
+    let should_daily_snapshot = if block_height.0 == 0 {
+        true
+    } else {
+        match *next_snapshot_timestamp {
+            None => {
+                // First snapshot after restart (but not block 0) - calculate next snapshot timestamp
+                true
+            }
+            Some(next_ts) => {
+                // Snapshot if we've reached or passed the next snapshot timestamp
+                block_timestamp >= next_ts
+            }
+        }
+    };
+    
+    let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
+    
+    // Log snapshot decision for every block
+    if should_snapshot {
+        tracing::info!(
+            ?block_height,
+            ?block_timestamp,
+            is_fully_synced,
+            non_finalized_len,
+            should_daily_snapshot,
+            should_realtime_snapshot,
+            "snapshot will be created"
+        );
+    } else {
+        tracing::info!(
+            ?block_height,
+            ?block_timestamp,
+            is_fully_synced,
+            non_finalized_len,
+            should_daily_snapshot,
+            should_realtime_snapshot,
+            "snapshot decision: no snapshot"
+        );
+    }
+    
+    if should_snapshot {
+        let network = non_finalized_state.network.clone();
+        // Prioritize daily snapshots: use block date for daily snapshots,
+        // current date only for real-time snapshots when it's NOT a daily snapshot time
+        // This ensures daily snapshots always use the correct date (block's date)
+        let use_current_date = should_realtime_snapshot && !should_daily_snapshot;
+        let snapshot_type = if should_daily_snapshot {
+            "daily"
+        } else if should_realtime_snapshot {
+            "realtime"
+        } else {
+            "unknown"
+        };
+        
+        tracing::info!(
+            ?block_height,
+            snapshot_type,
+            should_daily_snapshot,
+            should_realtime_snapshot,
+            use_current_date,
+            "creating snapshot"
+        );
+        
+        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
+            tracing::warn!(
+                ?block_height,
+                snapshot_type,
+                error = ?e,
+                "failed to store snapshot data to RocksDB"
+            );
+        } else {
+            if should_daily_snapshot {
+                // Calculate the start of the next UTC day (00:00:00 UTC)
+                let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                    .unwrap_or_else(|| {
+                        // Fallback: if timestamp conversion fails, use epoch
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                    });
+                
+                // Get the start of the current UTC day (00:00:00 UTC)
+                let current_date = current_datetime.date_naive();
+                
+                // Get the start of the next day at 00:00:00 UTC
+                let next_date = current_date + chrono::Duration::days(1);
+                let next_datetime = next_date.and_hms_opt(0, 0, 0)
+                    .expect("00:00:00 should always be valid");
+                let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    next_datetime,
+                    chrono::Utc,
+                ).timestamp();
+                
+                *next_snapshot_timestamp = Some(next_timestamp);
+            }
+        }
+    }
 }
 
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
@@ -315,153 +429,18 @@ impl WriteBlockWorkerTask {
                     let tip_block = ChainTipBlock::from(finalized);
                     let block_height = tip_block.height;
                     
-                    // TEMPORARY: Disabled log
-                    // tracing::info!(
-                    //     ?block_height,
-                    //     "committed finalized block - checking snapshot conditions"
-                    // );
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
 
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
 
-                    // Store snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp)
-                    // 1. Always snapshot block 0 (genesis block)
-                    // 2. Snapshot on the first block of each UTC day
-                    // 3. When fully synced, snapshot every confirmed block (using current date)
-                    //    Only snapshot if block's date matches current date (real-time blocks)
-                    let current_time = chrono::Utc::now().timestamp();
-                    let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
-                    
-                    // Check if block's date matches current date (for realtime snapshots)
-                    let block_date = chrono::DateTime::from_timestamp(block_timestamp, 0)
-                        .map(|dt| dt.date_naive())
-                        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
-                    let current_date = chrono::DateTime::from_timestamp(current_time, 0)
-                        .map(|dt| dt.date_naive())
-                        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap());
-                    let is_current_date = block_date == current_date;
-                    
-                    // Determine if we're fully synced:
-                    // - Block is recent (within last hour) AND
-                    // - Either we have non-finalized blocks (actively syncing) OR
-                    //   the block timestamp is very close to current time (within 5 minutes, meaning we're caught up) OR
-                    //   non_finalized_len is 0 (all blocks are finalized, meaning we're fully synced)
-                    let is_recent_block = (current_time - block_timestamp) < 3600; // Block is within last hour
-                    let time_diff_seconds = current_time - block_timestamp;
-                    let is_fully_synced = is_recent_block && (
-                        non_finalized_len > 0 || 
-                        time_diff_seconds < 300 || // Block is within last 5 minutes
-                        non_finalized_len == 0 // All blocks finalized = fully synced
+                    // Check snapshot conditions and create snapshots if needed
+                    check_and_create_snapshot(
+                        &finalized_state,
+                        non_finalized_state,
+                        block_height,
+                        block_timestamp,
+                        &mut next_snapshot_timestamp,
                     );
-                    
-                    // When fully synced AND block's date matches current date, snapshot every confirmed block
-                    let should_realtime_snapshot = is_fully_synced && is_current_date;
-                    
-                    let should_daily_snapshot = if block_height.0 == 0 {
-                        true
-                    } else {
-                        match next_snapshot_timestamp {
-                            None => {
-                                // First snapshot after restart (but not block 0) - calculate next snapshot timestamp
-                                true
-                            }
-                            Some(next_ts) => {
-                                // Snapshot if we've reached or passed the next snapshot timestamp
-                                block_timestamp >= next_ts
-                            }
-                        }
-                    };
-                    
-                    let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
-                    
-                    // Log snapshot decision for every block
-                    // if should_snapshot {
-                    //     tracing::info!(
-                    //         ?block_height,
-                    //         ?block_timestamp,
-                    //         time_diff_seconds,
-                    //         ?block_date,
-                    //         ?current_date,
-                    //         is_current_date,
-                    //         is_recent_block,
-                    //         is_fully_synced,
-                    //         non_finalized_len,
-                    //         should_daily_snapshot,
-                    //         should_realtime_snapshot,
-                    //         "snapshot will be created"
-                    //     );
-                    // } else {
-                    //     tracing::info!(
-                    //         ?block_height,
-                    //         ?block_timestamp,
-                    //         time_diff_seconds,
-                    //         ?block_date,
-                    //         ?current_date,
-                    //         is_current_date,
-                    //         is_recent_block,
-                    //         is_fully_synced,
-                    //         non_finalized_len,
-                    //         should_daily_snapshot,
-                    //         should_realtime_snapshot,
-                    //         "snapshot decision: no snapshot"
-                    //     );
-                    // }
-                    
-                    if should_snapshot {
-                        let network = non_finalized_state.network.clone();
-                        // Prioritize daily snapshots: use block date for daily snapshots,
-                        // current date only for real-time snapshots when it's NOT a daily snapshot time
-                        // This ensures daily snapshots always use the correct date (block's date)
-                        let use_current_date = should_realtime_snapshot && !should_daily_snapshot;
-                        let snapshot_type = if should_daily_snapshot {
-                            "daily"
-                        } else if should_realtime_snapshot {
-                            "realtime"
-                        } else {
-                            "unknown"
-                        };
-                        
-                        tracing::info!(
-                            ?block_height,
-                            snapshot_type,
-                            should_daily_snapshot,
-                            should_realtime_snapshot,
-                            use_current_date,
-                            "creating snapshot"
-                        );
-                        
-                        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
-                            tracing::warn!(
-                                ?block_height,
-                                snapshot_type,
-                                error = ?e,
-                                "failed to store snapshot data to RocksDB"
-                            );
-                        } else {
-                            if should_daily_snapshot {
-                                // Calculate the start of the next UTC day (00:00:00 UTC)
-                                let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
-                                    .unwrap_or_else(|| {
-                                        // Fallback: if timestamp conversion fails, use epoch
-                                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
-                                    });
-                                
-                                // Get the start of the current UTC day (00:00:00 UTC)
-                                let current_date = current_datetime.date_naive();
-                                
-                                // Get the start of the next day at 00:00:00 UTC
-                                let next_date = current_date + chrono::Duration::days(1);
-                                let next_datetime = next_date.and_hms_opt(0, 0, 0)
-                                    .expect("00:00:00 should always be valid");
-                                let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                                    next_datetime,
-                                    chrono::Utc,
-                                ).timestamp();
-                                
-                                next_snapshot_timestamp = Some(next_timestamp);
-                            }
-                        }
-                    }
 
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
@@ -591,11 +570,36 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
+                
+                // Extract block information before committing for snapshot logging
+                let (block_height, block_timestamp) = match &contextually_verified_with_trees {
+                    crate::request::FinalizableBlock::Checkpoint { checkpoint_verified } => {
+                        let height = checkpoint_verified.height;
+                        let timestamp = checkpoint_verified.block.header.time.timestamp();
+                        (height, timestamp)
+                    }
+                    crate::request::FinalizableBlock::Contextual { contextually_verified, .. } => {
+                        let height = contextually_verified.height;
+                        let timestamp = contextually_verified.block.header.time.timestamp();
+                        (height, timestamp)
+                    }
+                };
+                
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
+                
+                // Check snapshot conditions and create snapshots if needed
+                // This ensures logging happens even when fully synced (blocks finalized via commit_finalized_direct)
+                check_and_create_snapshot(
+                    &finalized_state,
+                    non_finalized_state,
+                    block_height,
+                    block_timestamp,
+                    &mut next_snapshot_timestamp,
+                );
             }
 
             // Update the metrics if semantic and contextual validation passes
