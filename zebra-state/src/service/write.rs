@@ -1,6 +1,7 @@
 //! Writing blocks to the finalized and non-finalized states.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use indexmap::IndexMap;
 use tokio::sync::{
@@ -146,35 +147,64 @@ fn check_and_create_snapshot(
             "creating snapshot"
         );
         
-        if let Err(e) = finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
-            tracing::warn!(
-                ?block_height,
-                snapshot_type,
-                error = ?e,
-                "failed to store snapshot data to RocksDB"
-            );
-        } else {
-            if should_daily_snapshot {
-                // Calculate the start of the next UTC day (00:00:00 UTC)
-                let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
-                    .unwrap_or_else(|| {
-                        // Fallback: if timestamp conversion fails, use epoch
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
-                    });
-                
-                // Get the start of the current UTC day (00:00:00 UTC)
-                let current_date = current_datetime.date_naive();
-                
-                // Get the start of the next day at 00:00:00 UTC
-                let next_date = current_date + chrono::Duration::days(1);
-                let next_datetime = next_date.and_hms_opt(0, 0, 0)
-                    .expect("00:00:00 should always be valid");
-                let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                    next_datetime,
-                    chrono::Utc,
-                ).timestamp();
-                
-                *next_snapshot_timestamp = Some(next_timestamp);
+        // Retry snapshot until it succeeds - snapshot is required
+        let mut retry_count = 0u32;
+        let mut delay_ms = 100u64; // Start with 100ms delay
+        const MAX_DELAY_MS: u64 = 10_000; // Cap at 10 seconds
+        
+        loop {
+            match finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
+                Ok(()) => {
+                    if retry_count > 0 {
+                        tracing::info!(
+                            ?block_height,
+                            snapshot_type,
+                            retry_count,
+                            "snapshot stored successfully after retries"
+                        );
+                    }
+                    
+                    if should_daily_snapshot {
+                        // Calculate the start of the next UTC day (00:00:00 UTC)
+                        let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                            .unwrap_or_else(|| {
+                                // Fallback: if timestamp conversion fails, use epoch
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                            });
+                        
+                        // Get the start of the current UTC day (00:00:00 UTC)
+                        let current_date = current_datetime.date_naive();
+                        
+                        // Get the start of the next day at 00:00:00 UTC
+                        let next_date = current_date + chrono::Duration::days(1);
+                        let next_datetime = next_date.and_hms_opt(0, 0, 0)
+                            .expect("00:00:00 should always be valid");
+                        let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                            next_datetime,
+                            chrono::Utc,
+                        ).timestamp();
+                        
+                        *next_snapshot_timestamp = Some(next_timestamp);
+                    }
+                    break; // Success, exit retry loop
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    tracing::warn!(
+                        ?block_height,
+                        snapshot_type,
+                        retry_count,
+                        error = ?e,
+                        delay_ms,
+                        "failed to store snapshot data to RocksDB, retrying"
+                    );
+                    
+                    // Exponential backoff with jitter
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    
+                    // Exponential backoff: double the delay, capped at MAX_DELAY_MS
+                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                }
             }
         }
     }
