@@ -38,7 +38,36 @@ use super::super::TypedColumnFamily;
 /// The name of the snapshot data by date column family.
 /// Stores holder count, pool values, difficulty, issuance, inflation rate, and timestamp.
 /// Key format: YY:MM:DD (year, month, day) as 3 bytes: [year, month, day]
+/// This is used for daily snapshots only.
 pub const SNAPSHOT_DATA_BY_DATE: &str = "snapshot_data_by_date";
+
+/// The name of the realtime snapshot data column family.
+/// Stores the same data as daily snapshots, but for realtime snapshots (taken when fully synced).
+/// Only keeps the current day's snapshot, using a constant key since we overwrite it each time.
+/// This is used for realtime snapshots only, to prevent them from interfering with daily snapshot calculations.
+pub const REALTIME_SNAPSHOT_DATA: &str = "realtime_snapshot_data";
+
+/// Key type for realtime snapshots (only one entry, overwritten each time)
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RealtimeSnapshotKey;
+
+impl IntoDisk for RealtimeSnapshotKey {
+    type Bytes = [u8; 1];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        [0]
+    }
+}
+
+impl FromDisk for RealtimeSnapshotKey {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let _ = bytes.as_ref();
+        RealtimeSnapshotKey
+    }
+}
+
+/// Constant key for realtime snapshots
+const REALTIME_SNAPSHOT_KEY: RealtimeSnapshotKey = RealtimeSnapshotKey;
 
 /// Snapshot date key in format YY:MM:DD (year, month, day)
 /// Stored as 3 bytes: [year (0-99), month (1-12), day (1-31)]
@@ -438,8 +467,15 @@ impl FromDisk for SnapshotData {
 
 impl ZebraDb {
     /// Returns a handle to the `snapshot_data_by_date` RocksDB column family.
+    /// This is used for daily snapshots only.
     pub fn snapshot_data_by_date_cf(&self) -> &ColumnFamily {
         self.db.cf_handle(SNAPSHOT_DATA_BY_DATE).unwrap()
+    }
+
+    /// Returns a handle to the `realtime_snapshot_data` RocksDB column family.
+    /// This is used for realtime snapshots only (only keeps current day).
+    pub fn realtime_snapshot_data_cf(&self) -> &ColumnFamily {
+        self.db.cf_handle(REALTIME_SNAPSHOT_DATA).unwrap()
     }
 
     /// Returns the holder count for a given block height, if it was stored in a snapshot.
@@ -1039,23 +1075,17 @@ impl ZebraDb {
         let difficulty_bytes = difficulty.bytes_in_serialized_order();
         
         // 9. Find the previous snapshot height to avoid double counting blocks
-        // We need to find the most recent snapshot with height < current height
-        let previous_snapshot_height = {
-            // Get recent snapshots (up to 100 should be enough to find the previous one)
-            let recent_snapshots = self.recent_snapshot_data(100);
-            // Find the most recent snapshot with height < current height
-            recent_snapshots
-                .iter()
-                .rev() // Start from most recent
-                .find_map(|(_, snapshot_data)| {
-                    let prev_height = snapshot_data.block_height();
-                    if prev_height < height.0 {
-                        Some(Height(prev_height))
-                    } else {
-                        None
-                    }
-                })
-        };
+        // Get the latest snapshot and check if it's before the current height
+        let previous_snapshot_height = self.recent_snapshot_data(1)
+            .first()
+            .and_then(|(_, snapshot_data)| {
+                let prev_height = snapshot_data.block_height();
+                if prev_height < height.0 {
+                    Some(Height(prev_height))
+                } else {
+                    None
+                }
+            });
         
         // Calculate range: from (previous_snapshot_height + 1) to height (inclusive)
         // This ensures we don't double count the previous snapshot block
@@ -1109,21 +1139,24 @@ impl ZebraDb {
             average_block_size,
         );
 
-        // 14. Store in RocksDB using date key
-        // Use current date if requested (for real-time snapshots), otherwise use block's date
-        let date_key = if use_current_date {
-            SnapshotDateKey::from_timestamp(chrono::Utc::now().timestamp())
-        } else {
-            SnapshotDateKey::from_timestamp(block_timestamp)
-        };
-        let snapshot_cf = self.snapshot_data_by_date_cf();
+        // 14. Store in RocksDB
+        // Use separate column families for daily vs realtime snapshots
         let mut batch = DiskWriteBatch::new();
-        batch.zs_insert(snapshot_cf, &date_key, &snapshot_data);
+        if use_current_date {
+            // Realtime snapshot: use constant key (only keep current day, overwrite each time)
+            let realtime_snapshot_cf = self.realtime_snapshot_data_cf();
+            batch.zs_insert(realtime_snapshot_cf, &REALTIME_SNAPSHOT_KEY, &snapshot_data);
+        } else {
+            // Daily snapshot: use date key (YY:MM:DD format)
+            let date_key = SnapshotDateKey::from_timestamp(block_timestamp);
+            let snapshot_cf = self.snapshot_data_by_date_cf();
+            batch.zs_insert(snapshot_cf, &date_key, &snapshot_data);
+        }
         self.db.write(batch)?;
 
         tracing::info!(
             ?height,
-            ?date_key,
+            date_key = if use_current_date { "realtime" } else { &SnapshotDateKey::from_timestamp(block_timestamp).to_string() },
             use_current_date,
             holder_count,
             ?pool_values,
@@ -1155,11 +1188,27 @@ impl ZebraDb {
     }
 
     /// Returns the snapshot data for a given date key, if it was stored.
+    /// Checks both daily and realtime snapshots, with realtime taking precedence if date matches.
     ///
     /// Returns `None` if no snapshot was stored for that date.
     pub fn snapshot_data_at_date(&self, date_key: SnapshotDateKey) -> Option<SnapshotData> {
+        // First check realtime snapshot (more recent, takes precedence)
+        if let Some(realtime_data) = self.get_realtime_snapshot() {
+            let realtime_date_key = SnapshotDateKey::from_timestamp(realtime_data.block_timestamp());
+            if realtime_date_key == date_key {
+                return Some(realtime_data);
+            }
+        }
+        
+        // Fall back to daily snapshot
         let snapshot_cf = self.snapshot_data_by_date_cf();
         self.db.zs_get(snapshot_cf, &date_key)
+    }
+    
+    /// Gets the current realtime snapshot, if it exists.
+    fn get_realtime_snapshot(&self) -> Option<SnapshotData> {
+        let realtime_cf = self.realtime_snapshot_data_cf();
+        self.db.zs_get(realtime_cf, &REALTIME_SNAPSHOT_KEY)
     }
     
     /// Returns the snapshot data for a given block height, if it was stored.
@@ -1174,6 +1223,7 @@ impl ZebraDb {
     }
 
     /// Returns the most recent snapshot data, limited to the specified count.
+    /// Merges daily and realtime snapshots, with realtime taking precedence for the same date.
     ///
     /// Returns a vector of (date_key, snapshot_data) pairs, sorted by date (ascending).
     /// Uses reverse iteration to efficiently get only the most recent snapshots.
@@ -1201,10 +1251,33 @@ impl ZebraDb {
 
         // Reverse to get ascending order by date
         snapshots.reverse();
+        
+        // Merge with realtime snapshot if it exists
+        if let Some(realtime_data) = self.get_realtime_snapshot() {
+            let realtime_date_key = SnapshotDateKey::from_timestamp(realtime_data.block_timestamp());
+            
+            // Check if realtime snapshot date already exists in daily snapshots
+            if let Some(existing_idx) = snapshots.iter().position(|(key, _)| *key == realtime_date_key) {
+                // Replace existing daily snapshot with realtime (more recent)
+                snapshots[existing_idx] = (realtime_date_key, realtime_data);
+            } else {
+                // Add realtime snapshot and sort by date
+                snapshots.push((realtime_date_key, realtime_data));
+                snapshots.sort_by_key(|(key, _)| *key);
+                
+                // Keep only the most recent ones if we exceeded the limit
+                if snapshots.len() > limit {
+                    snapshots = snapshots.into_iter().rev().take(limit).collect();
+                    snapshots.reverse();
+                }
+            }
+        }
+        
         snapshots
     }
 
     /// Returns snapshot data within a date range.
+    /// Merges daily and realtime snapshots, with realtime taking precedence for the same date.
     ///
     /// Returns a vector of (date_key, snapshot_data) pairs, sorted by date (ascending).
     ///
@@ -1223,8 +1296,8 @@ impl ZebraDb {
         )
         .expect("column family was created when database was created");
 
-        // Iterate through the range based on what's provided
-        match (start_date, end_date) {
+        // Get daily snapshots in the range
+        let mut snapshots: Vec<(SnapshotDateKey, SnapshotData)> = match (start_date, end_date) {
             (Some(start), Some(end)) => {
                 typed_cf
                     .zs_forward_range_iter(start..=end)
@@ -1245,7 +1318,34 @@ impl ZebraDb {
                     .zs_forward_range_iter(..)
                     .collect()
             }
+        };
+        
+        // Merge with realtime snapshot if it's in the range
+        if let Some(realtime_data) = self.get_realtime_snapshot() {
+            let realtime_date_key = SnapshotDateKey::from_timestamp(realtime_data.block_timestamp());
+            
+            // Check if realtime snapshot is in the range
+            let in_range = match (start_date, end_date) {
+                (Some(start), Some(end)) => realtime_date_key >= start && realtime_date_key <= end,
+                (Some(start), None) => realtime_date_key >= start,
+                (None, Some(end)) => realtime_date_key <= end,
+                (None, None) => true,
+            };
+            
+            if in_range {
+                // Check if realtime snapshot date already exists in daily snapshots
+                if let Some(existing_idx) = snapshots.iter().position(|(key, _)| *key == realtime_date_key) {
+                    // Replace existing daily snapshot with realtime (more recent)
+                    snapshots[existing_idx] = (realtime_date_key, realtime_data);
+                } else {
+                    // Add realtime snapshot and sort by date
+                    snapshots.push((realtime_date_key, realtime_data));
+                    snapshots.sort_by_key(|(key, _)| *key);
+                }
+            }
         }
+        
+        snapshots
     }
 }
 

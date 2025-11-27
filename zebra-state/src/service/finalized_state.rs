@@ -99,6 +99,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Snapshot data (holder count + pool values + difficulty + issuance + inflation + timestamp)
     zebra_db::snapshot::SNAPSHOT_DATA_BY_DATE,
+    zebra_db::snapshot::REALTIME_SNAPSHOT_DATA,
 ];
 
 /// The finalized part of the chain state, stored in the db.
