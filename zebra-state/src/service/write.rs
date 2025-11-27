@@ -69,20 +69,19 @@ pub(crate) fn validate_and_commit_non_finalized(
 /// Check snapshot conditions and create snapshots if needed.
 /// This function is called when blocks are finalized, either through the finalized block channel
 /// (during catch-up) or via commit_finalized_direct (when fully synced).
+/// 
+/// `is_realtime`: true for realtime snapshots (when fully synced), false for daily snapshots (during catch-up)
 fn check_and_create_snapshot(
     finalized_state: &FinalizedState,
     non_finalized_state: &NonFinalizedState,
     block_height: Height,
     block_timestamp: i64,
     next_snapshot_timestamp: &mut Option<i64>,
+    is_realtime: bool,
 ) {
-    let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
-        
-    // Determine if we're fully synced:
-    let is_fully_synced = non_finalized_len <= MAX_BLOCK_REORG_HEIGHT;
     
-    // When fully synced AND block's date matches current date, snapshot every confirmed block
-    let should_realtime_snapshot = is_fully_synced;
+    // Set realtime snapshot flag based on parameter
+    let should_realtime_snapshot = is_realtime;
     
     let should_daily_snapshot = if block_height.0 == 0 {
         true
@@ -102,27 +101,25 @@ fn check_and_create_snapshot(
     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
     
     // Log snapshot decision for every block
-    if should_snapshot {
-        tracing::info!(
-            ?block_height,
-            ?block_timestamp,
-            is_fully_synced,
-            non_finalized_len,
-            should_daily_snapshot,
-            should_realtime_snapshot,
-            "snapshot will be created"
-        );
-    } else {
-        tracing::info!(
-            ?block_height,
-            ?block_timestamp,
-            is_fully_synced,
-            non_finalized_len,
-            should_daily_snapshot,
-            should_realtime_snapshot,
-            "snapshot decision: no snapshot"
-        );
-    }
+    // if should_snapshot {
+    //     tracing::info!(
+    //         ?block_height,
+    //         ?block_timestamp,
+    //         is_realtime,
+    //         should_daily_snapshot,
+    //         should_realtime_snapshot,
+    //         "snapshot will be created"
+    //     );
+    // } else {
+    //     tracing::info!(
+    //         ?block_height,
+    //         ?block_timestamp,
+    //         is_realtime,
+    //         should_daily_snapshot,
+    //         should_realtime_snapshot,
+    //         "snapshot decision: no snapshot"
+    //     );
+    // }
     
     if should_snapshot {
         let network = non_finalized_state.network.clone();
@@ -464,12 +461,14 @@ impl WriteBlockWorkerTask {
                     log_if_mined_by_zebra(&tip_block, &mut last_zebra_mined_log_height);
 
                     // Check snapshot conditions and create snapshots if needed
+                    // During catch-up (commit_finalized), use daily snapshots
                     check_and_create_snapshot(
                         &finalized_state,
                         non_finalized_state,
                         block_height,
                         block_timestamp,
                         &mut next_snapshot_timestamp,
+                        false, // Daily snapshot during catch-up
                     );
 
                     chain_tip_sender.set_finalized_tip(tip_block);
@@ -629,6 +628,7 @@ impl WriteBlockWorkerTask {
                     block_height,
                     block_timestamp,
                     &mut next_snapshot_timestamp,
+                    true, // Realtime snapshot when fully synced
                 );
             }
 
