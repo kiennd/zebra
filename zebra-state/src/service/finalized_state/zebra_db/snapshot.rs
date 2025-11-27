@@ -1154,9 +1154,16 @@ impl ZebraDb {
         }
         self.db.write(batch)?;
 
+        // Prepare date_key string for logging
+        let date_key_str = if use_current_date {
+            "realtime".to_string()
+        } else {
+            SnapshotDateKey::from_timestamp(block_timestamp).to_string()
+        };
+
         tracing::info!(
             ?height,
-            date_key = if use_current_date { "realtime" } else { &SnapshotDateKey::from_timestamp(block_timestamp).to_string() },
+            date_key = %date_key_str,
             use_current_date,
             holder_count,
             ?pool_values,
