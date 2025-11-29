@@ -83,7 +83,10 @@ fn check_and_create_snapshot(
     // Set realtime snapshot flag based on parameter and non-finalized length
     // Only create realtime snapshots if non-finalized length is less than 100
     let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
-    let should_realtime_snapshot = is_realtime && non_finalized_len > 0 && non_finalized_len < 100;
+    let current_time = chrono::Utc::now().timestamp();
+    // Calculate time difference (how old the block is relative to current time)
+    let time_diff = current_time - block_timestamp;
+    let should_realtime_snapshot = is_realtime && non_finalized_len > 0 && non_finalized_len < 100 && time_diff < 3 * 3600;
     
     let should_daily_snapshot = if block_height.0 == 0 {
         true
@@ -111,6 +114,7 @@ fn check_and_create_snapshot(
             should_daily_snapshot,
             should_realtime_snapshot,
             non_finalized_len,
+            time_diff,
             "snapshot will be created"
         );
     } else {
@@ -121,6 +125,7 @@ fn check_and_create_snapshot(
             should_daily_snapshot,
             should_realtime_snapshot,
             non_finalized_len,
+            time_diff,
             "snapshot decision: no snapshot"
         );
     }
