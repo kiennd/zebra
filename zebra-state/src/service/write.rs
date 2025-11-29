@@ -80,8 +80,10 @@ fn check_and_create_snapshot(
     is_realtime: bool,
 ) {
     
-    // Set realtime snapshot flag based on parameter
-    let should_realtime_snapshot = is_realtime;
+    // Set realtime snapshot flag based on parameter and non-finalized length
+    // Only create realtime snapshots if non-finalized length is less than 100
+    let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
+    let should_realtime_snapshot = is_realtime && non_finalized_len > 0 && non_finalized_len < 100;
     
     let should_daily_snapshot = if block_height.0 == 0 {
         true
