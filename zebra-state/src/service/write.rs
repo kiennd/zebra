@@ -70,14 +70,15 @@ pub(crate) fn validate_and_commit_non_finalized(
 /// This function is called when blocks are finalized, either through the finalized block channel
 /// (during catch-up) or via commit_finalized_direct (when fully synced).
 /// 
-/// `is_realtime`: true for realtime snapshots (when fully synced), false for daily snapshots (during catch-up)
+/// `enable_realtime_check`: if true, enables checking for realtime snapshot conditions (when fully synced);
+///                          if false, only daily snapshots are considered (during catch-up)
 fn check_and_create_snapshot(
     finalized_state: &FinalizedState,
     non_finalized_state: &NonFinalizedState,
     block_height: Height,
     block_timestamp: i64,
     next_snapshot_timestamp: &mut Option<i64>,
-    is_realtime: bool,
+    enable_realtime_check: bool,
 ) {
     
     // Set realtime snapshot flag based on parameter and non-finalized length
@@ -86,7 +87,7 @@ fn check_and_create_snapshot(
     let current_time = chrono::Utc::now().timestamp();
     // Calculate time difference (how old the block is relative to current time)
     let time_diff = current_time - block_timestamp;
-    let should_realtime_snapshot = is_realtime && non_finalized_len > 0 && non_finalized_len < 100 && time_diff < 3 * 3600;
+    let should_realtime_snapshot = enable_realtime_check && non_finalized_len > 0 && non_finalized_len < 100 && time_diff < 3 * 3600;
     
     let should_daily_snapshot = if block_height.0 == 0 {
         true
@@ -110,7 +111,7 @@ fn check_and_create_snapshot(
         tracing::info!(
             ?block_height,
             ?block_timestamp,
-            is_realtime,
+            enable_realtime_check,
             should_daily_snapshot,
             should_realtime_snapshot,
             non_finalized_len,
@@ -121,7 +122,7 @@ fn check_and_create_snapshot(
         tracing::info!(
             ?block_height,
             ?block_timestamp,
-            is_realtime,
+            enable_realtime_check,
             should_daily_snapshot,
             should_realtime_snapshot,
             non_finalized_len,
