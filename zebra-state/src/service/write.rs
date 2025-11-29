@@ -103,25 +103,27 @@ fn check_and_create_snapshot(
     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
     
     // Log snapshot decision for every block
-    // if should_snapshot {
-    //     tracing::info!(
-    //         ?block_height,
-    //         ?block_timestamp,
-    //         is_realtime,
-    //         should_daily_snapshot,
-    //         should_realtime_snapshot,
-    //         "snapshot will be created"
-    //     );
-    // } else {
-    //     tracing::info!(
-    //         ?block_height,
-    //         ?block_timestamp,
-    //         is_realtime,
-    //         should_daily_snapshot,
-    //         should_realtime_snapshot,
-    //         "snapshot decision: no snapshot"
-    //     );
-    // }
+    if should_snapshot {
+        tracing::info!(
+            ?block_height,
+            ?block_timestamp,
+            is_realtime,
+            should_daily_snapshot,
+            should_realtime_snapshot,
+            non_finalized_len,
+            "snapshot will be created"
+        );
+    } else {
+        tracing::info!(
+            ?block_height,
+            ?block_timestamp,
+            is_realtime,
+            should_daily_snapshot,
+            should_realtime_snapshot,
+            non_finalized_len,
+            "snapshot decision: no snapshot"
+        );
+    }
     
     if should_snapshot {
         let network = non_finalized_state.network.clone();
