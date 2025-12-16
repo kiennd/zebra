@@ -400,11 +400,12 @@ impl WriteBlockWorkerTask {
         let mut last_zebra_mined_log_height = None;
         let mut prev_finalized_note_commitment_trees = None;
         
-        // Initialize next_snapshot_timestamp from the most recent snapshot in the database
+        // Initialize next_snapshot_timestamp from the most recent daily snapshot in the database
         // This handles the case where the node is restarted
+        // Use recent_daily_snapshot_data to exclude realtime snapshots
         let mut next_snapshot_timestamp: Option<i64> = finalized_state
             .db
-            .recent_snapshot_data(1)
+            .recent_daily_snapshot_data(1)
             .first()
             .and_then(|(_, snapshot_data)| {
                 let last_snapshot_timestamp = snapshot_data.block_timestamp();

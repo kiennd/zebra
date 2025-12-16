@@ -1248,6 +1248,38 @@ impl ZebraDb {
         self.snapshot_data_at_date(date_key)
     }
 
+    /// Returns the most recent daily snapshot data only (excludes realtime snapshots).
+    /// 
+    /// Returns a vector of (date_key, snapshot_data) pairs, sorted by date (ascending).
+    /// Uses reverse iteration to efficiently get only the most recent snapshots.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: Maximum number of snapshots to return
+    ///
+    /// # Performance
+    ///
+    /// This method uses reverse iteration to only read the last N snapshots,
+    /// avoiding a full scan of the column family.
+    pub fn recent_daily_snapshot_data(&self, limit: usize) -> Vec<(SnapshotDateKey, SnapshotData)> {
+        let typed_cf = TypedColumnFamily::<SnapshotDateKey, SnapshotData>::new(
+            &self.db,
+            SNAPSHOT_DATA_BY_DATE,
+        )
+        .expect("column family was created when database was created");
+
+        // Use reverse iteration to get the most recent snapshots first
+        let mut snapshots: Vec<(SnapshotDateKey, SnapshotData)> = typed_cf
+            .zs_reverse_range_iter(..)
+            .take(limit)
+            .collect();
+
+        // Reverse to get ascending order by date
+        snapshots.reverse();
+        
+        snapshots
+    }
+
     /// Returns the most recent snapshot data, limited to the specified count.
     /// Merges daily and realtime snapshots, with realtime taking precedence for the same date.
     ///
