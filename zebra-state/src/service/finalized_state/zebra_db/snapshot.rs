@@ -1075,17 +1075,36 @@ impl ZebraDb {
         let difficulty_bytes = difficulty.bytes_in_serialized_order();
         
         // 9. Find the previous snapshot height to avoid double counting blocks
-        // Get the latest snapshot and check if it's before the current height
-        let previous_snapshot_height = self.recent_snapshot_data(1)
-            .first()
-            .and_then(|(_, snapshot_data)| {
+        // Get the snapshot with the highest height that is still < current height
+        // Only consider daily snapshots (exclude realtime snapshots)
+        let previous_snapshot_height = {
+            // Get daily snapshots directly from column family (excludes realtime)
+            let typed_cf = TypedColumnFamily::<SnapshotDateKey, SnapshotData>::new(
+                &self.db,
+                SNAPSHOT_DATA_BY_DATE,
+            )
+            .expect("column family was created when database was created");
+            
+            // Get all daily snapshots (realtime is stored separately)
+            let daily_snapshots: Vec<(SnapshotDateKey, SnapshotData)> = typed_cf
+                .zs_reverse_range_iter(..)
+                .take(100) // Get enough snapshots to find the best previous one
+                .collect();
+            
+            // Find the snapshot with the highest height that is < current height
+            let mut best_prev: Option<Height> = None;
+            
+            for (_, snapshot_data) in daily_snapshots {
                 let prev_height = snapshot_data.block_height();
                 if prev_height < height.0 {
-                    Some(Height(prev_height))
-                } else {
-                    None
+                    if best_prev.is_none() || prev_height > best_prev.unwrap().0 {
+                        best_prev = Some(Height(prev_height));
+                    }
                 }
-            });
+            }
+            
+            best_prev
+        };
         
         // Calculate range: from (previous_snapshot_height + 1) to height (inclusive)
         // This ensures we don't double count the previous snapshot block
