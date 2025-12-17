@@ -1104,41 +1104,56 @@ impl ZebraDb {
                 .take(10)
                 .collect();
             
-            // Find previous day snapshot in one pass
-            if let Some((_, previous_snapshot)) = recent_snapshots.iter()
-                .find(|(date_key, _)| *date_key == previous_date_key) {
-                let prev_height = previous_snapshot.block_height();
-                if prev_height < height.0 {
-                    tracing::debug!(
-                        ?height,
-                        ?block_timestamp,
-                        current_date = %current_date,
-                        previous_date = %previous_date,
-                        previous_snapshot_height = ?prev_height,
-                        "found previous day snapshot"
-                    );
-                    Some(Height(prev_height))
-                } else {
-                    tracing::warn!(
-                        ?height,
-                        ?block_timestamp,
-                        previous_snapshot_height = ?prev_height,
-                        "previous day snapshot height >= current height, ignoring"
-                    );
-                    None
-                }
-            } else {
-                // Previous day snapshot not found in 10 most recent snapshots - panic
-                panic!(
-                    "CRITICAL: Previous day snapshot not found in 10 most recent snapshots. \
-                    Current height: {:?}, Current date: {}, Previous date: {}, \
-                    Previous date key: {:?}, Recent snapshots checked: {}",
-                    height,
-                    current_date,
-                    previous_date,
-                    previous_date_key,
-                    recent_snapshots.len()
+            // If no snapshots exist, this is the first snapshot - return None (will start from height 0)
+            if recent_snapshots.is_empty() {
+                tracing::debug!(
+                    ?height,
+                    ?block_timestamp,
+                    current_date = %current_date,
+                    previous_date = %previous_date,
+                    "no previous snapshots found, this is the first snapshot"
                 );
+                None
+            } else {
+                // Find previous day snapshot in one pass
+                if let Some((_, previous_snapshot)) = recent_snapshots.iter()
+                    .find(|(date_key, _)| *date_key == previous_date_key) {
+                    let prev_height = previous_snapshot.block_height();
+                    if prev_height < height.0 {
+                        tracing::debug!(
+                            ?height,
+                            ?block_timestamp,
+                            current_date = %current_date,
+                            previous_date = %previous_date,
+                            previous_snapshot_height = ?prev_height,
+                            "found previous day snapshot"
+                        );
+                        Some(Height(prev_height))
+                    } else {
+                        tracing::warn!(
+                            ?height,
+                            ?block_timestamp,
+                            previous_snapshot_height = ?prev_height,
+                            "previous day snapshot height >= current height, ignoring"
+                        );
+                        None
+                    }
+                } else {
+                    // Previous day snapshot not found in 10 most recent snapshots - panic
+                    // This should only happen if there are snapshots but previous day is missing
+                    panic!(
+                        "CRITICAL: Previous day snapshot not found in 10 most recent snapshots. \
+                        Current height: {:?}, Current date: {}, Previous date: {}, \
+                        Previous date key: {:?}, Recent snapshots checked: {}, \
+                        Recent snapshot dates: {:?}",
+                        height,
+                        current_date,
+                        previous_date,
+                        previous_date_key,
+                        recent_snapshots.len(),
+                        recent_snapshots.iter().map(|(k, _)| k).collect::<Vec<_>>()
+                    );
+                }
             }
         };
         
