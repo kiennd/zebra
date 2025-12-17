@@ -1075,9 +1075,22 @@ impl ZebraDb {
         let difficulty_bytes = difficulty.bytes_in_serialized_order();
         
         // 9. Find the previous snapshot height to avoid double counting blocks
-        // Get the snapshot with the highest height that is still < current height
+        // Find the snapshot of the previous day (yesterday), not the highest height
         // Only consider daily snapshots (exclude realtime snapshots)
+        // If previous day snapshot is not found in the 10 most recent snapshots, panic
         let previous_snapshot_height = {
+            // Calculate the date of the previous day (yesterday)
+            let current_date = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap())
+                .date_naive();
+            let previous_date = current_date - chrono::Duration::days(1);
+            let previous_date_key = SnapshotDateKey::from_timestamp(
+                previous_date.and_hms_opt(0, 0, 0)
+                    .expect("00:00:00 should always be valid")
+                    .and_utc()
+                    .timestamp()
+            );
+            
             // Get daily snapshots directly from column family (excludes realtime)
             let typed_cf = TypedColumnFamily::<SnapshotDateKey, SnapshotData>::new(
                 &self.db,
@@ -1085,25 +1098,48 @@ impl ZebraDb {
             )
             .expect("column family was created when database was created");
             
-            // Get all daily snapshots (realtime is stored separately)
-            let daily_snapshots: Vec<(SnapshotDateKey, SnapshotData)> = typed_cf
+            // Get the 10 most recent snapshots and find previous day snapshot in one pass
+            let recent_snapshots: Vec<(SnapshotDateKey, SnapshotData)> = typed_cf
                 .zs_reverse_range_iter(..)
-                .take(100) // Get enough snapshots to find the best previous one
+                .take(10)
                 .collect();
             
-            // Find the snapshot with the highest height that is < current height
-            let mut best_prev: Option<Height> = None;
-            
-            for (_, snapshot_data) in daily_snapshots {
-                let prev_height = snapshot_data.block_height();
+            // Find previous day snapshot in one pass
+            if let Some((_, previous_snapshot)) = recent_snapshots.iter()
+                .find(|(date_key, _)| *date_key == previous_date_key) {
+                let prev_height = previous_snapshot.block_height();
                 if prev_height < height.0 {
-                    if best_prev.is_none() || prev_height > best_prev.unwrap().0 {
-                        best_prev = Some(Height(prev_height));
-                    }
+                    tracing::debug!(
+                        ?height,
+                        ?block_timestamp,
+                        current_date = %current_date,
+                        previous_date = %previous_date,
+                        previous_snapshot_height = ?prev_height,
+                        "found previous day snapshot"
+                    );
+                    Some(Height(prev_height))
+                } else {
+                    tracing::warn!(
+                        ?height,
+                        ?block_timestamp,
+                        previous_snapshot_height = ?prev_height,
+                        "previous day snapshot height >= current height, ignoring"
+                    );
+                    None
                 }
+            } else {
+                // Previous day snapshot not found in 10 most recent snapshots - panic
+                panic!(
+                    "CRITICAL: Previous day snapshot not found in 10 most recent snapshots. \
+                    Current height: {:?}, Current date: {}, Previous date: {}, \
+                    Previous date key: {:?}, Recent snapshots checked: {}",
+                    height,
+                    current_date,
+                    previous_date,
+                    previous_date_key,
+                    recent_snapshots.len()
+                );
             }
-            
-            best_prev
         };
         
         // Calculate range: from (previous_snapshot_height + 1) to height (inclusive)
