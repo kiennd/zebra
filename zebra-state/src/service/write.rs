@@ -118,18 +118,7 @@ fn check_and_create_snapshot(
             time_diff,
             "snapshot will be created"
         );
-    } else {
-        tracing::info!(
-            ?block_height,
-            ?block_timestamp,
-            enable_realtime_check,
-            should_daily_snapshot,
-            should_realtime_snapshot,
-            non_finalized_len,
-            time_diff,
-            "snapshot decision: no snapshot"
-        );
-    }
+    } 
     
     if should_snapshot {
         let network = non_finalized_state.network.clone();
