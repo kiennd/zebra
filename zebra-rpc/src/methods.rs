@@ -1354,7 +1354,7 @@ where
                     pool_sapling: pool_values.sapling_amount(),
                     pool_orchard: pool_values.orchard_amount(),
                     pool_deferred: pool_values.deferred_amount(),
-                    difficulty: hex::encode(snapshot_data.difficulty_bytes()),
+                    difficulty: snapshot_data.work_difficulty(),
                     total_issuance: snapshot_data.total_issuance(),
                     inflation_rate_percent: snapshot_data.inflation_rate_percent(),
                     block_timestamp: snapshot_data.block_timestamp(),
@@ -1412,7 +1412,7 @@ where
                                 pool_sapling: snapshot_data.pool_values().sapling_amount(),
                                 pool_orchard: snapshot_data.pool_values().orchard_amount(),
                                 pool_deferred: snapshot_data.pool_values().deferred_amount(),
-                                difficulty: hex::encode(snapshot_data.difficulty_bytes()),
+                                difficulty: snapshot_data.work_difficulty(),
                                 total_issuance: snapshot_data.total_issuance(),
                                 inflation_rate_percent: snapshot_data.inflation_rate_percent(),
                                 block_timestamp: snapshot_data.block_timestamp(),
@@ -3857,8 +3857,9 @@ pub struct SnapshotDataEntry {
     /// Deferred pool value (in zatoshis).
     #[getter(copy)]
     pub pool_deferred: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
-    /// Mining difficulty (expanded difficulty as 32 bytes in big-endian, hex encoded).
-    pub difficulty: String,
+    /// Mining work difficulty (as a multiple of the minimum difficulty, f64).
+    /// This matches the value returned by the `getdifficulty` RPC method.
+    pub difficulty: f64,
     /// Total ZEC issuance up to this height (in zatoshis).
     #[getter(copy)]
     pub total_issuance: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,

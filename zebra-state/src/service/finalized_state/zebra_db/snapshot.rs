@@ -21,8 +21,8 @@ use zebra_chain::{
         subsidy::block_subsidy,
         Network, NetworkUpgrade,
     },
-    serialization::BytesInDisplayOrder,
     value_balance::ValueBalance,
+    work::difficulty::{ParameterDifficulty, U256},
 };
 
 use crate::{
@@ -135,8 +135,9 @@ pub struct SnapshotData {
     holder_count: u64,
     /// Pool values (value balance) at this height.
     pool_values: ValueBalance<NonNegative>,
-    /// Mining difficulty (expanded difficulty as U256, stored as 32 bytes in big-endian).
-    difficulty: [u8; 32],
+    /// Mining work difficulty (as a multiple of the minimum difficulty, stored as f64).
+    /// This matches the value returned by the `getdifficulty` RPC method.
+    work_difficulty: f64,
     /// Total ZEC issuance up to this height (in zatoshis).
     total_issuance: u64,
     /// Inflation rate per year (in basis points, e.g., 200 = 2.00%).
@@ -191,7 +192,7 @@ impl SnapshotData {
     pub fn new(
         holder_count: u64,
         pool_values: ValueBalance<NonNegative>,
-        difficulty_bytes: [u8; 32],
+        work_difficulty: f64,
         total_issuance: Amount<NonNegative>,
         inflation_rate_percent: f64,
         block_timestamp: i64,
@@ -220,7 +221,7 @@ impl SnapshotData {
         SnapshotData {
             holder_count,
             pool_values,
-            difficulty: difficulty_bytes,
+            work_difficulty,
             total_issuance: total_issuance.zatoshis() as u64,
             inflation_rate_bps,
             block_timestamp,
@@ -253,8 +254,8 @@ impl SnapshotData {
         self.pool_values
     }
     
-    pub fn difficulty_bytes(&self) -> [u8; 32] {
-        self.difficulty
+    pub fn work_difficulty(&self) -> f64 {
+        self.work_difficulty
     }
     
     pub fn total_issuance(&self) -> Amount<NonNegative> {
@@ -346,11 +347,11 @@ impl IntoDisk for SnapshotData {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
-        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 208 bytes total
-        let mut bytes = Vec::with_capacity(208);
+        // 8 + 40 + 8 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 184 bytes total
+        let mut bytes = Vec::with_capacity(184);
         bytes.extend_from_slice(&self.holder_count.to_be_bytes());
         bytes.extend_from_slice(&self.pool_values.as_bytes());
-        bytes.extend_from_slice(&self.difficulty);
+        bytes.extend_from_slice(&self.work_difficulty.to_be_bytes());
         bytes.extend_from_slice(&self.total_issuance.to_be_bytes());
         bytes.extend_from_slice(&self.inflation_rate_bps.to_be_bytes());
         bytes.extend_from_slice(&self.block_timestamp.to_be_bytes());
@@ -379,13 +380,13 @@ impl IntoDisk for SnapshotData {
 impl FromDisk for SnapshotData {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
         let bytes = bytes.as_ref();
-        // Current format: 208 bytes
-        // 8 + 40 + 32 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 208 bytes
+        // Current format: 184 bytes
+        // 8 + 40 + 8 + 8 + 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4 + 8*8 + 4 + 8 + 4 = 184 bytes
         
         // Validate byte length
-        if bytes.len() != 208 {
+        if bytes.len() != 184 {
             panic!(
-                "SnapshotData deserialization error: expected 208 bytes, got {} bytes. \
+                "SnapshotData deserialization error: expected 184 bytes, got {} bytes. \
                 This may indicate old database format or corrupted data. \
                 Please clear the database and resync.",
                 bytes.len()
@@ -397,49 +398,51 @@ impl FromDisk for SnapshotData {
         );
         let pool_values = ValueBalance::<NonNegative>::from_bytes(&bytes[8..48])
             .expect("pool values must be 40 bytes");
-        let difficulty: [u8; 32] = bytes[48..80].try_into().expect("difficulty must be 32 bytes");
+        let work_difficulty = f64::from_be_bytes(
+            bytes[48..56].try_into().expect("work difficulty must be 8 bytes")
+        );
         let total_issuance = u64::from_be_bytes(
-            bytes[80..88].try_into().expect("total issuance must be 8 bytes")
+            bytes[56..64].try_into().expect("total issuance must be 8 bytes")
         );
         let inflation_rate_bps = u32::from_be_bytes(
-            bytes[88..92].try_into().expect("inflation rate must be 4 bytes")
+            bytes[64..68].try_into().expect("inflation rate must be 4 bytes")
         );
         let block_timestamp = i64::from_be_bytes(
-            bytes[92..100].try_into().expect("block timestamp must be 8 bytes")
+            bytes[68..76].try_into().expect("block timestamp must be 8 bytes")
         );
         let block_height = u32::from_be_bytes(
-            bytes[100..104].try_into().expect("block height must be 4 bytes")
+            bytes[76..80].try_into().expect("block height must be 4 bytes")
         );
         
         // Transaction counts
-        let transparent_tx_count = u32::from_be_bytes(bytes[104..108].try_into().expect("transparent tx count must be 4 bytes"));
-        let transparent_coinbase_tx_count = u32::from_be_bytes(bytes[108..112].try_into().expect("transparent coinbase tx count must be 4 bytes"));
-        let shielded_coinbase_migration_tx_count = u32::from_be_bytes(bytes[112..116].try_into().expect("shielded coinbase migration tx count must be 4 bytes"));
-        let sprout_tx_count = u32::from_be_bytes(bytes[116..120].try_into().expect("sprout tx count must be 4 bytes"));
-        let sapling_tx_count = u32::from_be_bytes(bytes[120..124].try_into().expect("sapling tx count must be 4 bytes"));
-        let orchard_tx_count = u32::from_be_bytes(bytes[124..128].try_into().expect("orchard tx count must be 4 bytes"));
+        let transparent_tx_count = u32::from_be_bytes(bytes[80..84].try_into().expect("transparent tx count must be 4 bytes"));
+        let transparent_coinbase_tx_count = u32::from_be_bytes(bytes[84..88].try_into().expect("transparent coinbase tx count must be 4 bytes"));
+        let shielded_coinbase_migration_tx_count = u32::from_be_bytes(bytes[88..92].try_into().expect("shielded coinbase migration tx count must be 4 bytes"));
+        let sprout_tx_count = u32::from_be_bytes(bytes[92..96].try_into().expect("sprout tx count must be 4 bytes"));
+        let sapling_tx_count = u32::from_be_bytes(bytes[96..100].try_into().expect("sapling tx count must be 4 bytes"));
+        let orchard_tx_count = u32::from_be_bytes(bytes[100..104].try_into().expect("orchard tx count must be 4 bytes"));
         
         // Inflow/outflow
-        let transparent_inflow = u64::from_be_bytes(bytes[128..136].try_into().expect("transparent inflow must be 8 bytes"));
-        let transparent_outflow = u64::from_be_bytes(bytes[136..144].try_into().expect("transparent outflow must be 8 bytes"));
-        let sprout_inflow = u64::from_be_bytes(bytes[144..152].try_into().expect("sprout inflow must be 8 bytes"));
-        let sprout_outflow = u64::from_be_bytes(bytes[152..160].try_into().expect("sprout outflow must be 8 bytes"));
-        let sapling_inflow = u64::from_be_bytes(bytes[160..168].try_into().expect("sapling inflow must be 8 bytes"));
-        let sapling_outflow = u64::from_be_bytes(bytes[168..176].try_into().expect("sapling outflow must be 8 bytes"));
-        let orchard_inflow = u64::from_be_bytes(bytes[176..184].try_into().expect("orchard inflow must be 8 bytes"));
-        let orchard_outflow = u64::from_be_bytes(bytes[184..192].try_into().expect("orchard outflow must be 8 bytes"));
+        let transparent_inflow = u64::from_be_bytes(bytes[104..112].try_into().expect("transparent inflow must be 8 bytes"));
+        let transparent_outflow = u64::from_be_bytes(bytes[112..120].try_into().expect("transparent outflow must be 8 bytes"));
+        let sprout_inflow = u64::from_be_bytes(bytes[120..128].try_into().expect("sprout inflow must be 8 bytes"));
+        let sprout_outflow = u64::from_be_bytes(bytes[128..136].try_into().expect("sprout outflow must be 8 bytes"));
+        let sapling_inflow = u64::from_be_bytes(bytes[136..144].try_into().expect("sapling inflow must be 8 bytes"));
+        let sapling_outflow = u64::from_be_bytes(bytes[144..152].try_into().expect("sapling outflow must be 8 bytes"));
+        let orchard_inflow = u64::from_be_bytes(bytes[152..160].try_into().expect("orchard inflow must be 8 bytes"));
+        let orchard_outflow = u64::from_be_bytes(bytes[160..168].try_into().expect("orchard outflow must be 8 bytes"));
         
         // Average block time
-        let average_block_time = f32::from_be_bytes(bytes[192..196].try_into().expect("average block time must be 4 bytes"));
+        let average_block_time = f32::from_be_bytes(bytes[168..172].try_into().expect("average block time must be 4 bytes"));
         
         // Average fee and block size
-        let average_block_fee_zat = u64::from_be_bytes(bytes[196..204].try_into().expect("average block fee must be 8 bytes"));
-        let average_block_size = u32::from_be_bytes(bytes[204..208].try_into().expect("average block size must be 4 bytes"));
+        let average_block_fee_zat = u64::from_be_bytes(bytes[172..180].try_into().expect("average block fee must be 8 bytes"));
+        let average_block_size = u32::from_be_bytes(bytes[180..184].try_into().expect("average block size must be 4 bytes"));
         
         SnapshotData {
             holder_count,
             pool_values,
-            difficulty,
+            work_difficulty,
             total_issuance,
             inflation_rate_bps,
             block_timestamp,
@@ -868,9 +871,13 @@ impl ZebraDb {
                     // Calculate fee for all transaction types
                     // General formula: fee = transparent_inputs - transparent_outputs - value_balance
                     // Where value_balance can be negative (shielding) or positive (deshielding)
+                    //
+                    // Note: transparent_inputs - transparent_outputs can be negative if outputs > inputs,
+                    // but this is valid when there's shielding (negative value_balance) that compensates.
                     
-                    // Calculate sprout value balance: vpub_old (outputs to sprout) - vpub_new (inputs from sprout)
-                    // Positive = value leaving sprout, Negative = value entering sprout
+                    // Calculate sprout value balance: vpub_new (outputs from sprout) - vpub_old (inputs to sprout)
+                    // This matches JoinSplit::value_balance() in zebra-chain/src/sprout/joinsplit.rs
+                    // Positive = value leaving sprout (deshielding), Negative = value entering sprout (shielding)
                     let mut sprout_vpub_old = Amount::<NonNegative>::zero();
                     for vpub_old in transaction.output_values_to_sprout() {
                         sprout_vpub_old = sprout_vpub_old
@@ -885,16 +892,16 @@ impl ZebraDb {
                             .map_err(|e| format!("overflow calculating sprout vpub_new: {}", e))?;
                     }
                     
-                    // Sprout value balance (signed): vpub_old - vpub_new
+                    // Sprout value balance (signed): vpub_new - vpub_old
                     // Positive = value leaving sprout (deshielding), Negative = value entering sprout (shielding)
-                    let sprout_value_balance_zatoshis = if sprout_vpub_old > sprout_vpub_new {
+                    let sprout_value_balance_zatoshis = if sprout_vpub_new > sprout_vpub_old {
                         // Value leaving sprout (positive)
-                        (sprout_vpub_old - sprout_vpub_new)
+                        (sprout_vpub_new - sprout_vpub_old)
                             .map_err(|e| format!("error calculating sprout value balance: {}", e))?
                             .zatoshis() as i64
-                    } else if sprout_vpub_new > sprout_vpub_old {
+                    } else if sprout_vpub_old > sprout_vpub_new {
                         // Value entering sprout (negative)
-                        -((sprout_vpub_new - sprout_vpub_old)
+                        -((sprout_vpub_old - sprout_vpub_new)
                             .map_err(|e| format!("error calculating sprout value balance: {}", e))?
                             .zatoshis() as i64)
                     } else {
@@ -911,30 +918,37 @@ impl ZebraDb {
                     let orchard_value_balance = orchard_vb_fee.orchard_amount();
                     let orchard_zatoshis = orchard_value_balance.zatoshis();
                     
-                    // Calculate total value balance (signed)
-                    // Formula: fee = transparent_inputs - transparent_outputs - (sapling_vb + orchard_vb + sprout_vb)
-                    // value_balance: negative = shielding (value entering), positive = deshielding (value leaving)
-                    
-                    // Calculate total value balance in zatoshis (signed)
-                    let total_value_balance_zatoshis = sapling_zatoshis
-                        .saturating_add(orchard_zatoshis)
-                        .saturating_add(sprout_value_balance_zatoshis);
-                    
-                    // Calculate fee: transparent_inputs - transparent_outputs - value_balance
-                    // If transparent_inputs <= transparent_outputs, there's no fee from transparent component
-                    // But we still need to account for value_balance (which can make fee positive even if transparent diff is 0)
-                    let transparent_diff = if input_value > output_value {
+                    // Calculate transparent value balance (signed)
+                    // This is: transparent_inputs - transparent_outputs
+                    let transparent_value_balance_zatoshis = if input_value > output_value {
+                        // Positive: more inputs than outputs
                         (input_value - output_value)
-                            .map_err(|e| format!("error calculating transparent diff: {}", e))?
+                            .map_err(|e| format!("error calculating transparent value balance: {}", e))?
                             .zatoshis() as i64
+                    } else if output_value > input_value {
+                        // Negative: more outputs than inputs (valid when there's shielding)
+                        -((output_value - input_value)
+                            .map_err(|e| format!("error calculating transparent value balance: {}", e))?
+                            .zatoshis() as i64)
                     } else {
+                        // Zero: inputs equal outputs
                         0i64
                     };
                     
-                    // Fee = transparent_diff - total_value_balance
-                    // If value_balance is negative (shielding), fee increases
-                    // If value_balance is positive (deshielding), fee decreases
-                    let fee_zatoshis = transparent_diff.saturating_sub(total_value_balance_zatoshis);
+                    // Calculate fee using the consensus formula from value_balance.rs:
+                    // remaining_transaction_value = transparent + sprout + sapling + orchard
+                    //
+                    // This is the sum of all value balances:
+                    // - transparent: transparent_inputs - transparent_outputs
+                    // - sprout: vpub_new - vpub_old
+                    // - sapling: value_balance (negative = shielding, positive = deshielding)
+                    // - orchard: value_balance (negative = shielding, positive = deshielding)
+                    //
+                    // The remaining value is the transaction fee (for non-coinbase transactions)
+                    let fee_zatoshis = transparent_value_balance_zatoshis
+                        .saturating_add(sprout_value_balance_zatoshis)
+                        .saturating_add(sapling_zatoshis)
+                        .saturating_add(orchard_zatoshis);
                     
                     // Only add positive fees
                     if fee_zatoshis > 0 {
@@ -1035,10 +1049,30 @@ impl ZebraDb {
             .ok_or_else(|| format!("block at height {:?} not found", height))?;
         let header = &block.header;
         
-        // 4. Get mining difficulty (expanded difficulty)
-        let difficulty = header.difficulty_threshold
+        // 4. Calculate work difficulty (matches RPC getdifficulty)
+        // Get expanded difficulty from block header
+        let expanded_difficulty = header.difficulty_threshold
             .to_expanded()
             .ok_or_else(|| "invalid difficulty threshold".to_string())?;
+        
+        // Calculate work difficulty: pow_limit / expanded_difficulty
+        // This matches the calculation in RPC getdifficulty method
+        let pow_limit: U256 = network.target_difficulty_limit().into();
+        
+        // Shift out the lower 128 bits (same as RPC getdifficulty)
+        let pow_limit_shifted = pow_limit >> 128;
+        let difficulty_shifted = U256::from(expanded_difficulty) >> 128;
+        
+        // Convert to u128 then f64
+        let pow_limit_f64 = pow_limit_shifted.as_u128() as f64;
+        let difficulty_f64 = difficulty_shifted.as_u128() as f64;
+        
+        // Calculate work difficulty (avoid division by zero)
+        let work_difficulty = if difficulty_f64 == 0.0 {
+            0.0
+        } else {
+            pow_limit_f64 / difficulty_f64
+        };
         
         // 5. Get block timestamp (Unix timestamp in seconds)
         let block_timestamp = header.time.timestamp();
@@ -1071,10 +1105,7 @@ impl ZebraDb {
             (calculated_issuance, calculated_inflation)
         };
         
-        // 8. Convert difficulty to bytes (big-endian)
-        let difficulty_bytes = difficulty.bytes_in_serialized_order();
-        
-        // 9. Find the previous snapshot height to avoid double counting blocks
+        // 8. Find the previous snapshot height to avoid double counting blocks
         // Find the snapshot of the previous day (yesterday), not the highest height
         // Only consider daily snapshots (exclude realtime snapshots)
         // If previous day snapshot is not found in the 10 most recent snapshots, panic
@@ -1185,7 +1216,7 @@ impl ZebraDb {
         let snapshot_data = SnapshotData::new(
             holder_count as u64,
             pool_values,
-            difficulty_bytes,
+            work_difficulty,
             total_issuance,
             inflation_rate,
             block_timestamp,
@@ -1237,7 +1268,7 @@ impl ZebraDb {
             use_current_date,
             holder_count,
             ?pool_values,
-            ?difficulty,
+            work_difficulty,
             total_issuance_zat = total_issuance.zatoshis(),
             inflation_rate_percent = inflation_rate,
             block_timestamp,
