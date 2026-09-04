@@ -9,12 +9,11 @@ use zebra_chain::{
     block::{Block, Height},
     fmt::TypeNameToDebug,
     orchard,
-    parameters::NetworkUpgrade::Nu5,
     primitives::Groth16Proof,
     sapling::{self, FieldNotPresent, PerSpendAnchor, TransferData::*},
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     sprout::JoinSplit,
-    transaction::{JoinSplitData, LockTime, Transaction},
+    transaction::{JoinSplitData, Transaction},
 };
 
 use crate::{
@@ -969,6 +968,237 @@ proptest! {
         prop_assert_eq!(Some((Height(1), block1_hash)), read::best_tip(&non_finalized_state, &finalized_state.db));
         prop_assert!(non_finalized_state.eq_internal_state(&previous_mem));
     }
+
+    /// A block whose sprout-shielded transaction has the same hash as one
+    /// already finalized must be rejected with `DuplicateSproutNullifier`.
+    #[test]
+    fn reject_block_containing_sprout_tx_already_in_finalized_chain(
+        mut joinsplit in TypeNameToDebug::<JoinSplit<Groth16Proof>>::arbitrary(),
+        joinsplit_data in TypeNameToDebug::<JoinSplitData<Groth16Proof>>::arbitrary(),
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+        let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+
+        make_distinct_nullifiers(&mut joinsplit.nullifiers);
+        let expected_duplicate_nullifier = joinsplit.nullifiers[0];
+
+        let transaction = Arc::new(transaction_v4_with_joinsplit_data(joinsplit_data.0, [joinsplit.0]));
+
+        block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+        block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
+
+        // Push the same Arc into both blocks so they share a tx hash.
+        block1.transactions.push(transaction.clone());
+        block2.transactions.push(transaction);
+
+        let (mut finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+
+        finalized_state.populate_with_anchors(&block1);
+        finalized_state.populate_with_anchors(&block2);
+
+        let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
+        let commit_result = finalized_state.commit_finalized_direct(block1.into(), None, "test");
+        prop_assert!(commit_result.is_ok());
+
+        let block2 = Arc::new(block2).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block2,
+        );
+
+        prop_assert_eq!(
+            commit_result,
+            Err(DuplicateSproutNullifier {
+                nullifier: expected_duplicate_nullifier,
+                in_finalized_state: true,
+            })
+        );
+    }
+
+    /// A block whose sapling-shielded transaction has the same hash as one
+    /// already finalized must be rejected with `DuplicateSaplingNullifier`.
+    #[test]
+    fn reject_block_containing_sapling_tx_already_in_finalized_chain(
+        spend in TypeNameToDebug::<sapling::Spend<PerSpendAnchor>>::arbitrary(),
+        sapling_shielded_data in TypeNameToDebug::<sapling::ShieldedData<PerSpendAnchor>>::arbitrary(),
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+        let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+
+        let expected_duplicate_nullifier = spend.nullifier;
+
+        let transaction = Arc::new(transaction_v4_with_sapling_shielded_data(
+            sapling_shielded_data.0,
+            [spend.0],
+        ));
+
+        block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+        block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
+
+        block1.transactions.push(transaction.clone());
+        block2.transactions.push(transaction);
+
+        let (mut finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+
+        finalized_state.populate_with_anchors(&block1);
+        finalized_state.populate_with_anchors(&block2);
+
+        let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
+        let commit_result = finalized_state.commit_finalized_direct(block1.into(), None, "test");
+        prop_assert!(commit_result.is_ok());
+
+        let block2 = Arc::new(block2).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block2,
+        );
+
+        prop_assert_eq!(
+            commit_result,
+            Err(DuplicateSaplingNullifier {
+                nullifier: expected_duplicate_nullifier,
+                in_finalized_state: true,
+            })
+        );
+    }
+
+    /// A block whose orchard-shielded transaction has the same hash as one
+    /// already finalized must be rejected with `DuplicateOrchardNullifier`.
+    #[test]
+    fn reject_block_containing_orchard_tx_already_in_finalized_chain(
+        authorized_action in TypeNameToDebug::<orchard::AuthorizedAction>::arbitrary(),
+        orchard_shielded_data in TypeNameToDebug::<orchard::ShieldedData>::arbitrary(),
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+        let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+
+        let expected_duplicate_nullifier = authorized_action.action.nullifier;
+
+        let transaction = Arc::new(transaction_v5_with_orchard_shielded_data(
+            orchard_shielded_data.0,
+            [authorized_action.0],
+        ));
+
+        block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+        block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
+
+        block1.transactions.push(transaction.clone());
+        block2.transactions.push(transaction);
+
+        let (mut finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+
+        finalized_state.populate_with_anchors(&block1);
+        finalized_state.populate_with_anchors(&block2);
+
+        let block1 = CheckpointVerifiedBlock::from(Arc::new(block1));
+        let commit_result = finalized_state.commit_finalized_direct(block1.into(), None, "test");
+        prop_assert!(commit_result.is_ok());
+
+        let block2 = Arc::new(block2).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block2,
+        );
+
+        prop_assert_eq!(
+            commit_result,
+            Err(DuplicateOrchardNullifier {
+                nullifier: expected_duplicate_nullifier,
+                in_finalized_state: true,
+            })
+        );
+    }
+
+    /// A block whose sapling-shielded transaction has the same hash as one
+    /// already present in the **non-finalized** part of the chain must be
+    /// rejected with `DuplicateSaplingNullifier` — not panic.
+    ///
+    /// This is the BIP30-style duplicate-txid scenario where the prior
+    /// occurrence lives in the non-finalized chain (so the
+    /// `no_duplicates_in_finalized_chain` check in `initial_contextual_validity`
+    /// cannot catch it). The fix in
+    /// `zebra-state/src/service/non_finalized_state/chain.rs` runs the
+    /// shielded nullifier check before the `tx_loc_by_hash` assertion,
+    /// so the duplicate is rejected via the existing nullifier check.
+    #[test]
+    fn reject_block_containing_sapling_tx_already_in_non_finalized_chain(
+        spend in TypeNameToDebug::<sapling::Spend<PerSpendAnchor>>::arbitrary(),
+        sapling_shielded_data in TypeNameToDebug::<sapling::ShieldedData<PerSpendAnchor>>::arbitrary(),
+    ) {
+        let _init_guard = zebra_test::init();
+
+        let mut block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+        let mut block2 = zebra_test::vectors::BLOCK_MAINNET_2_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("block should deserialize");
+
+        let expected_duplicate_nullifier = spend.nullifier;
+
+        let transaction = Arc::new(transaction_v4_with_sapling_shielded_data(
+            sapling_shielded_data.0,
+            [spend.0],
+        ));
+
+        block1.transactions[0] = transaction_v4_from_coinbase(&block1.transactions[0]).into();
+        block2.transactions[0] = transaction_v4_from_coinbase(&block2.transactions[0]).into();
+
+        // Push the same Arc into both blocks so they share a tx hash.
+        block1.transactions.push(transaction.clone());
+        block2.transactions.push(transaction);
+
+        let (finalized_state, mut non_finalized_state, _genesis) = new_state_with_mainnet_genesis();
+
+        finalized_state.populate_with_anchors(&block1);
+        finalized_state.populate_with_anchors(&block2);
+
+        // Commit block1 to the *non-finalized* state so the duplicate-tx
+        // scenario is purely within the non-finalized chain.
+        let block1 = Arc::new(block1).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block1,
+        );
+        prop_assert_eq!(commit_result, Ok(()));
+
+        let block2 = Arc::new(block2).prepare();
+        let commit_result = validate_and_commit_non_finalized(
+            &finalized_state.db,
+            &mut non_finalized_state,
+            block2,
+        );
+
+        prop_assert_eq!(
+            commit_result,
+            Err(DuplicateSaplingNullifier {
+                nullifier: expected_duplicate_nullifier,
+                in_finalized_state: false,
+            })
+        );
+    }
 }
 
 /// Make sure the supplied nullifiers are distinct, modifying them if necessary.
@@ -998,6 +1228,7 @@ fn make_distinct_nullifiers<'until_modified, NullifierT>(
 /// with its `JoinSplit`s replaced by `joinsplits`.
 ///
 /// Other fields have empty or default values.
+/// Builds the transaction by serializing to raw V4 bytes and deserializing.
 ///
 /// # Panics
 ///
@@ -1029,20 +1260,14 @@ fn transaction_v4_with_joinsplit_data(
         }
     }
 
-    Transaction::V4 {
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: Height(0),
-        joinsplit_data,
-        sapling_shielded_data: None,
-    }
+    Transaction::test_v4_with_joinsplit_data(joinsplit_data.as_ref())
 }
 
-/// Return a `Transaction::V4` containing `sapling_shielded_data`.
+/// Return a `Transaction::V4` containing `sapling_shielded_data`,
 /// with its `Spend`s replaced by `spends`.
 ///
 /// Other fields have empty or default values.
+/// Builds the transaction by serializing to raw V4 bytes and deserializing.
 ///
 /// Note: since sapling nullifiers in V5 transactions are identical to V4 transactions,
 /// we just use V4 transactions in the tests.
@@ -1097,20 +1322,60 @@ fn transaction_v4_with_sapling_shielded_data(
         sapling_shielded_data.value_balance = zero_amount;
     }
 
-    Transaction::V4 {
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: Height(0),
-        joinsplit_data: None,
-        sapling_shielded_data,
+    // Build a V4 transaction by writing raw bytes with the sapling shielded data in the correct
+    // V4 wire format (valueBalanceSapling BEFORE spends and outputs).
+    let mut bytes: Vec<u8> = Vec::new();
+    // V4 overwintered header + versionGroupId
+    bytes.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+    bytes.extend_from_slice(&0x892F_2085u32.to_le_bytes());
+    // No transparent inputs or outputs
+    bytes.push(0x00);
+    bytes.push(0x00);
+    // nLockTime = min_lock_time_timestamp (500_000_000 LE)
+    bytes.extend_from_slice(&500_000_000u32.to_le_bytes());
+    // nExpiryHeight = 0
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    // valueBalanceSapling = 0
+    bytes.extend_from_slice(&0i64.to_le_bytes());
+
+    // Sapling spends and outputs (V4 format: spends with individual anchors)
+    if let Some(ref sd) = sapling_shielded_data {
+        let spend_list: Vec<_> = sd.spends().cloned().collect();
+        let output_list: Vec<_> = sd
+            .outputs()
+            .cloned()
+            .map(sapling::Output::into_v4)
+            .collect();
+
+        spend_list
+            .zcash_serialize(&mut bytes)
+            .expect("sapling spends serialization should succeed");
+        output_list
+            .zcash_serialize(&mut bytes)
+            .expect("sapling outputs serialization should succeed");
+
+        // No joinsplits
+        bytes.push(0x00);
+
+        // bindingSig (64 bytes zeros - not cryptographically valid but state only checks nullifiers)
+        bytes.extend_from_slice(&[0u8; 64]);
+    } else {
+        // nSpendsSapling = 0, nOutputsSapling = 0
+        bytes.push(0x00);
+        bytes.push(0x00);
+        // nJoinSplits = 0
+        bytes.push(0x00);
     }
+
+    Transaction::zcash_deserialize(bytes.as_slice())
+        .expect("manually constructed V4 transaction should deserialize")
 }
 
 /// Return a `Transaction::V5` containing `orchard_shielded_data`.
 /// with its `AuthorizedAction`s replaced by `authorized_actions`.
 ///
 /// Other fields have empty or default values.
+/// Builds the transaction by serializing to raw V5 bytes and deserializing.
 ///
 /// # Panics
 ///
@@ -1133,13 +1398,29 @@ fn transaction_v5_with_orchard_shielded_data(
         orchard_shielded_data.value_balance = zero_amount;
     }
 
-    Transaction::V5 {
-        network_upgrade: Nu5,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        lock_time: LockTime::min_lock_time_timestamp(),
-        expiry_height: Height(0),
-        sapling_shielded_data: None,
-        orchard_shielded_data,
+    // Build a V5 transaction by writing raw bytes with the orchard shielded data.
+    let mut bytes: Vec<u8> = Vec::new();
+    // V5 header: nVersion=5 overwintered, nVersionGroupId, nConsensusBranchId (Nu5), lockTime, expiryHeight
+    bytes.extend_from_slice(&0x8000_0005u32.to_le_bytes());
+    bytes.extend_from_slice(&0x26A7_270Au32.to_le_bytes());
+    bytes.extend_from_slice(&0xC2D6_D0B4u32.to_le_bytes()); // Nu5 branch ID
+    bytes.extend_from_slice(&500_000_000u32.to_le_bytes()); // nLockTime
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // nExpiryHeight
+                                                  // No transparent inputs or outputs
+    bytes.push(0x00);
+    bytes.push(0x00);
+    // No sapling data: nSpendsSapling = 0, nOutputsSapling = 0
+    bytes.push(0x00);
+    bytes.push(0x00);
+    // Orchard data (via the ZcashSerialize impl for orchard::ShieldedData)
+    if let Some(ref sd) = orchard_shielded_data {
+        sd.zcash_serialize(&mut bytes)
+            .expect("orchard ShieldedData serialization should succeed");
+    } else {
+        // nActionsOrchard = 0
+        bytes.push(0x00);
     }
+
+    Transaction::zcash_deserialize(bytes.as_slice())
+        .expect("manually constructed V5 transaction should deserialize")
 }

@@ -48,10 +48,8 @@ pub fn transparent_spend(
     {
         // Coinbase inputs represent new coins,
         // so there are no UTXOs to mark as spent.
-        let spends = transaction
-            .inputs()
-            .iter()
-            .filter_map(transparent::Input::outpoint);
+        let inputs = transaction.inputs();
+        let spends = inputs.iter().filter_map(transparent::Input::outpoint);
 
         for spend in spends {
             let utxo = transparent_spend_chain_order(
@@ -232,6 +230,8 @@ pub fn remaining_transaction_value(
     semantically_verified: &SemanticallyVerifiedBlock,
     utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
 ) -> Result<(), ValidateContextError> {
+    let utxos = utxos_from_ordered_utxos(utxos.clone());
+
     for (tx_index_in_block, transaction) in
         semantically_verified.block.transactions.iter().enumerate()
     {
@@ -240,7 +240,7 @@ pub fn remaining_transaction_value(
         }
 
         // Check the remaining transparent value pool for this transaction
-        let value_balance = transaction.value_balance(&utxos_from_ordered_utxos(utxos.clone()));
+        let value_balance = transaction.value_balance(&utxos);
         match value_balance {
             Ok(vb) => match vb.remaining_transaction_value() {
                 Ok(_) => Ok(()),

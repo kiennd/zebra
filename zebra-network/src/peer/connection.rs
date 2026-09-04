@@ -448,7 +448,7 @@ impl Handler {
         // doesn't respond to our getaddr requests.
         //
         // Add the new addresses to the end of the cache.
-        cached_addrs.extend(new_addrs);
+        cached_addrs.extend(new_addrs.into_iter().cloned());
 
         // # Security
         //
@@ -1114,7 +1114,7 @@ where
                     )
             }
 
-            (AwaitingRequest, PushTransaction(transaction)) => {
+            (AwaitingRequest, PushTransaction(transaction, _)) => {
                 self
                     .peer_tx
                     .send(Message::Tx(transaction))
@@ -1123,7 +1123,7 @@ where
                          Handler::Finished(Ok(Response::Nil))
                     )
             }
-            (AwaitingRequest, AdvertiseTransactionIds(hashes)) => {
+            (AwaitingRequest, AdvertiseTransactionIds(hashes, _)) => {
                 let max_tx_inv_in_message: usize = MAX_TX_INV_IN_SENT_MESSAGE
                     .try_into()
                     .expect("constant fits in usize");
@@ -1154,7 +1154,7 @@ where
                          Handler::Finished(Ok(Response::Nil))
                     )
             }
-            (AwaitingRequest, AdvertiseBlock(hash) | AdvertiseBlockToAll(hash)) => {
+            (AwaitingRequest, AdvertiseBlock(hash, _) | AdvertiseBlockToAll(hash)) => {
                 self
                     .peer_tx
                     .send(Message::Inv(vec![hash.into()]))
@@ -1275,11 +1275,22 @@ where
 
                 Consumed
             }
-            Message::Tx(ref transaction) => Request::PushTransaction(transaction.clone()).into(),
+            Message::Tx(ref transaction) => Request::PushTransaction(
+                transaction.clone(),
+                // Tag the directly pushed transaction with the sending peer so the
+                // mempool downloader can enforce a per-peer queue cap, just like
+                // advertised transaction IDs. See `GHSA-m9xx-8rcj-vmgp`.
+                self.connection_info.connected_addr.get_transient_addr(),
+            )
+            .into(),
             Message::Inv(ref items) => match &items[..] {
                 // We don't expect to be advertised multiple blocks at a time,
                 // so we ignore any advertisements of multiple blocks.
-                [InventoryHash::Block(hash)] => Request::AdvertiseBlock(*hash).into(),
+                [InventoryHash::Block(hash)] => Request::AdvertiseBlock(
+                    *hash,
+                    self.connection_info.connected_addr.get_transient_addr(),
+                )
+                .into(),
 
                 // Some peers advertise invs with mixed item types.
                 // But we're just interested in the transaction invs.
@@ -1287,7 +1298,11 @@ where
                 // TODO: split mixed invs into multiple requests,
                 //       but skip runs of multiple blocks.
                 tx_ids if tx_ids.iter().any(|item| item.unmined_tx_id().is_some()) => {
-                    Request::AdvertiseTransactionIds(transaction_ids(items).collect()).into()
+                    Request::AdvertiseTransactionIds(
+                        transaction_ids(items).collect(),
+                        self.connection_info.connected_addr.get_transient_addr(),
+                    )
+                    .into()
                 }
 
                 // Log detailed messages for ignored inv advertisement messages.

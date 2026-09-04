@@ -1,17 +1,24 @@
 //! Types and implementation for Testnet consensus parameters
+
 use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use crate::{
     amount::{Amount, NonNegative},
     block::{self, Height, HeightDiff},
     parameters::{
-        checkpoint::list::{CheckpointList, TESTNET_CHECKPOINTS},
+        checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
         constants::{magics, SLOW_START_INTERVAL, SLOW_START_SHIFT},
         network::error::ParametersBuilderError,
         network_upgrade::TESTNET_ACTIVATION_HEIGHTS,
         subsidy::{
-            funding_stream_address_period, FUNDING_STREAMS_MAINNET, FUNDING_STREAMS_TESTNET,
-            FUNDING_STREAM_RECEIVER_DENOMINATOR, NU6_1_LOCKBOX_DISBURSEMENTS_TESTNET,
+            constants::mainnet,
+            constants::testnet,
+            constants::{
+                BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+                POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+            },
+            funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
+            FundingStreams,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -19,14 +26,7 @@ use crate::{
     work::difficulty::{ExpandedDifficulty, U256},
 };
 
-use super::{
-    magic::Magic,
-    subsidy::{
-        FundingStreamReceiver, FundingStreamRecipient, FundingStreams,
-        BLOSSOM_POW_TARGET_SPACING_RATIO, POST_BLOSSOM_HALVING_INTERVAL,
-        PRE_BLOSSOM_HALVING_INTERVAL,
-    },
-};
+use super::magic::Magic;
 
 /// Reserved network names that should not be allowed for configured Testnets.
 pub const RESERVED_NETWORK_NAMES: [&str; 6] = [
@@ -69,6 +69,46 @@ pub struct ConfiguredFundingStreamRecipient {
 }
 
 impl ConfiguredFundingStreamRecipient {
+    /// Creates a new [`ConfiguredFundingStreamRecipient`] with the provided receiver and default
+    /// values for other fields.
+    pub fn new_for(receiver: FundingStreamReceiver) -> Self {
+        use FundingStreamReceiver::*;
+        match receiver {
+            Ecc => Self {
+                receiver: Ecc,
+                numerator: 7,
+                addresses: Some(
+                    testnet::FUNDING_STREAM_ECC_ADDRESSES
+                        .map(ToString::to_string)
+                        .to_vec(),
+                ),
+            },
+            ZcashFoundation => Self {
+                receiver: ZcashFoundation,
+                numerator: 5,
+                addresses: Some(
+                    testnet::FUNDING_STREAM_ZF_ADDRESSES
+                        .map(ToString::to_string)
+                        .to_vec(),
+                ),
+            },
+            MajorGrants => Self {
+                receiver: MajorGrants,
+                numerator: 8,
+                addresses: Some(
+                    testnet::FUNDING_STREAM_MG_ADDRESSES
+                        .map(ToString::to_string)
+                        .to_vec(),
+                ),
+            },
+            Deferred => Self {
+                receiver,
+                numerator: 0,
+                addresses: None,
+            },
+        }
+    }
+
     /// Converts a [`ConfiguredFundingStreamRecipient`] to a [`FundingStreamReceiver`] and [`FundingStreamRecipient`].
     pub fn into_recipient(self) -> (FundingStreamReceiver, FundingStreamRecipient) {
         (
@@ -149,6 +189,8 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu5 => &mut configured_activation_heights.nu5,
                 NetworkUpgrade::Nu6 => &mut configured_activation_heights.nu6,
                 NetworkUpgrade::Nu6_1 => &mut configured_activation_heights.nu6_1,
+                NetworkUpgrade::Nu6_2 => &mut configured_activation_heights.nu6_2,
+                NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
@@ -322,6 +364,12 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for `NU6.1` network upgrade.
     #[serde(rename = "NU6.1")]
     pub nu6_1: Option<u32>,
+    /// Activation height for `NU6.2` network upgrade.
+    #[serde(rename = "NU6.2")]
+    pub nu6_2: Option<u32>,
+    /// Activation height for `NU6.3` (Ironwood) network upgrade.
+    #[serde(rename = "NU6.3")]
+    pub nu6_3: Option<u32>,
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
@@ -345,6 +393,8 @@ impl ConfiguredActivationHeights {
             nu5,
             nu6,
             nu6_1,
+            nu6_2,
+            nu6_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -366,6 +416,8 @@ impl ConfiguredActivationHeights {
             nu5,
             nu6,
             nu6_1,
+            nu6_2,
+            nu6_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -437,6 +489,8 @@ pub struct ParametersBuilder {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// Checkpointed block hashes and heights for this network.
     checkpoints: Arc<CheckpointList>,
+    /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
+    temporary_orchard_disabling_soft_fork_height: Option<Height>,
 }
 
 impl Default for ParametersBuilder {
@@ -463,19 +517,19 @@ impl Default for ParametersBuilder {
                 .to_expanded()
                 .expect("difficulty limits are valid expanded values"),
             disable_pow: false,
-            funding_streams: FUNDING_STREAMS_TESTNET.clone(),
+            funding_streams: testnet::FUNDING_STREAMS.clone(),
             should_lock_funding_stream_address_period: false,
             pre_blossom_halving_interval: PRE_BLOSSOM_HALVING_INTERVAL,
             post_blossom_halving_interval: POST_BLOSSOM_HALVING_INTERVAL,
             should_allow_unshielded_coinbase_spends: false,
-            lockbox_disbursements: NU6_1_LOCKBOX_DISBURSEMENTS_TESTNET
+            lockbox_disbursements: testnet::NU6_1_LOCKBOX_DISBURSEMENTS
                 .iter()
                 .map(|(addr, amount)| (addr.to_string(), *amount))
                 .collect(),
-            checkpoints: TESTNET_CHECKPOINTS
-                .parse()
-                .map(Arc::new)
-                .expect("must be able to parse checkpoints"),
+            checkpoints: TESTNET_CHECKPOINT_LIST.clone(),
+            temporary_orchard_disabling_soft_fork_height: Some(
+                super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
+            ),
         }
     }
 }
@@ -556,6 +610,8 @@ impl ParametersBuilder {
             nu5,
             nu6,
             nu6_1,
+            nu6_2,
+            nu6_3,
             nu7,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
@@ -583,6 +639,8 @@ impl ParametersBuilder {
                 .chain(nu5.into_iter().map(|h| (h, Nu5)))
                 .chain(nu6.into_iter().map(|h| (h, Nu6)))
                 .chain(nu6_1.into_iter().map(|h| (h, Nu6_1)))
+                .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
+                .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
 
             #[cfg(zcash_unstable = "zfuture")]
@@ -636,14 +694,14 @@ impl ParametersBuilder {
     ///
     /// # Panics
     ///
-    /// If `funding_streams` is longer than `FUNDING_STREAMS_TESTNET`, and one
+    /// If `funding_streams` is longer than `testnet::FUNDING_STREAMS`, and one
     /// of the extra streams requires a default value.
     pub fn with_funding_streams(mut self, funding_streams: Vec<ConfiguredFundingStreams>) -> Self {
         self.funding_streams = funding_streams
             .into_iter()
             .enumerate()
             .map(|(idx, streams)| {
-                let default_streams = FUNDING_STREAMS_TESTNET.get(idx).cloned();
+                let default_streams = testnet::FUNDING_STREAMS.get(idx).cloned();
                 streams.convert_with_default(default_streams)
             })
             .collect();
@@ -662,8 +720,6 @@ impl ParametersBuilder {
     ///
     /// This should be called after configuring the desired network upgrade activation heights.
     pub fn extend_funding_streams(mut self) -> Self {
-        // self.funding_streams.extend(FUNDING_STREAMS_TESTNET);
-
         let network = self.to_network_unchecked();
 
         for funding_streams in &mut self.funding_streams {
@@ -698,7 +754,8 @@ impl ParametersBuilder {
         self
     }
 
-    /// Sets the `disable_pow` flag to be used in the [`Parameters`] being built.
+    /// Sets whether coinbase outputs may be spent into transparent outputs in the
+    /// [`Parameters`] being built (the inverse of zcashd's `-regtestshieldcoinbase`).
     pub fn with_unshielded_coinbase_spends(
         mut self,
         should_allow_unshielded_coinbase_spends: bool,
@@ -739,14 +796,12 @@ impl ParametersBuilder {
         mut self,
         checkpoints: impl Into<ConfiguredCheckpoints>,
     ) -> Result<Self, ParametersBuilderError> {
-        self.checkpoints = Arc::new(match checkpoints.into() {
-            ConfiguredCheckpoints::Default(true) => TESTNET_CHECKPOINTS
-                .parse()
-                .map_err(|_| ParametersBuilderError::InvalidCheckpointsFormat)?,
-            ConfiguredCheckpoints::Default(false) => {
+        self.checkpoints = match checkpoints.into() {
+            ConfiguredCheckpoints::Default(true) => TESTNET_CHECKPOINT_LIST.clone(),
+            ConfiguredCheckpoints::Default(false) => Arc::new(
                 CheckpointList::from_list([(block::Height(0), self.genesis_hash)])
-                    .map_err(|_| ParametersBuilderError::FailedToParseDefaultCheckpoint)?
-            }
+                    .map_err(|_| ParametersBuilderError::FailedToParseDefaultCheckpoint)?,
+            ),
             ConfiguredCheckpoints::Path(path_buf) => {
                 let Ok(raw_checkpoints_str) = std::fs::read_to_string(&path_buf) else {
                     return Err(ParametersBuilderError::FailedToReadCheckpointFile {
@@ -754,16 +809,20 @@ impl ParametersBuilder {
                     });
                 };
 
-                raw_checkpoints_str
-                    .parse::<CheckpointList>()
-                    .map_err(|err| ParametersBuilderError::FailedToParseCheckpointFile {
-                        path_buf: path_buf.clone(),
-                        err: err.to_string(),
-                    })?
+                Arc::new(
+                    raw_checkpoints_str
+                        .parse::<CheckpointList>()
+                        .map_err(|err| ParametersBuilderError::FailedToParseCheckpointFile {
+                            path_buf: path_buf.clone(),
+                            err: err.to_string(),
+                        })?,
+                )
             }
-            ConfiguredCheckpoints::HeightsAndHashes(items) => CheckpointList::from_list(items)
-                .map_err(|_| ParametersBuilderError::InvalidCustomCheckpoints)?,
-        });
+            ConfiguredCheckpoints::HeightsAndHashes(items) => Arc::new(
+                CheckpointList::from_list(items)
+                    .map_err(|_| ParametersBuilderError::InvalidCustomCheckpoints)?,
+            ),
+        };
 
         Ok(self)
     }
@@ -771,6 +830,19 @@ impl ParametersBuilder {
     /// Clears checkpoints from the [`Parameters`] being built, keeping the genesis checkpoint.
     pub fn clear_checkpoints(self) -> Result<Self, ParametersBuilderError> {
         self.with_checkpoints(ConfiguredCheckpoints::Default(false))
+    }
+
+    /// Sets the height for this network at which the soft fork that temporarily disables
+    /// Orchard transactions will activate.
+    pub fn with_temporary_orchard_disabling_soft_fork_height(mut self, height: Height) -> Self {
+        self.temporary_orchard_disabling_soft_fork_height = Some(height);
+        self
+    }
+
+    /// Disables the soft fork that would temporarily disable Orchard transactions.
+    pub fn disable_temporary_orchard_disabling_soft_fork(mut self) -> Self {
+        self.temporary_orchard_disabling_soft_fork_height = None;
+        self
     }
 
     /// Converts the builder to a [`Parameters`] struct
@@ -790,6 +862,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            temporary_orchard_disabling_soft_fork_height,
         } = self;
         Parameters {
             network_name,
@@ -806,6 +879,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints,
+            temporary_orchard_disabling_soft_fork_height,
         }
     }
 
@@ -852,6 +926,7 @@ impl ParametersBuilder {
             post_blossom_halving_interval,
             lockbox_disbursements,
             checkpoints: _,
+            temporary_orchard_disabling_soft_fork_height: _,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -882,6 +957,9 @@ pub struct RegtestParameters {
     pub checkpoints: Option<ConfiguredCheckpoints>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// Whether to allow coinbase spends to have transparent outputs (inverse of
+    /// zcashd's `-regtestshieldcoinbase`).
+    pub should_allow_unshielded_coinbase_spends: Option<bool>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -925,6 +1003,8 @@ pub struct Parameters {
     lockbox_disbursements: Vec<(String, Amount<NonNegative>)>,
     /// List of checkpointed block heights and hashes
     checkpoints: Arc<CheckpointList>,
+    /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
+    temporary_orchard_disabling_soft_fork_height: Option<Height>,
 }
 
 impl Default for Parameters {
@@ -953,6 +1033,7 @@ impl Parameters {
             lockbox_disbursements,
             checkpoints,
             extend_funding_stream_addresses_as_required,
+            should_allow_unshielded_coinbase_spends,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -960,8 +1041,13 @@ impl Parameters {
             // This value is chosen to match zcashd, see: <https://github.com/zcash/zcash/blob/master/src/chainparams.cpp#L654>
             .with_target_difficulty_limit(U256::from_big_endian(&[0x0f; 32]))?
             .with_disable_pow(true)
-            .with_unshielded_coinbase_spends(true)
+            .with_unshielded_coinbase_spends(
+                should_allow_unshielded_coinbase_spends.unwrap_or(true),
+            )
             .with_slow_start_interval(Height::MIN)
+            // Like the default Testnet activation heights stripped below, the default Testnet's
+            // temporary Orchard-disabling soft fork does not apply to Regtest.
+            .disable_temporary_orchard_disabling_soft_fork()
             // Removes default Testnet activation heights if not configured,
             // most network upgrades are disabled by default for Regtest in zcashd
             .with_activation_heights(activation_heights.for_regtest())?
@@ -1004,11 +1090,13 @@ impl Parameters {
             funding_streams: _,
             target_difficulty_limit,
             disable_pow,
-            should_allow_unshielded_coinbase_spends,
+            // Configurable on Regtest
+            should_allow_unshielded_coinbase_spends: _,
             pre_blossom_halving_interval,
             post_blossom_halving_interval,
             lockbox_disbursements: _,
             checkpoints: _,
+            temporary_orchard_disabling_soft_fork_height: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1017,8 +1105,6 @@ impl Parameters {
             && self.slow_start_shift == slow_start_shift
             && self.target_difficulty_limit == target_difficulty_limit
             && self.disable_pow == disable_pow
-            && self.should_allow_unshielded_coinbase_spends
-                == should_allow_unshielded_coinbase_spends
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
     }
@@ -1110,6 +1196,12 @@ impl Parameters {
     pub fn checkpoints(&self) -> Arc<CheckpointList> {
         self.checkpoints.clone()
     }
+
+    /// Returns the height at which the soft-fork to temporarily disable Orchard in
+    /// transactions activates.
+    pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
+        self.temporary_orchard_disabling_soft_fork_height
+    }
 }
 
 impl Network {
@@ -1161,7 +1253,7 @@ impl Network {
         if let Self::Testnet(params) = self {
             params.funding_streams()
         } else {
-            &FUNDING_STREAMS_MAINNET
+            &mainnet::FUNDING_STREAMS
         }
     }
 
@@ -1172,6 +1264,14 @@ impl Network {
             params.should_allow_unshielded_coinbase_spends()
         } else {
             false
+        }
+    }
+
+    /// Returns the list of founders' reward addresses for this network.
+    pub fn founder_address_list(&self) -> &[&str] {
+        match self {
+            Network::Mainnet => &mainnet::FOUNDER_ADDRESS_LIST,
+            Network::Testnet(_) => &testnet::FOUNDER_ADDRESS_LIST,
         }
     }
 }

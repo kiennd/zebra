@@ -2,7 +2,14 @@
 //!
 //! It is used when Zebra is a long way behind the current chain tip.
 
-use std::{cmp::max, collections::HashSet, convert, pin::Pin, task::Poll, time::Duration};
+use std::{
+    cmp::max,
+    collections::{HashMap, HashSet},
+    convert,
+    pin::Pin,
+    task::Poll,
+    time::Duration,
+};
 
 use color_eyre::eyre::{eyre, Report};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -59,6 +66,17 @@ const FANOUT: usize = 3;
 /// We also hedge requests, so we may retry up to twice this many times. Hedged
 /// retries may be concurrent, inner retries are sequential.
 const BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+
+/// Controls how many times the syncer will re-request a block whose download
+/// failed because no peer delivered it (a `NotFound`), before giving up and
+/// letting the normal tip re-walk handle it.
+///
+/// Without this re-request, a single missing block at the checkpoint frontier
+/// is dropped and never re-fetched, wedging the whole verify pipeline until the
+/// 8-minute `BLOCK_VERIFY_TIMEOUT` fires (#5709). Each attempt already goes
+/// through the tower-level `BLOCK_DOWNLOAD_RETRY_LIMIT` (and hedging), so this
+/// is a coarse, hash-scoped retry on top of an exhausted per-request retry.
+const MAX_BLOCK_REOBTAIN_RETRIES: u8 = 3;
 
 /// A lower bound on the user-specified checkpoint verification concurrency limit.
 ///
@@ -205,6 +223,11 @@ const FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT: HeightDiff = 100;
 /// previous sync runs.
 const SYNC_RESTART_DELAY: Duration = Duration::from_secs(67);
 
+/// In regtest, use a much shorter restart delay so that downstream nodes pick up
+/// newly-mined blocks quickly (e.g. after `generate(N)` in integration tests).
+/// The default 67-second delay exceeds the typical `sync_all` timeout of 60 seconds.
+const REGTEST_SYNC_RESTART_DELAY: Duration = Duration::from_secs(2);
+
 /// Controls how long we wait to retry a failed attempt to download
 /// and verify the genesis block.
 ///
@@ -306,7 +329,7 @@ struct CheckedTip {
     expected_next: block::Hash,
 }
 
-pub struct ChainSync<ZN, ZS, ZV, ZSTip>
+pub struct ChainSync<ZN, ZS, ZSR, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
         + Send
@@ -320,6 +343,12 @@ where
         + Clone
         + 'static,
     ZS::Future: Send,
+    ZSR: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZSR::Future: Send,
     ZV: Service<zebra_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -342,6 +371,9 @@ where
     /// The configured full verification concurrency limit, after applying the minimum limit.
     full_verify_concurrency_limit: usize,
 
+    /// Whether the node is running on regtest. Used to apply a shorter sync restart delay.
+    is_regtest: bool,
+
     // Services
     //
     /// A network service which is used to perform ObtainTips and ExtendTips
@@ -357,6 +389,7 @@ where
             Downloads<
                 Hedge<ConcurrencyLimit<Retry<zn::RetryLimit, Timeout<ZN>>>, AlwaysHedge>,
                 Timeout<ZV>,
+                ZSR,
                 ZSTip,
             >,
         >,
@@ -382,6 +415,14 @@ where
 
     /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+
+    /// Blocks whose download failed with `NotFound` and should be re-requested on
+    /// the next sync round, instead of being silently dropped (#5709).
+    reobtain_hashes: IndexSet<block::Hash>,
+
+    /// Per-hash count of how many times a `NotFound` block has been re-requested,
+    /// bounded by [`MAX_BLOCK_REOBTAIN_RETRIES`].
+    block_reobtain_retries: HashMap<block::Hash, u8>,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -390,7 +431,7 @@ where
 /// This component is used for initial block sync, but the `Inbound` service is
 /// responsible for participating in the gossip protocols used for block
 /// diffusion.
-impl<ZN, ZS, ZV, ZSTip> ChainSync<ZN, ZS, ZV, ZSTip>
+impl<ZN, ZS, ZSR, ZV, ZSTip> ChainSync<ZN, ZS, ZSR, ZV, ZSTip>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError>
         + Send
@@ -404,6 +445,12 @@ where
         + Clone
         + 'static,
     ZS::Future: Send,
+    ZSR: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+    ZSR::Future: Send,
     ZV: Service<zebra_consensus::Request, Response = block::Hash, Error = BoxError>
         + Send
         + Sync
@@ -417,15 +464,18 @@ where
     ///  - peers: the zebra-network peers to contact for downloads
     ///  - verifier: the zebra-consensus verifier that checks the chain
     ///  - state: the zebra-state that stores the chain
+    ///  - read_state: a read-only handle to the zebra-state, used to check downloaded block heights
     ///  - latest_chain_tip: the latest chain tip from `state`
     ///
     /// Also returns a [`SyncStatus`] to check if the syncer has likely reached the chain tip.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &ZebradConfig,
         max_checkpoint_height: Height,
         peers: ZN,
         verifier: ZV,
         state: ZS,
+        read_state: ZSR,
         latest_chain_tip: ZSTip,
         misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     ) -> (Self, SyncStatus) {
@@ -487,7 +537,7 @@ where
         // We apply a timeout to the verifier to avoid hangs due to missing earlier blocks.
         let verifier = Timeout::new(verifier, BLOCK_VERIFY_TIMEOUT);
 
-        let (sync_status, recent_syncs) = SyncStatus::new();
+        let (sync_status, recent_syncs) = SyncStatus::new_for_network(&config.network.network);
 
         let (past_lookahead_limit_sender, past_lookahead_limit_receiver) = watch::channel(false);
         let past_lookahead_limit_receiver = zs::WatchReceiver::new(past_lookahead_limit_receiver);
@@ -495,6 +545,7 @@ where
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
+            read_state,
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
             max(
@@ -509,6 +560,7 @@ where
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
+            is_regtest: config.network.network.is_regtest(),
             tip_network,
             downloads,
             state,
@@ -517,6 +569,8 @@ where
             recent_syncs,
             past_lookahead_limit_receiver,
             misbehavior_sender,
+            reobtain_hashes: IndexSet::new(),
+            block_reobtain_retries: HashMap::new(),
         };
 
         (new_syncer, sync_status)
@@ -536,12 +590,17 @@ where
 
             self.update_metrics();
 
+            let restart_delay = if self.is_regtest {
+                REGTEST_SYNC_RESTART_DELAY
+            } else {
+                SYNC_RESTART_DELAY
+            };
             info!(
-                timeout = ?SYNC_RESTART_DELAY,
+                timeout = ?restart_delay,
                 state_tip = ?self.latest_chain_tip.best_tip_height(),
                 "waiting to restart sync"
             );
-            sleep(SYNC_RESTART_DELAY).await;
+            sleep(restart_delay).await;
         }
     }
 
@@ -560,6 +619,9 @@ where
     #[instrument(skip(self))]
     async fn try_to_sync(&mut self) -> Result<(), Report> {
         self.prospective_tips = HashSet::new();
+
+        self.reobtain_hashes.clear();
+        self.block_reobtain_retries.clear();
 
         info!(
             state_tip = ?self.latest_chain_tip.best_tip_height(),
@@ -609,6 +671,9 @@ where
             // the syncer will reset itself.
             self.handle_block_response(rsp)?;
         }
+        // Re-request any blocks that just failed with `NotFound`, before pausing
+        // on the lookahead limit (#5709).
+        self.reobtain_missing_blocks().await;
         self.update_metrics();
 
         // Pause new downloads while the syncer or downloader are past their lookahead limits.
@@ -631,6 +696,10 @@ where
             let response = self.downloads.next().await.expect("downloads is nonempty");
 
             self.handle_block_response(response)?;
+            // A block that just failed with `NotFound` is what unblocks the
+            // verifier, so re-request it now rather than waiting for the pause
+            // loop to clear — which it cannot until this block arrives (#5709).
+            self.reobtain_missing_blocks().await;
             self.update_metrics();
         }
 
@@ -667,10 +736,34 @@ where
         Ok(extra_hashes)
     }
 
+    /// Re-issues downloads for blocks that failed with `NotFound` (#5709).
+    ///
+    /// These are re-requested even while the download pipeline is past its
+    /// lookahead limit, because a missing low block is exactly what stops the
+    /// checkpoint verifier from advancing. Waiting for the lookahead pause to
+    /// clear would deadlock — the pause cannot clear until this block arrives.
+    /// The per-hash retry count is bounded by [`MAX_BLOCK_REOBTAIN_RETRIES`].
+    async fn reobtain_missing_blocks(&mut self) {
+        if self.reobtain_hashes.is_empty() {
+            return;
+        }
+
+        for hash in std::mem::take(&mut self.reobtain_hashes) {
+            // The block was removed from the in-flight set when its download
+            // failed, so this re-queues it. A residual duplicate/queue error is
+            // benign — it means the block is already being handled.
+            if let Err(error) = self.downloads.download_and_verify(hash).await {
+                trace!(?hash, ?error, "re-download of missing block not queued");
+            }
+        }
+    }
+
     /// Given a block_locator list fan out request for subsequent hashes to
     /// multiple peers
     #[instrument(skip(self))]
     async fn obtain_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+        let stage_start = std::time::Instant::now();
+
         let block_locator = self
             .state
             .ready()
@@ -729,21 +822,10 @@ where
                 Ok(zn::Response::BlockHashes(hashes)) => {
                     trace!(?hashes);
 
-                    // zcashd sometimes appends an unrelated hash at the start
-                    // or end of its response.
-                    //
-                    // We can't discard the first hash, because it might be a
-                    // block we want to download. So we just accept any
-                    // out-of-order first hashes.
-
-                    // We use the last hash for the tip, and we want to avoid bad
-                    // tips. So we discard the last hash. (We don't need to worry
-                    // about missed downloads, because we will pick them up again
-                    // in ExtendTips.)
-                    let hashes = match hashes.as_slice() {
-                        [] => continue,
-                        [rest @ .., _last] => rest,
-                    };
+                    let hashes = hashes.as_slice();
+                    if hashes.is_empty() {
+                        continue;
+                    }
 
                     let mut first_unknown = None;
                     for (i, &hash) in hashes.iter().enumerate() {
@@ -763,29 +845,31 @@ where
 
                     trace!(?unknown_hashes);
 
-                    let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                        CheckedTip {
+                    if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
+                        let new_tip = CheckedTip {
                             tip: end[0],
                             expected_next: end[1],
+                        };
+
+                        // Make sure we get the same tips, regardless of the
+                        // order of peer responses
+                        if !download_set.contains(&new_tip.expected_next) {
+                            debug!(
+                                ?new_tip,
+                                "adding new prospective tip, and removing existing tips in the \
+                                new block hash list",
+                            );
+                            self.prospective_tips
+                                .retain(|t| !unknown_hashes.contains(&t.expected_next));
+                            self.prospective_tips.insert(new_tip);
+                        } else {
+                            debug!(
+                                ?new_tip,
+                                "discarding prospective tip: already in download set"
+                            );
                         }
                     } else {
-                        debug!("discarding response that extends only one block");
-                        continue;
-                    };
-
-                    // Make sure we get the same tips, regardless of the
-                    // order of peer responses
-                    if !download_set.contains(&new_tip.expected_next) {
-                        debug!(?new_tip,
-                                        "adding new prospective tip, and removing existing tips in the new block hash list");
-                        self.prospective_tips
-                            .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                        self.prospective_tips.insert(new_tip);
-                    } else {
-                        debug!(
-                            ?new_tip,
-                            "discarding prospective tip: already in download set"
-                        );
+                        debug!("downloading response that extends only one block");
                     }
 
                     // security: the first response determines our download order
@@ -825,11 +909,16 @@ where
 
         let response = self.request_blocks(download_set).await;
 
+        metrics::histogram!("sync.stage.duration_seconds", "stage" => "obtain_tips")
+            .record(stage_start.elapsed().as_secs_f64());
+
         Self::handle_hash_response(response).map_err(Into::into)
     }
 
     #[instrument(skip(self))]
     async fn extend_tips(&mut self) -> Result<IndexSet<block::Hash>, Report> {
+        let stage_start = std::time::Instant::now();
+
         let tips = std::mem::take(&mut self.prospective_tips);
 
         let mut download_set = IndexSet::new();
@@ -862,9 +951,9 @@ where
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
 
-                        // zcashd sometimes appends an unrelated hash at the
-                        // start or end of its response. Check the first hash
-                        // against the previous response, and discard mismatches.
+                        // Legacy zcashd nodes could prepend an unrelated hash
+                        // to their response. Check the first hash against the
+                        // previous response, and discard mismatches.
                         let unknown_hashes = match hashes.as_slice() {
                             [expected_hash, rest @ ..] if expected_hash == &tip.expected_next => {
                                 rest
@@ -899,40 +988,38 @@ where
                             }
                         };
 
-                        // We use the last hash for the tip, and we want to avoid
-                        // bad tips. So we discard the last hash. (We don't need
-                        // to worry about missed downloads, because we will pick
-                        // them up again in the next ExtendTips.)
-                        let unknown_hashes = match unknown_hashes {
-                            [] => continue,
-                            [rest @ .., _last] => rest,
-                        };
-
-                        let new_tip = if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
-                            CheckedTip {
-                                tip: end[0],
-                                expected_next: end[1],
-                            }
-                        } else {
-                            debug!("discarding response that extends only one block");
+                        if unknown_hashes.is_empty() {
+                            debug!(?tip.tip, "response contained no new hashes after the expected overlap");
                             continue;
-                        };
+                        }
 
                         trace!(?unknown_hashes);
 
-                        // Make sure we get the same tips, regardless of the
-                        // order of peer responses
-                        if !download_set.contains(&new_tip.expected_next) {
-                            debug!(?new_tip,
-                                            "adding new prospective tip, and removing any existing tips in the new block hash list");
-                            self.prospective_tips
-                                .retain(|t| !unknown_hashes.contains(&t.expected_next));
-                            self.prospective_tips.insert(new_tip);
+                        if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
+                            let new_tip = CheckedTip {
+                                tip: end[0],
+                                expected_next: end[1],
+                            };
+
+                            // Make sure we get the same tips, regardless of the
+                            // order of peer responses
+                            if !download_set.contains(&new_tip.expected_next) {
+                                debug!(
+                                    ?new_tip,
+                                    "adding new prospective tip, and removing any existing tips \
+                                    in the new block hash list",
+                                );
+                                self.prospective_tips
+                                    .retain(|t| !unknown_hashes.contains(&t.expected_next));
+                                self.prospective_tips.insert(new_tip);
+                            } else {
+                                debug!(
+                                    ?new_tip,
+                                    "discarding prospective tip: already in download set"
+                                );
+                            }
                         } else {
-                            debug!(
-                                ?new_tip,
-                                "discarding prospective tip: already in download set"
-                            );
+                            debug!("downloading response that extends only one block");
                         }
 
                         // security: the first response determines our download order
@@ -962,6 +1049,9 @@ where
         self.recent_syncs.push_extend_tips_length(new_downloads);
 
         let response = self.request_blocks(download_set).await;
+
+        metrics::histogram!("sync.stage.duration_seconds", "stage" => "extend_tips")
+            .record(stage_start.elapsed().as_secs_f64());
 
         Self::handle_hash_response(response).map_err(Into::into)
     }
@@ -1048,8 +1138,18 @@ where
             IndexSet::new()
         };
 
+        // Dispatch blocks with duplicate-tolerant error handling.
+        // DuplicateBlockQueuedForDownload is caught and skipped instead of
+        // propagating — this prevents dropping unprocessed hashes from the
+        // batch, which would create frontier gaps and stalls (#5709).
         for hash in hashes.into_iter() {
-            self.downloads.download_and_verify(hash).await?;
+            match self.downloads.download_and_verify(hash).await {
+                Ok(()) => {}
+                Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {
+                    debug!("block request was already queued, continuing");
+                }
+                Err(error) => return Err(error),
+            }
         }
 
         Ok(extra_hashes)
@@ -1098,6 +1198,9 @@ where
             Ok((height, hash)) => {
                 trace!(?height, ?hash, "verified and committed block to state");
 
+                // The block arrived, so forget any re-request bookkeeping for it.
+                self.block_reobtain_retries.remove(&hash);
+
                 return Ok(());
             }
 
@@ -1111,8 +1214,75 @@ where
                     .try_send((advertiser_addr, error.misbehavior_score()));
             }
 
+            Err(BlockDownloadVerifyError::InvalidHeight {
+                advertiser_addr: Some(advertiser_addr),
+                ..
+            }) => {
+                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+            }
+
+            // The downloader only sets `advertiser_addr` here when Zebra already holds the parent
+            // header and it proves the body's claimed height wrong. A peer can answer with a
+            // canonical header and a rewritten coinbase height because the initial hash check does
+            // not recompute the header's commitment to the body's authorizing data
+            // (GHSA-g95h-hw6g-pvgv). Peers that serve genuinely old blocks arrive unattributed and
+            // fall through unscored. Score only a parent-proven rewrite.
+            Err(BlockDownloadVerifyError::BehindTipHeightLimit {
+                advertiser_addr: Some(advertiser_addr),
+                ..
+            }) => {
+                let _ = self.misbehavior_sender.try_send((advertiser_addr, 100));
+            }
+
+            // `AboveLookaheadHeightLimit` deliberately falls through unscored, and must
+            // stay that way (GHSA-qhr3-cvch-5fh2): `FindBlocks` responses carry no
+            // address, so the follow-up request goes to an independently chosen, honest
+            // peer that served the block but did not choose its height. Scoring it let a
+            // malicious `FindBlocks` responder evict honest peers throughout IBD. Unlike
+            // the behind-tip sibling advisory, the block here is genuine, so there is no
+            // local proof of forgery to re-attribute with. Do not add scoring back.
             Err(_) => {}
         };
+
+        // A hash the syncer still needs, whose download did not produce a usable block, is
+        // otherwise dropped here and only rediscovered by a later sync round. Re-queue it for the
+        // next sync round, bounded by `MAX_BLOCK_REOBTAIN_RETRIES`:
+        // - `DownloadFailed`/`NotFound`: no peer delivered the block, which wedges the checkpoint
+        //   frontier until the verify timeout (#5709).
+        // - `BehindTipHeightLimit`: the body was not a usable block for this hash, so the hash is
+        //   still missing (GHSA-g95h-hw6g-pvgv). This re-request runs whether or not the peer could
+        //   be attributed, and covers the window before a score reaches the address book, which
+        //   only applies misbehavior reports in batches.
+        // Consensus failures (`Invalid`/`ValidationRequestError`) are deliberately excluded —
+        // re-downloading a block the network already rejected is pointless.
+        let reobtain_hash = match &response {
+            Err(BlockDownloadVerifyError::DownloadFailed { error, hash })
+                if format!("{error:?}").contains("NotFound") =>
+            {
+                Some(*hash)
+            }
+            Err(BlockDownloadVerifyError::BehindTipHeightLimit { hash, .. }) => Some(*hash),
+            _ => None,
+        };
+
+        if let Some(hash) = reobtain_hash {
+            let attempts = self.block_reobtain_retries.entry(hash).or_insert(0);
+            if *attempts < MAX_BLOCK_REOBTAIN_RETRIES {
+                *attempts += 1;
+                self.reobtain_hashes.insert(hash);
+                debug!(
+                    ?hash,
+                    attempts = *attempts,
+                    "re-queueing missing block for re-download"
+                );
+            } else {
+                debug!(
+                    ?hash,
+                    "missing block exceeded re-download retries, dropping"
+                );
+                self.block_reobtain_retries.remove(&hash);
+            }
+        }
 
         Self::handle_response(response)
     }
@@ -1181,7 +1351,7 @@ where
         match e {
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
-                debug!(error = ?e, "block was already verified, possibly from a previous sync run, continuing");
+                debug!(error = ?e, "block was already verified or committed, possibly from a previous sync run, continuing");
                 false
             }
 
@@ -1194,8 +1364,24 @@ where
             BlockDownloadVerifyError::BehindTipHeightLimit { .. } => {
                 debug!(
                     error = ?e,
-                    "block height is behind the current state tip, \
-                     assuming the syncer will eventually catch up to the state, continuing"
+                    "block height is behind the current state tip: re-requesting the hash, \
+                     and scoring the peer if the body contradicts the parent we hold, continuing"
+                );
+                false
+            }
+            BlockDownloadVerifyError::AboveLookaheadHeightLimit { .. } => {
+                debug!(
+                    error = ?e,
+                    "block height is above the lookahead limit, \
+                     dropping the block and continuing sync"
+                );
+                false
+            }
+            BlockDownloadVerifyError::InvalidHeight { .. } => {
+                debug!(
+                    error = ?e,
+                    "block has no valid height, \
+                     dropping the block and continuing sync"
                 );
                 false
             }
@@ -1208,21 +1394,6 @@ where
                 false
             }
 
-            // String matches
-            //
-            // We want to match VerifyChainError::Block(VerifyBlockError::Commit(ref source)),
-            // but that type is boxed.
-            // TODO:
-            // - turn this check into a function on VerifyChainError, like is_duplicate_request()
-            BlockDownloadVerifyError::Invalid { error, .. }
-                if format!("{error:?}").contains("block is already committed to the state")
-                    || format!("{error:?}")
-                        .contains("block has already been sent to be committed to the state") =>
-            {
-                // TODO: improve this by checking the type (#2908)
-                debug!(error = ?e, "block is already committed or pending a commit, possibly from a previous sync run, continuing");
-                false
-            }
             BlockDownloadVerifyError::DownloadFailed { ref error, .. }
                 if format!("{error:?}").contains("NotFound") =>
             {
@@ -1247,12 +1418,7 @@ where
                 // TODO: add a proper test and remove this
                 // https://github.com/ZcashFoundation/zebra/issues/2909
                 let err_str = format!("{e:?}");
-                if err_str.contains("AlreadyVerified")
-                    || err_str.contains("AlreadyInChain")
-                    || err_str.contains("block is already committed to the state")
-                    || err_str.contains("block has already been sent to be committed to the state")
-                    || err_str.contains("NotFound")
-                {
+                if err_str.contains("NotFound") {
                     error!(?e,
                         "a BlockDownloadVerifyError that should have been filtered out was detected, \
                         which possibly indicates a programming error in the downcast inside \

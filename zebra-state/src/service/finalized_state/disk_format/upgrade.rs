@@ -22,6 +22,7 @@ use DbFormatChange::*;
 
 use crate::service::finalized_state::ZebraDb;
 
+pub(crate) mod add_ironwood_tree;
 pub(crate) mod add_subtrees;
 pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
@@ -102,7 +103,14 @@ fn format_upgrades(
             Version::new(26, 0, 0),
         )),
         Box::new(block_info_and_address_received::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 5])
+        // The NU6.3 Ironwood shielded pool adds new column families and widens the chain value pool
+        // serialization. New column families and the wider records are created/read in place when
+        // the database is opened, but the genesis Ironwood tree and anchor must be backfilled so an
+        // upgraded database matches a genesis-synced one (otherwise ironwood_tree_for_tip() panics
+        // and the genesis Ironwood anchor is missing for NU6.3 anchor validation). This is a
+        // major-version upgrade that is restorable from the previous major database format version.
+        Box::new(add_ironwood_tree::Upgrade),
+    ] as [Box<dyn DiskFormatUpgrade>; 6])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -260,6 +268,12 @@ impl DbFormatChange {
     #[allow(dead_code)]
     pub fn is_upgrade(&self) -> bool {
         matches!(self, Upgrade { .. })
+    }
+
+    /// Returns true if this format change indicates a newly created database
+    /// (no database was found on disk).
+    pub fn is_newly_created(&self) -> bool {
+        matches!(self, NewlyCreated { .. })
     }
 
     /// Returns true if this format change/check happens at startup.
@@ -460,7 +474,7 @@ impl DbFormatChange {
             track_tx_locs_by_spends::run(initial_tip_height, db, cancel_receiver)?;
             info!("finished checking/adding indexes for spending tx ids");
 
-            timer.finish(module_path!(), line!(), "indexing spending transaction ids");
+            timer.finish_desc("indexing spending transaction ids");
         };
 
         #[cfg(not(feature = "indexer"))]
@@ -487,7 +501,7 @@ impl DbFormatChange {
                 db.update_format_version_on_disk(&version)
                     .expect("unable to write database format version file to disk");
 
-                timer.finish(module_path!(), line!(), "removing spending transaction ids");
+                timer.finish_desc("removing spending transaction ids");
             }
         };
 
@@ -580,7 +594,7 @@ impl DbFormatChange {
                     .validate(db, cancel_receiver)?
                     .expect("db should be valid after upgrade");
 
-                timer.finish(module_path!(), line!(), upgrade.description());
+                timer.finish_desc(upgrade.description());
             }
 
             // Mark the database as upgraded. Zebra won't repeat the upgrade anymore once the
@@ -613,7 +627,7 @@ impl DbFormatChange {
         results.push(fix_tree_key_type::quick_check(db));
 
         // The work is done in the functions we just called.
-        timer.finish(module_path!(), line!(), "format_validity_checks_quick()");
+        timer.finish_desc("format_validity_checks_quick()");
 
         if results.iter().any(Result::is_err) {
             let err = Err(format!("invalid quick check: {results:?}"));
@@ -643,7 +657,7 @@ impl DbFormatChange {
         }
 
         // The work is done in the functions we just called.
-        timer.finish(module_path!(), line!(), "format_validity_checks_detailed()");
+        timer.finish_desc("format_validity_checks_detailed()");
 
         if results.iter().any(Result::is_err) {
             let err = Err(format!("invalid detailed check: {results:?}"));

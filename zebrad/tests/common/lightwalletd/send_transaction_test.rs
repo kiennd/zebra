@@ -24,7 +24,7 @@ use color_eyre::eyre::{eyre, Result};
 use zebra_chain::{
     block::Block,
     parameters::Network::*,
-    serialization::{BytesInDisplayOrder, ZcashSerialize},
+    serialization::ZcashSerialize,
     transaction::{self, Transaction},
 };
 use zebra_node_services::rpc_client::RpcRequestClient;
@@ -33,7 +33,7 @@ use zebrad::components::mempool::downloads::MAX_INBOUND_CONCURRENCY;
 
 use crate::common::{
     cached_state::future_blocks,
-    launch::{can_spawn_zebrad_for_test_type, spawn_zebrad_for_rpc},
+    launch::{can_spawn_zebrad_for_test_type, spawn_zebrad_for_rpc_with_opts},
     lightwalletd::{
         can_spawn_lightwalletd_for_rpc, spawn_lightwalletd_for_rpc,
         sync::wait_for_zebrad_and_lightwalletd_sync,
@@ -112,12 +112,18 @@ pub async fn run() -> Result<()> {
 
     // Start zebrad with no peers, we want to send transactions without blocks coming in. If `wallet_grpc_test`
     // runs before this test (as it does in `lightwalletd_test_suite`), then we are the most up to date with tip we can.
-    let (mut zebrad, zebra_rpc_address) = if let Some(zebrad_and_address) = spawn_zebrad_for_rpc(
-        network.clone(),
-        test_name,
-        test_type,
-        use_internet_connection,
-    )? {
+    //
+    // Disable the non-finalized state backup so the node loads at the finalized tip: the
+    // transactions taken from blocks above it are not already in the chain when we send them.
+    let use_non_finalized_backup = false;
+    let (mut zebrad, zebra_rpc_address) = if let Some(zebrad_and_address) =
+        spawn_zebrad_for_rpc_with_opts(
+            network.clone(),
+            test_name,
+            test_type,
+            use_internet_connection,
+            use_non_finalized_backup,
+        )? {
         zebrad_and_address
     } else {
         // Skip the test, we don't have the required cached state
@@ -296,7 +302,10 @@ async fn send_transactions_from_block(
     let mut counter = 0;
     while let Some(tx) = transactions_stream.message().await? {
         let hash: [u8; 32] = tx.hash.clone().try_into().expect("hash is correct length");
-        let hash = transaction::Hash::from_bytes_in_display_order(&hash);
+        // Since lightwalletd v0.5.0, `GetMempoolTx` returns the txid in internal
+        // (little-endian) byte order, like the rest of its compact formats.
+        // Older versions returned the display order bytes of `getrawmempool`'s txid.
+        let hash = transaction::Hash::from(hash);
 
         assert!(
             transaction_hashes.contains(&hash),

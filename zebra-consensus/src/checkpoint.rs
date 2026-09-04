@@ -28,12 +28,11 @@ use tower::{Service, ServiceExt};
 use tracing::instrument;
 
 use zebra_chain::{
-    amount::{self, DeferredPoolBalanceChange},
+    amount::{self},
     block::{self, Block},
     parameters::{
-        checkpoint::list::CheckpointList,
-        subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
-        Network, GENESIS_PREVIOUS_BLOCK_HASH,
+        checkpoint::list::CheckpointList, subsidy::SubsidyError, Network,
+        GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
 };
@@ -610,23 +609,8 @@ where
             crate::block::check::equihash_solution_is_valid(&block.header)?;
         }
 
-        // We can't get the block subsidy for blocks with heights in the slow start interval, so we
-        // omit the calculation of the expected deferred amount.
-        let expected_deferred_amount = if height > self.network.slow_start_interval() {
-            // See [ZIP-1015](https://zips.z.cash/zip-1015).
-            funding_stream_values(height, &self.network, block_subsidy(height, &self.network)?)?
-                .remove(&FundingStreamReceiver::Deferred)
-        } else {
-            None
-        };
-
-        let deferred_pool_balance_change = expected_deferred_amount
-            .unwrap_or_default()
-            .checked_sub(self.network.lockbox_disbursement_total_amount(height))
-            .map(DeferredPoolBalanceChange::new);
-
         // don't do precalculation until the block passes basic difficulty checks
-        let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
+        let block = CheckpointVerifiedBlock::new(block, Some(hash));
 
         crate::block::check::merkle_root_validity(
             &self.network,
@@ -1041,6 +1025,12 @@ impl VerifyCheckpointError {
             // TODO: make this duplicate-incomplete
             VerifyCheckpointError::NewerRequest { .. } => true,
             VerifyCheckpointError::VerifyBlock(block_error) => block_error.is_duplicate_request(),
+            // The state boxes commit errors as `zs::CommitCheckpointVerifiedError`,
+            // a newtype around `zs::CommitBlockError`, so the wrapper must be
+            // unwrapped to classify duplicate blocks as benign.
+            VerifyCheckpointError::CommitCheckpointVerified(source) => source
+                .downcast_ref::<zs::CommitCheckpointVerifiedError>()
+                .is_some_and(|commit_err| commit_err.inner().is_duplicate_request()),
             _ => false,
         }
     }
@@ -1164,10 +1154,27 @@ where
             } else {
                 result.expect("commit_checkpoint_verified should not panic")
             };
-            if result.is_err() {
-                // If there was an error committing the block, then this verifier
-                // will be out of sync with the state. In that case, reset
-                // its progress back to the state tip.
+            // Only reset the verifier's progress when a block that the verifier
+            // accepted failed to commit to the state. Then the verifier's
+            // progress can be ahead of the state's committed blocks, so it must
+            // be re-aligned to the state tip.
+            //
+            // Other errors are rejections of this specific block (side-chain
+            // fork candidates, duplicates, or invalid block data). They don't
+            // change the committed chain, so the verifier's progress stays in
+            // sync with the state, and resetting would be harmful:
+            //
+            // # Correctness
+            //
+            // Verified checkpoint ranges commit to the state in height order,
+            // so the state tip can temporarily lag the verifier's progress
+            // while a range is still committing. Resetting to that lagging tip
+            // on unrelated errors rewinds the verifier below the last verified
+            // checkpoint. The blocks in between have already been consumed
+            // from the verifier's queue, so verification would stall until
+            // they are submitted again. The syncer re-downloads them, but
+            // other submitters (like the zcashd state migration) don't.
+            if let Err(VerifyCheckpointError::CommitCheckpointVerified(_)) = result {
                 let tip = match state_service
                     .oneshot(zs::Request::Tip)
                     .await

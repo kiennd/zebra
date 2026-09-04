@@ -3,20 +3,25 @@
 #![allow(clippy::unwrap_in_result)]
 
 use zcash_keys::address::Address;
-
 use zcash_transparent::address::TransparentAddress;
-use zebra_chain::{block::Height, parameters::Network, transaction, transparent::OutPoint};
+
+use zebra_chain::{
+    amount::Amount,
+    block::{Header, Height, MAX_BLOCK_BYTES},
+    parameters::Network,
+    transaction,
+    transparent::OutPoint,
+};
 use zebra_node_services::mempool::TransactionDependencies;
 
-use super::select_mempool_transactions;
+use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
+
+use super::{max_transaction_count_size, select_mempool_transactions};
 
 #[test]
 fn excludes_tx_with_unselected_dependencies() {
     let network = Network::Mainnet;
-    let next_block_height = Height(1_000_000);
-    let extra_coinbase_data = Vec::new();
     let mut mempool_tx_deps = TransactionDependencies::default();
-    let miner_address = Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]));
 
     let unmined_tx = network
         .unmined_transactions_in_blocks(..)
@@ -31,12 +36,10 @@ fn excludes_tx_with_unselected_dependencies() {
     assert_eq!(
         select_mempool_transactions(
             &network,
-            next_block_height,
-            &miner_address,
+            Height(1_000_000),
+            &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
             vec![unmined_tx],
             mempool_tx_deps,
-            extra_coinbase_data,
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
             None,
         ),
         vec![],
@@ -47,9 +50,7 @@ fn excludes_tx_with_unselected_dependencies() {
 #[test]
 fn includes_tx_with_selected_dependencies() {
     let network = Network::Mainnet;
-    let next_block_height = Height(1_000_000);
     let unmined_txs: Vec<_> = network.unmined_transactions_in_blocks(..).take(3).collect();
-    let miner_address = Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]));
 
     let dependent_tx1 = unmined_txs.first().expect("should have 3 txns");
     let dependent_tx2 = unmined_txs.get(1).expect("should have 3 txns");
@@ -73,16 +74,12 @@ fn includes_tx_with_selected_dependencies() {
         ],
     );
 
-    let extra_coinbase_data = Vec::new();
-
     let selected_txs = select_mempool_transactions(
         &network,
-        next_block_height,
-        &miner_address,
+        Height(1_000_000),
+        &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
-        extra_coinbase_data,
-        #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
         None,
     );
 
@@ -112,5 +109,64 @@ fn includes_tx_with_selected_dependencies() {
     assert_eq!(
         *dependency_depth, 1,
         "should return a dependency depth of 1 for the dependent tx"
+    );
+}
+
+/// Checks that transaction selection reserves space for the block header and the transaction
+/// count, which [`MAX_BLOCK_BYTES`] covers: a transaction exactly filling the remaining safe
+/// budget is selected, and a transaction one byte larger is not (GHSA-95m2-vx53-v2jw).
+#[test]
+fn reserves_space_for_block_header_and_transaction_count() {
+    let network = Network::Mainnet;
+    let height = Height(1_000_000);
+    let miner_params =
+        MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
+
+    let coinbase_tx_size =
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+            .expect("valid coinbase transaction template")
+            .data
+            .as_ref()
+            .len();
+
+    let safe_budget = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory")
+        - Header::serialized_size(&network)
+        - max_transaction_count_size()
+        - coinbase_tx_size;
+
+    let mut unmined_tx = network
+        .unmined_transactions_in_blocks(..)
+        .next()
+        .expect("should not be empty");
+
+    unmined_tx.transaction.size = safe_budget;
+
+    assert_eq!(
+        select_mempool_transactions(
+            &network,
+            height,
+            &miner_params,
+            vec![unmined_tx.clone()],
+            TransactionDependencies::default(),
+            None,
+        )
+        .len(),
+        1,
+        "should select a transaction exactly filling the safe block budget"
+    );
+
+    unmined_tx.transaction.size = safe_budget + 1;
+
+    assert_eq!(
+        select_mempool_transactions(
+            &network,
+            height,
+            &miner_params,
+            vec![unmined_tx],
+            TransactionDependencies::default(),
+            None,
+        ),
+        vec![],
+        "should not select a transaction one byte over the safe block budget"
     );
 }

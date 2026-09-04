@@ -2,16 +2,16 @@
 
 use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
 
-use halo2::pasta::pallas;
+use halo2::pasta::{group::ff::PrimeField, pallas};
 
 use crate::{
     amount::{DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::AuthDataRoot,
     fmt::DisplayToDebug,
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling,
-    serialization::{TrustedPreallocate, MAX_PROTOCOL_MESSAGE_LEN},
+    serialization::TrustedPreallocate,
     sprout,
     transaction::Transaction,
     transparent,
@@ -81,9 +81,12 @@ impl Block {
     pub fn coinbase_height(&self) -> Option<Height> {
         self.transactions
             .first()
-            .and_then(|tx| tx.inputs().first())
+            .and_then(|tx| {
+                let inputs = tx.inputs();
+                inputs.into_iter().next()
+            })
             .and_then(|input| match input {
-                transparent::Input::Coinbase { ref height, .. } => Some(*height),
+                transparent::Input::Coinbase { height, .. } => Some(height),
                 _ => None,
             })
     }
@@ -140,49 +143,80 @@ impl Block {
         Ok(())
     }
 
-    /// Access the [`sprout::Nullifier`]s from all transactions in this block.
-    pub fn sprout_nullifiers(&self) -> impl Iterator<Item = &sprout::Nullifier> {
+    /// Access the sprout nullifiers from all transactions in this block.
+    pub fn sprout_nullifiers(&self) -> impl Iterator<Item = sprout::Nullifier> + '_ {
         self.transactions
             .iter()
-            .flat_map(|transaction| transaction.sprout_nullifiers())
+            .flat_map(|transaction| transaction.sprout_nullifiers().collect::<Vec<_>>())
     }
 
-    /// Access the [`sapling::Nullifier`]s from all transactions in this block.
-    pub fn sapling_nullifiers(&self) -> impl Iterator<Item = &sapling::Nullifier> {
+    /// Access the sapling nullifiers from all transactions in this block.
+    pub fn sapling_nullifiers(&self) -> impl Iterator<Item = sapling::Nullifier> + '_ {
         self.transactions
             .iter()
-            .flat_map(|transaction| transaction.sapling_nullifiers())
+            .flat_map(|transaction| transaction.sapling_nullifiers().collect::<Vec<_>>())
     }
 
-    /// Access the [`orchard::Nullifier`]s from all transactions in this block.
-    pub fn orchard_nullifiers(&self) -> impl Iterator<Item = &orchard::Nullifier> {
+    /// Access the orchard nullifiers from all transactions in this block.
+    pub fn orchard_nullifiers(&self) -> impl Iterator<Item = orchard::Nullifier> + '_ {
         self.transactions
             .iter()
-            .flat_map(|transaction| transaction.orchard_nullifiers())
+            .flat_map(|transaction| transaction.orchard_nullifiers().collect::<Vec<_>>())
     }
 
-    /// Access the [`sprout::NoteCommitment`]s from all transactions in this block.
-    pub fn sprout_note_commitments(&self) -> impl Iterator<Item = &sprout::NoteCommitment> {
+    /// Access the ironwood nullifiers from all transactions in this block.
+    pub fn ironwood_nullifiers(&self) -> impl Iterator<Item = ironwood::Nullifier> + '_ {
         self.transactions
             .iter()
-            .flat_map(|transaction| transaction.sprout_note_commitments())
+            .flat_map(|transaction| transaction.ironwood_nullifiers().collect::<Vec<_>>())
     }
 
-    /// Access the [sapling note commitments](`sapling_crypto::note::ExtractedNoteCommitment`)
-    /// from all transactions in this block.
+    /// Access the sprout note commitments from all transactions in this block.
+    pub fn sprout_note_commitments(
+        &self,
+    ) -> impl Iterator<Item = sprout::commitment::NoteCommitment> + '_ {
+        self.transactions
+            .iter()
+            .flat_map(|transaction| transaction.sprout_note_commitments().collect::<Vec<_>>())
+    }
+
+    /// Access the sapling note commitments from all transactions in this block.
     pub fn sapling_note_commitments(
         &self,
-    ) -> impl Iterator<Item = &sapling_crypto::note::ExtractedNoteCommitment> {
+    ) -> impl Iterator<Item = sapling_crypto::note::ExtractedNoteCommitment> + '_ {
         self.transactions
             .iter()
-            .flat_map(|transaction| transaction.sapling_note_commitments())
+            .flat_map(|transaction| transaction.sapling_note_commitments().collect::<Vec<_>>())
     }
 
-    /// Access the [orchard note commitments](pallas::Base) from all transactions in this block.
-    pub fn orchard_note_commitments(&self) -> impl Iterator<Item = &pallas::Base> {
-        self.transactions
-            .iter()
-            .flat_map(|transaction| transaction.orchard_note_commitments())
+    /// Access the orchard note commitments from all transactions in this block,
+    /// as `pallas::Base` values for the note commitment tree.
+    pub fn orchard_note_commitments(&self) -> impl Iterator<Item = pallas::Base> + '_ {
+        self.transactions.iter().flat_map(|transaction| {
+            transaction
+                .orchard_note_commitments()
+                .map(|cmx| {
+                    let bytes = cmx.to_bytes();
+                    pallas::Base::from_repr(bytes)
+                        .expect("orchard note commitment is a valid pallas::Base")
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Access the ironwood note commitments from all transactions in this block,
+    /// as `pallas::Base` values for the note commitment tree.
+    pub fn ironwood_note_commitments(&self) -> impl Iterator<Item = pallas::Base> + '_ {
+        self.transactions.iter().flat_map(|transaction| {
+            transaction
+                .ironwood_note_commitments()
+                .map(|cmx| {
+                    let bytes = cmx.to_bytes();
+                    pallas::Base::from_repr(bytes)
+                        .expect("ironwood note commitment is a valid pallas::Base")
+                })
+                .collect::<Vec<_>>()
+        })
     }
 
     /// Count how many Sapling transactions exist in a block,
@@ -209,6 +243,17 @@ impl Block {
             .expect("number of transactions must fit u64")
     }
 
+    /// Count how many Ironwood transactions exist in a block,
+    /// i.e. transactions where the Ironwood bundle is non-empty (NU6.3 onward).
+    pub fn ironwood_transactions_count(&self) -> u64 {
+        self.transactions
+            .iter()
+            .filter(|tx| tx.has_ironwood_shielded_data())
+            .count()
+            .try_into()
+            .expect("number of transactions must fit u64")
+    }
+
     /// Returns the overall chain value pool change in this block---the negative sum of the
     /// transaction value balances in this block.
     ///
@@ -228,19 +273,21 @@ impl Block {
     pub fn chain_value_pool_change(
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
-        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+        deferred_pool_balance_change: DeferredPoolBalanceChange,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        Ok(*self
+        // `Result<T, E>` implements `IntoIterator`, so a `flat_map(|t| t.value_balance(utxos))`
+        // would silently drop transactions whose value balance returns `Err`. Use `try_fold`
+        // to propagate the first error instead.
+        let tx_pool_sum = self
             .transactions
             .iter()
-            .flat_map(|t| t.value_balance(utxos))
-            .sum::<Result<ValueBalance<NegativeAllowed>, _>>()?
+            .try_fold(ValueBalance::<NegativeAllowed>::zero(), |acc, tx| {
+                acc + tx.value_balance(utxos)?
+            })?;
+
+        Ok(*tx_pool_sum
             .neg()
-            .set_deferred_amount(
-                deferred_pool_balance_change
-                    .map(DeferredPoolBalanceChange::value)
-                    .unwrap_or_default(),
-            ))
+            .set_deferred_amount(deferred_pool_balance_change.value()))
     }
 
     /// Compute the root of the authorizing data Merkle tree,
@@ -258,14 +305,30 @@ impl<'a> From<&'a Block> for Hash {
     }
 }
 
-/// A serialized Block hash takes 32 bytes
-const BLOCK_HASH_SIZE: u64 = 32;
+/// The maximum number of `block::Hash` entries Zebra will preallocate for in
+/// a single peer-deserialized vector.
+///
+/// In the P2P protocol, `Vec<block::Hash>` appears as the `known_blocks` block
+/// locator in `getblocks` and `getheaders` messages. The Bitcoin/Zcash
+/// convention encodes locators with exponentially-spaced heights (1, 2, 3, …,
+/// 10, 20, 40, …, genesis), giving `~log2(N) + 10` entries for chain length N.
+/// For current Zcash chain heights (~3M blocks) a legitimate locator has ~32
+/// entries.
+///
+/// We cap at 101 to match Bitcoin Core's `MAX_LOCATOR_SZ` constant
+/// (`net_processing.cpp`), which zcashd inherits. This avoids any risk of
+/// rejecting legitimate locators sent by compatible nodes that follow the
+/// existing Bitcoin/Zcash protocol convention.
+///
+/// Without this cap, `Hash::max_allocation` was previously derived from
+/// `MAX_PROTOCOL_MESSAGE_LEN / 32 = 65,535`, which allowed a remote peer to
+/// force ~2 MiB heap preallocation per crafted `getblocks`/`getheaders` message
+/// before any payload was read. This is the same class as
+/// GHSA-xr93-pcq3-pxf8 (`addr_limit`), fixed for AddrV1/V2 in PR #10494.
+pub const MAX_BLOCK_LOCATOR_LENGTH: u64 = 101;
 
-/// The maximum number of hashes in a valid Zcash protocol message.
 impl TrustedPreallocate for Hash {
     fn max_allocation() -> u64 {
-        // Every vector type requires a length field of at least one byte for de/serialization.
-        // Since a block::Hash takes 32 bytes, we can never receive more than (MAX_PROTOCOL_MESSAGE_LEN - 1) / 32 hashes in a single message
-        ((MAX_PROTOCOL_MESSAGE_LEN - 1) as u64) / BLOCK_HASH_SIZE
+        MAX_BLOCK_LOCATOR_LENGTH
     }
 }

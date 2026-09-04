@@ -5,11 +5,16 @@
 //! cargo insta test --review --release -p zebra-rpc --lib -- test_rpc_response_data
 //! ```
 
+// `insta`'s macro expansion trips this lint, and each toolchain knows only one of its two names: https://github.com/rust-lang/rust/issues/79813
+#![allow(unknown_lints)]
+#![allow(semicolon_in_expressions_from_macros)]
+#![allow(semicolon_in_expressions_from_non_local_macros)]
+
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::FutureExt;
@@ -26,7 +31,6 @@ use zebra_chain::{
     chain_tip::mock::MockChainTip,
     orchard,
     parameters::{
-        subsidy::FUNDING_STREAMS_TESTNET,
         testnet::{self, ConfiguredActivationHeights, Parameters},
         Network::{self, Mainnet},
         NetworkKind, NetworkUpgrade,
@@ -76,7 +80,7 @@ async fn test_rpc_response_data() {
         .expect("failed to set network name")
         .with_activation_heights(ConfiguredActivationHeights {
             blossom: Some(584_000),
-            nu6: Some(FUNDING_STREAMS_TESTNET[1].height_range().start.0),
+            nu6: Some(2_976_000),
             ..Default::default()
         })
         .expect("failed to set activation heights")
@@ -216,8 +220,11 @@ async fn test_rpc_response_data_for_network(network: &Network) {
         .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
         .collect();
 
-    let mut mempool: MockService<_, _, _, zebra_node_services::BoxError> =
-        MockService::build().for_unit_tests();
+    let mut mempool: MockService<_, _, _, zebra_node_services::BoxError> = MockService::build()
+        // This test runs multiple network snapshots concurrently; on busy CI runners the default
+        // mock request timeout can elapse before the GBT long-poll request is observed.
+        .with_max_request_delay(Duration::from_secs(2))
+        .for_unit_tests();
 
     // Create a populated state service
     let (state, read_state, tip, _) = zebra_state::populated_state(blocks.clone(), network).await;
@@ -509,7 +516,8 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let rpc_req = rpc.get_raw_transaction(txid.clone(), Some(0u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=0"), rsp));
+    settings
+        .bind(|| insta::assert_json_snapshot!("getrawtransaction_verbosity=0".to_string(), rsp));
     mempool.expect_no_requests().await;
 
     // `getrawtransaction` verbosity=1
@@ -523,7 +531,8 @@ async fn test_rpc_response_data_for_network(network: &Network) {
 
     let rpc_req = rpc.get_raw_transaction(txid, Some(1u8), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_verbosity=1"), rsp));
+    settings
+        .bind(|| insta::assert_json_snapshot!("getrawtransaction_verbosity=1".to_string(), rsp));
     mempool.expect_no_requests().await;
 
     // `getrawtransaction` with unknown txid
@@ -538,14 +547,16 @@ async fn test_rpc_response_data_for_network(network: &Network) {
     let rpc_req =
         rpc.get_raw_transaction(transaction::Hash::from([0; 32]).encode_hex(), Some(1), None);
     let (rsp, _) = futures::join!(rpc_req, mempool_req);
-    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_unknown_txid"), rsp));
+    settings
+        .bind(|| insta::assert_json_snapshot!("getrawtransaction_unknown_txid".to_string(), rsp));
     mempool.expect_no_requests().await;
 
     // `getrawtransaction` with an invalid TXID
     let rsp = rpc
         .get_raw_transaction("aBadC0de".to_owned(), Some(1), None)
         .await;
-    settings.bind(|| insta::assert_json_snapshot!(format!("getrawtransaction_invalid_txid"), rsp));
+    settings
+        .bind(|| insta::assert_json_snapshot!("getrawtransaction_invalid_txid".to_string(), rsp));
     mempool.expect_no_requests().await;
 
     // `getaddresstxids`
@@ -662,7 +673,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 
     // Check the response.
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("z_get_subtrees_by_index_for_sapling"), subtrees)
+        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_sapling".to_string(), subtrees)
     });
 
     // Test the response format from `z_getsubtreesbyindex` for Orchard.
@@ -690,7 +701,7 @@ async fn test_mocked_rpc_response_data_for_network(network: &Network) {
 
     // Check the response.
     settings.bind(|| {
-        insta::assert_json_snapshot!(format!("z_get_subtrees_by_index_for_orchard"), subtrees)
+        insta::assert_json_snapshot!("z_get_subtrees_by_index_for_orchard".to_string(), subtrees)
     });
 }
 
@@ -700,7 +711,7 @@ fn snapshot_rpc_getinfo(info: GetInfoResponse, settings: &insta::Settings) {
         insta::assert_json_snapshot!("get_info", info, {
             ".subversion" => dynamic_redaction(|value, _path| {
                 // assert that the subversion value is user agent
-                assert_eq!(value.as_str().unwrap(), format!("RPC test"));
+                assert_eq!(value.as_str().unwrap(), "RPC test".to_string());
                 // replace with:
                 "[SubVersion]"
             }),
@@ -908,7 +919,14 @@ fn snapshot_rpc_getnetworkinfo(
 
 /// Snapshot `getpeerinfo` response, using `cargo insta` and JSON serialization.
 fn snapshot_rpc_getpeerinfo(get_peer_info: Vec<PeerInfo>, settings: &insta::Settings) {
-    settings.bind(|| insta::assert_json_snapshot!("get_peer_info", get_peer_info));
+    settings.bind(|| {
+        insta::assert_json_snapshot!("get_peer_info", get_peer_info, {
+            "[].lastrecv" => dynamic_redaction(|value, _path| {
+                assert!(value.as_u64().unwrap() > 0, "lastrecv should be non-zero");
+                "[lastrecv]"
+            })
+        })
+    });
 }
 
 /// Snapshot `getnetworksolps` response, using `cargo insta` and JSON serialization.
@@ -1009,6 +1027,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
             [0x7e; 20],
         )),
         extra_coinbase_data: None,
+        miner_memo: None,
         // TODO: Use default field values when optional features are enabled in tests #8183
         internal_miner: true,
     };
@@ -1044,6 +1063,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .into(),
         &PeerServices::NODE_NETWORK,
         false,
+        "/Zebra:2.1.0/".to_string(),
+        zebra_network::constants::CURRENT_NETWORK_PROTOCOL_VERSION,
     )
     .into_new_meta_addr(Instant::now(), DateTime32::now())]);
 

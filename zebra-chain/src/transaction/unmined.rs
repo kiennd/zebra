@@ -21,11 +21,8 @@ use crate::{
     amount::{Amount, NonNegative},
     block::Height,
     serialization::ZcashSerialize,
-    transaction::{
-        AuthDigest, Hash,
-        Transaction::{self, *},
-        WtxId,
-    },
+    transaction::{AuthDigest, Hash, Transaction, WtxId},
+    transparent,
 };
 
 use UnminedTxId::*;
@@ -130,27 +127,13 @@ impl fmt::Display for UnminedTxId {
     }
 }
 
+// `From<&Transaction>` and `From<Arc<Transaction>>` for `UnminedTxId`
+// are defined in transaction.rs, where the version dispatch lives.
+
 impl From<Transaction> for UnminedTxId {
     fn from(transaction: Transaction) -> Self {
         // use the ref implementation, to avoid cloning the transaction
         UnminedTxId::from(&transaction)
-    }
-}
-
-impl From<&Transaction> for UnminedTxId {
-    fn from(transaction: &Transaction) -> Self {
-        match transaction {
-            V1 { .. } | V2 { .. } | V3 { .. } | V4 { .. } => Legacy(transaction.into()),
-            V5 { .. } => Witnessed(transaction.into()),
-            #[cfg(all(zcash_unstable = "nu7", feature = "tx_v6"))]
-            V6 { .. } => Witnessed(transaction.into()),
-        }
-    }
-}
-
-impl From<Arc<Transaction>> for UnminedTxId {
-    fn from(transaction: Arc<Transaction>) -> Self {
-        transaction.as_ref().into()
     }
 }
 
@@ -261,39 +244,6 @@ impl fmt::Display for UnminedTx {
     }
 }
 
-// Each of these conversions is implemented slightly differently,
-// to avoid cloning the transaction where possible.
-
-impl From<Transaction> for UnminedTx {
-    fn from(transaction: Transaction) -> Self {
-        let size = transaction.zcash_serialized_size();
-        let conventional_fee = zip317::conventional_fee(&transaction);
-
-        // The borrow is actually needed to avoid taking ownership
-        #[allow(clippy::needless_borrow)]
-        Self {
-            id: (&transaction).into(),
-            size,
-            conventional_fee,
-            transaction: Arc::new(transaction),
-        }
-    }
-}
-
-impl From<&Transaction> for UnminedTx {
-    fn from(transaction: &Transaction) -> Self {
-        let size = transaction.zcash_serialized_size();
-        let conventional_fee = zip317::conventional_fee(transaction);
-
-        Self {
-            id: transaction.into(),
-            size,
-            conventional_fee,
-            transaction: Arc::new(transaction.clone()),
-        }
-    }
-}
-
 impl From<Arc<Transaction>> for UnminedTx {
     fn from(transaction: Arc<Transaction>) -> Self {
         let size = transaction.zcash_serialized_size();
@@ -335,9 +285,19 @@ pub struct VerifiedUnminedTx {
     /// The transaction fee for this unmined transaction.
     pub miner_fee: Amount<NonNegative>,
 
-    /// The number of legacy signature operations in this transaction's
-    /// transparent inputs and outputs.
-    pub sigops: u32,
+    /// The number of legacy transparent signature operations in this transaction.
+    ///
+    /// This is the legacy sigop count only (`GetLegacySigOpCount()`).
+    /// The mempool adds P2SH sigops (`GetP2SHSigOpCount()`) when checking
+    /// `MAX_STANDARD_TX_SIGOPS`.
+    pub legacy_sigop_count: u32,
+
+    /// The number of P2SH redeem-script signature operations in this transaction.
+    ///
+    /// This mirrors zcashd's `GetP2SHSigOpCount()`. It must be added to `legacy_sigop_count` for
+    /// the block-level `MAX_BLOCK_SIGOPS` check and for `getblocktemplate` sigop budgeting,
+    /// matching zcashd's consensus behavior.
+    pub p2sh_sigop_count: u32,
 
     /// The number of conventional actions for `transaction`, as defined by [ZIP-317].
     ///
@@ -369,6 +329,12 @@ pub struct VerifiedUnminedTx {
     /// The tip height when the transaction was added to the mempool, or None if
     /// it has not reached the mempool yet.
     pub height: Option<Height>,
+
+    /// The spent outputs for this transaction's transparent inputs.
+    ///
+    /// Used by mempool policy checks (`AreInputsStandard`, `GetP2SHSigOpCount`).
+    /// Empty for transactions with no transparent inputs or in test contexts.
+    pub spent_outputs: Arc<Vec<transparent::Output>>,
 }
 
 impl fmt::Debug for VerifiedUnminedTx {
@@ -390,12 +356,14 @@ impl fmt::Display for VerifiedUnminedTx {
 }
 
 impl VerifiedUnminedTx {
-    /// Create a new verified unmined transaction from an unmined transaction,
-    /// its miner fee, and its legacy sigop count.
+    /// Create a new verified unmined transaction from an unmined transaction, its miner fee, its
+    /// legacy and P2SH sigop counts, and the spent outputs for its transparent inputs.
     pub fn new(
         transaction: UnminedTx,
         miner_fee: Amount<NonNegative>,
         legacy_sigop_count: u32,
+        p2sh_sigop_count: u32,
+        spent_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<Self, zip317::Error> {
         let fee_weight_ratio = zip317::conventional_fee_weight_ratio(&transaction, miner_fee);
         let conventional_actions = zip317::conventional_actions(&transaction.transaction);
@@ -406,13 +374,25 @@ impl VerifiedUnminedTx {
         Ok(Self {
             transaction,
             miner_fee,
-            sigops: legacy_sigop_count,
+            legacy_sigop_count,
+            p2sh_sigop_count,
             fee_weight_ratio,
             conventional_actions,
             unpaid_actions,
             time: None,
             height: None,
+            spent_outputs,
         })
+    }
+
+    /// The total number of transparent signature operations for block-level accounting: legacy +
+    /// P2SH.
+    ///
+    /// This is the value that must be used for the consensus `MAX_BLOCK_SIGOPS` limit and for
+    /// `getblocktemplate` sigop budgeting.
+    pub fn block_sigop_count(&self) -> u32 {
+        self.legacy_sigop_count
+            .saturating_add(self.p2sh_sigop_count)
     }
 
     /// Returns `true` if the transaction pays at least the [ZIP-317] conventional fee.

@@ -7,24 +7,33 @@ use chrono::{DateTime, Utc};
 use derive_getters::Getters;
 use derive_new::new;
 use hex::ToHex;
-
+use rand::rngs::OsRng;
 use zcash_script::script::Asm;
+
+use zcash_keys::address::Address;
+use zcash_primitives::transaction::{
+    builder::{BuildConfig, Builder},
+    fees::fixed::FeeRule,
+};
+use zcash_protocol::{consensus::BlockHeight, memo::MemoBytes, value::ZatBalance, value::Zatoshis};
 use zebra_chain::{
-    amount::{self, Amount, NegativeOrZero, NonNegative},
+    amount::{self, Amount, NegativeAllowed, NegativeOrZero, NonNegative},
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
-    orchard,
-    parameters::Network,
+    parameters::{
+        subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
+        Network, NetworkUpgrade,
+    },
     primitives::ed25519,
     sapling::ValueCommitment,
     serialization::ZcashSerialize,
-    transaction::{self, SerializedTransaction, Transaction, UnminedTx, VerifiedUnminedTx},
+    transaction::{self, SerializedTransaction, Transaction, VerifiedUnminedTx},
     transparent::Script,
 };
+use zebra_consensus::{error::TransactionError, funding_stream_address};
 use zebra_script::Sigops;
-use zebra_state::IntoDisk;
 
-use super::super::opthex;
 use super::zec::Zec;
+use super::{super::opthex, get_block_template::MinerParams};
 
 /// Transaction data and fields needed to generate blocks using the `getblocktemplate` RPC.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
@@ -95,7 +104,9 @@ impl From<&VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
 
             fee: tx.miner_fee,
 
-            sigops: tx.sigops,
+            // Report the full block-level sigop count (legacy + P2SH) so the template `sigops`
+            // field matches what the block verifier charges against `MAX_BLOCK_SIGOPS`.
+            sigops: tx.block_sigop_count(),
 
             // Zebra does not require any transactions except the coinbase transaction.
             required: false,
@@ -110,37 +121,146 @@ impl From<VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
 }
 
 impl TransactionTemplate<NegativeOrZero> {
-    /// Convert from a generated coinbase transaction into a coinbase transaction template.
-    ///
-    /// `miner_fee` is the total miner fees for the block, excluding newly created block rewards.
-    //
-    // TODO: use a different type for generated coinbase transactions?
-    pub fn from_coinbase(tx: &UnminedTx, miner_fee: Amount<NonNegative>) -> Self {
-        assert!(
-            tx.transaction.is_coinbase(),
-            "invalid generated coinbase transaction: \
-             must have exactly one input, which must be a coinbase input",
+    /// Constructs a transaction template for a coinbase transaction.
+    pub fn new_coinbase(
+        net: &Network,
+        height: Height,
+        miner_params: &MinerParams,
+        txs_fee: Amount<NonNegative>,
+    ) -> Result<Self, TransactionError> {
+        let block_subsidy = block_subsidy(height, net)?;
+        let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
+        let miner_reward = Zatoshis::try_from(miner_reward?)?;
+
+        let mut builder = Builder::new(
+            net,
+            BlockHeight::from(height),
+            BuildConfig::Coinbase {
+                miner_data: miner_params.data().clone(),
+            },
         );
 
-        let miner_fee = (-miner_fee)
-            .constrain()
-            .expect("negating a NonNegative amount always results in a valid NegativeOrZero");
+        let default_memo = MemoBytes::empty();
+        let memo = miner_params.memo().unwrap_or(&default_memo);
 
-        Self {
-            data: tx.transaction.as_ref().into(),
-            hash: tx.id.mined_id(),
-            auth_digest: tx.id.auth_digest().unwrap_or(AUTH_DIGEST_PLACEHOLDER),
+        // ZIP-233 was dropped from the v6 transaction format, so no burn amount is set here. If the
+        // Network Sustainability Mechanism re-introduces a burn, it will be plumbed back through
+        // explicitly at that point.
 
-            // Always empty, coinbase transactions never have inputs.
-            depends: Vec::new(),
-
-            fee: miner_fee,
-
-            sigops: tx.sigops().expect("sigops count should be valid"),
-
-            // Zcash requires a coinbase transaction.
-            required: true,
+        macro_rules! trace_err {
+            ($res:expr, $type:expr) => {
+                $res.map_err(|err| tracing::error!("Failed to add {} output: {err}", $type))
+                    .ok()
+            };
         }
+
+        // On NU6.3 onward the coinbase MUST have an empty Orchard component, and newly shielded
+        // coinbase value is routed to the Ironwood pool instead (see the Ironwood pool spec and
+        // `coinbase_orchard_component_empty` in zebra-consensus). Ironwood outputs use the same
+        // Orchard-shaped `orchard::Address` as their recipient, so a unified miner address with an
+        // Orchard receiver just gets routed to the Ironwood output builder from NU6.3 onward.
+        let use_ironwood = NetworkUpgrade::current(net, height) >= NetworkUpgrade::Nu6_3;
+
+        let add_shielded_reward = |builder: &mut Builder<_, _>, addr: &_| {
+            let ovk = Some(::orchard::keys::OutgoingViewingKey::from([0u8; 32]));
+            if use_ironwood {
+                trace_err!(
+                    builder.add_ironwood_output::<String>(ovk, *addr, miner_reward, memo.clone()),
+                    "Ironwood"
+                )
+            } else {
+                trace_err!(
+                    builder.add_orchard_output::<String>(ovk, *addr, miner_reward, memo.clone()),
+                    "Orchard"
+                )
+            }
+        };
+
+        let add_sapling_reward = |builder: &mut Builder<_, _>, addr: &_| {
+            trace_err!(
+                builder.add_sapling_output::<String>(
+                    Some(sapling_crypto::keys::OutgoingViewingKey([0u8; 32])),
+                    *addr,
+                    miner_reward,
+                    memo.clone(),
+                ),
+                "Sapling"
+            )
+        };
+
+        let add_transparent_reward = |builder: &mut Builder<_, _>, addr| {
+            trace_err!(
+                builder.add_transparent_output(addr, miner_reward),
+                "transparent"
+            )
+        };
+
+        match miner_params.addr() {
+            Address::Unified(addr) => addr
+                .orchard()
+                .and_then(|addr| add_shielded_reward(&mut builder, addr))
+                .or_else(|| {
+                    addr.sapling()
+                        .and_then(|addr| add_sapling_reward(&mut builder, addr))
+                })
+                .or_else(|| {
+                    addr.transparent()
+                        .and_then(|addr| add_transparent_reward(&mut builder, addr))
+                }),
+
+            Address::Sapling(addr) => add_sapling_reward(&mut builder, addr),
+
+            Address::Transparent(addr) => add_transparent_reward(&mut builder, addr),
+
+            _ => Err(TransactionError::CoinbaseConstruction(
+                "Address not supported for miner rewards".to_string(),
+            ))?,
+        }
+        .ok_or(TransactionError::CoinbaseConstruction(
+            "Could not construct output with miner reward".to_string(),
+        ))?;
+
+        let mut funding_streams = funding_stream_values(height, net, block_subsidy)?
+            .into_iter()
+            .filter_map(|(receiver, amount)| {
+                Some((*funding_stream_address(height, net, receiver)?, amount))
+            })
+            .chain(net.lockbox_disbursements(height))
+            .filter_map(|(addr, amount)| {
+                Some((Zatoshis::try_from(amount).ok()?, addr.try_into().ok()?))
+            })
+            .collect::<Vec<_>>();
+
+        funding_streams.sort();
+
+        for (fs_amount, fs_addr) in funding_streams {
+            builder.add_transparent_output(&fs_addr, fs_amount)?;
+        }
+
+        let sapling_prover = zebra_consensus::sapling_prover();
+        let build_result = builder.build(
+            &Default::default(),
+            Default::default(),
+            Default::default(),
+            OsRng,
+            sapling_prover,
+            sapling_prover,
+            &FeeRule::non_standard(Zatoshis::ZERO),
+        )?;
+
+        let tx = build_result.transaction();
+        let mut data = vec![];
+        tx.write(&mut data)?;
+
+        Ok(Self {
+            data: data.into(),
+            hash: tx.txid().as_ref().into(),
+            auth_digest: tx.auth_commitment().as_ref().try_into()?,
+            depends: Vec::new(),
+            fee: (-txs_fee).constrain()?,
+            sigops: tx.sigops()?,
+            required: true,
+        })
     }
 }
 
@@ -167,7 +287,7 @@ pub struct TransactionObject {
     /// mempool.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
-    pub(crate) confirmations: Option<u32>,
+    pub(crate) confirmations: Option<i64>,
 
     /// Transparent inputs of the transaction.
     #[serde(rename = "vin")]
@@ -222,6 +342,12 @@ pub struct TransactionObject {
     /// Orchard actions of the transaction.
     #[serde(rename = "orchard", skip_serializing_if = "Option::is_none")]
     pub(crate) orchard: Option<Orchard>,
+
+    /// Ironwood actions of the transaction (v6 transactions from NU6.3 onward).
+    ///
+    /// The Ironwood pool reuses the Orchard-shaped bundle, so this uses the same [`Orchard`] object.
+    #[serde(rename = "ironwood", skip_serializing_if = "Option::is_none")]
+    pub(crate) ironwood: Option<Orchard>,
 
     /// The net value of Sapling Spends minus Outputs in ZEC
     #[serde(rename = "valueBalance", skip_serializing_if = "Option::is_none")]
@@ -278,7 +404,9 @@ pub struct TransactionObject {
     #[serde(rename = "locktime")]
     pub(crate) lock_time: u32,
 
-    /// The block height after which the transaction expires
+    /// The block height after which the transaction expires.
+    /// Included for Overwinter+ transactions (matching zcashd), omitted for V1/V2.
+    /// See: <https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L224-L226>
     #[serde(rename = "expiryheight", skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
     pub(crate) expiry_height: Option<Height>,
@@ -347,6 +475,63 @@ pub struct Output {
     /// The scriptPubKey.
     #[serde(rename = "scriptPubKey")]
     script_pub_key: ScriptPubKey,
+}
+
+/// The output object returned by `gettxout` RPC requests.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct OutputObject {
+    #[serde(rename = "bestblock")]
+    best_block: String,
+    confirmations: u32,
+    value: f64,
+    #[serde(rename = "scriptPubKey")]
+    script_pub_key: ScriptPubKey,
+    version: u32,
+    coinbase: bool,
+}
+impl OutputObject {
+    pub fn from_output(
+        output: &zebra_chain::transparent::Output,
+        best_block: String,
+        confirmations: u32,
+        version: u32,
+        coinbase: bool,
+        network: &Network,
+    ) -> Self {
+        let lock_script = &output.lock_script;
+        let addresses = output.address(network).map(|addr| vec![addr.to_string()]);
+        let req_sigs = addresses.as_ref().map(|a| a.len() as u32);
+
+        let script_pub_key = ScriptPubKey::new(
+            zcash_script::script::Code(lock_script.as_raw_bytes().to_vec()).to_asm(false),
+            lock_script.clone(),
+            req_sigs,
+            zcash_script::script::Code(lock_script.as_raw_bytes().to_vec())
+                .to_component()
+                .ok()
+                .and_then(|c| c.refine().ok())
+                .and_then(|component| zcash_script::solver::standard(&component))
+                .map(|kind| match kind {
+                    zcash_script::solver::ScriptKind::PubKeyHash { .. } => "pubkeyhash",
+                    zcash_script::solver::ScriptKind::ScriptHash { .. } => "scripthash",
+                    zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
+                    zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
+                    zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
+                })
+                .unwrap_or("nonstandard")
+                .to_string(),
+            addresses,
+        );
+
+        Self {
+            best_block,
+            confirmations,
+            value: crate::methods::types::zec::Zec::from(output.value()).lossy_zec(),
+            script_pub_key,
+            version,
+            coinbase,
+        }
+    }
 }
 
 /// The scriptPubKey of a transaction output.
@@ -570,6 +755,55 @@ pub struct OrchardAction {
     out_ciphertext: [u8; 80],
 }
 
+/// Builds the RPC object for an Orchard-shaped shielded pool (Orchard or Ironwood) from its
+/// shielded data and net value balance.
+///
+/// The Ironwood pool reuses the Orchard bundle shape, so both pools serialize through the same
+/// [`Orchard`] object; the caller selects which pool's shielded data and value balance to pass.
+/// Builds the RPC object for an Orchard-shaped bundle.
+///
+/// Both the Orchard and Ironwood pools use the same bundle type and the same wire shape, so this
+/// serves both. The caller supplies the pool's own value balance, since that is read from a
+/// separate field per pool.
+fn orchard_shaped_object(
+    bundle: Option<&::orchard::Bundle<::orchard::bundle::Authorized, ZatBalance>>,
+    value_balance: Amount<NegativeAllowed>,
+) -> Orchard {
+    let actions = bundle
+        .into_iter()
+        .flat_map(|bundle| bundle.actions().iter())
+        .map(|action| OrchardAction {
+            cv: action.cv_net().to_bytes(),
+            nullifier: action.nullifier().to_bytes(),
+            rk: action.rk().into(),
+            cm_x: action.cmx().to_bytes(),
+            ephemeral_key: action.encrypted_note().epk_bytes,
+            enc_ciphertext: action.encrypted_note().enc_ciphertext,
+            spend_auth_sig: action.authorization().into(),
+            out_ciphertext: action.encrypted_note().out_ciphertext,
+        })
+        .collect();
+
+    Orchard {
+        actions,
+        value_balance: Zec::from(value_balance).lossy_zec(),
+        value_balance_zat: value_balance.zatoshis(),
+        flags: bundle.map(|bundle| {
+            let flags = bundle.flags();
+            OrchardFlags::new(flags.outputs_enabled(), flags.spends_enabled())
+        }),
+        anchor: bundle.map(|bundle| {
+            let mut anchor = bundle.anchor().to_bytes();
+            // Display order is reversed in the RPC output.
+            anchor.reverse();
+            anchor
+        }),
+        proof: bundle.map(|bundle| bundle.authorization().proof().as_ref().to_vec()),
+        binding_sig: bundle
+            .map(|bundle| <[u8; 64]>::from(bundle.authorization().binding_signature())),
+    }
+}
+
 impl Default for TransactionObject {
     fn default() -> Self {
         Self {
@@ -584,6 +818,7 @@ impl Default for TransactionObject {
             shielded_outputs: Vec::new(),
             joinsplits: Vec::new(),
             orchard: None,
+            ironwood: None,
             binding_sig: None,
             joinsplit_pub_key: None,
             joinsplit_sig: None,
@@ -612,7 +847,7 @@ impl TransactionObject {
     pub fn from_transaction(
         tx: Arc<Transaction>,
         height: Option<block::Height>,
-        confirmations: Option<u32>,
+        confirmations: Option<i64>,
         network: &Network,
         block_time: Option<DateTime<Utc>>,
         block_hash: Option<block::Hash>,
@@ -658,8 +893,9 @@ impl TransactionObject {
                         txid: outpoint.hash.encode_hex(),
                         vout: outpoint.index,
                         script_sig: ScriptSig {
+                            // https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L240
                             asm: zcash_script::script::Code(unlock_script.as_raw_bytes().to_vec())
-                                .to_asm(false),
+                                .to_asm(true),
                             hex: unlock_script.clone(),
                         },
                         sequence: *sequence,
@@ -686,6 +922,8 @@ impl TransactionObject {
                         value_zat: output.1.value.zatoshis(),
                         n: output.0 as u32,
                         script_pub_key: ScriptPubKey {
+                            // https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L271
+                            // https://github.com/zcash/zcash/blob/v6.11.0/src/rpc/rawtransaction.cpp#L45
                             asm: zcash_script::script::Code(
                                 output.1.lock_script.as_raw_bytes().to_vec(),
                             )
@@ -714,25 +952,25 @@ impl TransactionObject {
                 })
                 .collect(),
             shielded_spends: tx
-                .sapling_spends_per_anchor()
+                .sapling_spends()
                 .map(|spend| {
-                    let mut anchor = spend.per_spend_anchor.as_bytes();
+                    let mut anchor = spend.anchor().to_bytes();
                     anchor.reverse();
 
-                    let mut nullifier = spend.nullifier.as_bytes();
+                    let mut nullifier = spend.nullifier().0;
                     nullifier.reverse();
 
-                    let mut rk: [u8; 32] = spend.clone().rk.into();
+                    let mut rk: [u8; 32] = (*spend.rk()).into();
                     rk.reverse();
 
-                    let spend_auth_sig: [u8; 64] = spend.spend_auth_sig.into();
+                    let spend_auth_sig: [u8; 64] = (*spend.spend_auth_sig()).into();
 
                     ShieldedSpend {
-                        cv: spend.cv.clone(),
+                        cv: ValueCommitment(spend.cv().clone()),
                         anchor,
                         nullifier,
                         rk,
-                        proof: spend.zkproof.0,
+                        proof: *spend.zkproof(),
                         spend_auth_sig,
                     }
                 })
@@ -740,129 +978,84 @@ impl TransactionObject {
             shielded_outputs: tx
                 .sapling_outputs()
                 .map(|output| {
-                    let mut cm_u: [u8; 32] = output.cm_u.to_bytes();
+                    let mut cm_u: [u8; 32] = output.cmu().to_bytes();
                     cm_u.reverse();
-                    let mut ephemeral_key: [u8; 32] = output.ephemeral_key.into();
+                    let mut ephemeral_key: [u8; 32] = output.ephemeral_key().0;
                     ephemeral_key.reverse();
-                    let enc_ciphertext: [u8; 580] = output.enc_ciphertext.into();
-                    let out_ciphertext: [u8; 80] = output.out_ciphertext.into();
+                    let enc_ciphertext: [u8; 580] = *output.enc_ciphertext();
+                    let out_ciphertext: [u8; 80] = *output.out_ciphertext();
 
                     ShieldedOutput {
-                        cv: output.cv.clone(),
+                        cv: ValueCommitment(output.cv().clone()),
                         cm_u,
                         ephemeral_key,
                         enc_ciphertext,
                         out_ciphertext,
-                        proof: output.zkproof.0,
+                        proof: *output.zkproof(),
                     }
                 })
                 .collect(),
             joinsplits: tx
-                .sprout_joinsplits()
+                .sprout_joinsplit_descriptions()
                 .map(|joinsplit| {
-                    let mut ephemeral_key_bytes: [u8; 32] = joinsplit.ephemeral_key.to_bytes();
-                    ephemeral_key_bytes.reverse();
+                    // `JsDescription` stores every field in wire order; the RPC renders the
+                    // 32-byte fields in display (reversed) order, matching zcashd.
+                    let display_order = |bytes: &[u8; 32]| {
+                        let mut bytes = *bytes;
+                        bytes.reverse();
+                        bytes
+                    };
+
+                    let (ephemeral_key, ciphertexts) =
+                        transaction::sprout_joinsplit_key_and_ciphertexts(joinsplit);
+
+                    let vpub_old = i64::from(joinsplit.vpub_old());
+                    let vpub_new = i64::from(joinsplit.vpub_new());
+                    let vpub_old_amount = Amount::<NonNegative>::try_from(vpub_old)
+                        .expect("vpub_old is a valid non-negative amount");
+                    let vpub_new_amount = Amount::<NonNegative>::try_from(vpub_new)
+                        .expect("vpub_new is a valid non-negative amount");
 
                     JoinSplit {
-                        old_public_value: Zec::from(joinsplit.vpub_old).lossy_zec(),
-                        old_public_value_zat: joinsplit.vpub_old.zatoshis(),
-                        new_public_value: Zec::from(joinsplit.vpub_new).lossy_zec(),
-                        new_public_value_zat: joinsplit.vpub_new.zatoshis(),
-                        anchor: joinsplit.anchor.bytes_in_display_order(),
-                        nullifiers: joinsplit
-                            .nullifiers
-                            .iter()
-                            .map(|n| n.bytes_in_display_order())
-                            .collect(),
-                        commitments: joinsplit
-                            .commitments
-                            .iter()
-                            .map(|c| c.bytes_in_display_order())
-                            .collect(),
-                        one_time_pubkey: ephemeral_key_bytes,
-                        random_seed: joinsplit.random_seed.bytes_in_display_order(),
-                        macs: joinsplit
-                            .vmacs
-                            .iter()
-                            .map(|m| m.bytes_in_display_order())
-                            .collect(),
-                        proof: joinsplit.zkproof.unwrap_or_default(),
-                        ciphertexts: joinsplit
-                            .enc_ciphertexts
-                            .iter()
-                            .map(|c| c.zcash_serialize_to_vec().unwrap_or_default())
-                            .collect(),
+                        old_public_value: Zec::from(vpub_old_amount).lossy_zec(),
+                        old_public_value_zat: vpub_old,
+                        new_public_value: Zec::from(vpub_new_amount).lossy_zec(),
+                        new_public_value_zat: vpub_new,
+                        anchor: display_order(joinsplit.anchor()),
+                        nullifiers: joinsplit.nullifiers().iter().map(display_order).collect(),
+                        commitments: joinsplit.commitments().iter().map(display_order).collect(),
+                        one_time_pubkey: display_order(&ephemeral_key),
+                        random_seed: display_order(joinsplit.random_seed()),
+                        macs: joinsplit.macs().iter().map(display_order).collect(),
+                        proof: joinsplit
+                            .groth_proof_bytes()
+                            .map(|proof| proof.to_vec())
+                            .unwrap_or_default(),
+                        ciphertexts: ciphertexts.iter().map(|c| c.to_vec()).collect(),
                     }
                 })
                 .collect(),
             value_balance: Some(Zec::from(tx.sapling_value_balance().sapling_amount()).lossy_zec()),
             value_balance_zat: Some(tx.sapling_value_balance().sapling_amount().zatoshis()),
-            orchard: Some(Orchard {
-                actions: tx
-                    .orchard_actions()
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .map(|action| {
-                        let spend_auth_sig: [u8; 64] = tx
-                            .orchard_shielded_data()
-                            .and_then(|shielded_data| {
-                                shielded_data
-                                    .actions
-                                    .iter()
-                                    .find(|authorized_action| authorized_action.action == **action)
-                                    .map(|authorized_action| {
-                                        authorized_action.spend_auth_sig.into()
-                                    })
-                            })
-                            .unwrap_or([0; 64]);
-
-                        let cv: [u8; 32] = action.cv.into();
-                        let nullifier: [u8; 32] = action.nullifier.into();
-                        let rk: [u8; 32] = action.rk.into();
-                        let cm_x: [u8; 32] = action.cm_x.into();
-                        let ephemeral_key: [u8; 32] = action.ephemeral_key.into();
-                        let enc_ciphertext: [u8; 580] = action.enc_ciphertext.into();
-                        let out_ciphertext: [u8; 80] = action.out_ciphertext.into();
-
-                        OrchardAction {
-                            cv,
-                            nullifier,
-                            rk,
-                            cm_x,
-                            ephemeral_key,
-                            enc_ciphertext,
-                            spend_auth_sig,
-                            out_ciphertext,
-                        }
-                    })
-                    .collect(),
-                value_balance: Zec::from(tx.orchard_value_balance().orchard_amount()).lossy_zec(),
-                value_balance_zat: tx.orchard_value_balance().orchard_amount().zatoshis(),
-                flags: tx.orchard_shielded_data().map(|data| {
-                    OrchardFlags::new(
-                        data.flags.contains(orchard::Flags::ENABLE_OUTPUTS),
-                        data.flags.contains(orchard::Flags::ENABLE_SPENDS),
-                    )
-                }),
-                anchor: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.shared_anchor.bytes_in_display_order()),
-                proof: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.proof.bytes_in_display_order()),
-                binding_sig: tx
-                    .orchard_shielded_data()
-                    .map(|data| data.binding_sig.into()),
+            orchard: Some(orchard_shaped_object(
+                tx.orchard_bundle(),
+                tx.orchard_value_balance().orchard_amount(),
+            )),
+            ironwood: tx.ironwood_bundle().map(|bundle| {
+                orchard_shaped_object(Some(bundle), tx.ironwood_value_balance().ironwood_amount())
             }),
-            binding_sig: tx.sapling_binding_sig().map(|raw_sig| raw_sig.into()),
-            joinsplit_pub_key: tx.joinsplit_pub_key().map(|raw_key| {
+            binding_sig: tx.sapling_bundle().map(|b| {
+                let sig: [u8; 64] = b.authorization().binding_sig.into();
+                sig
+            }),
+            joinsplit_pub_key: tx.sprout_joinsplit_pub_key().map(|raw_key| {
                 // Display order is reversed in the RPC output.
                 let mut key: [u8; 32] = raw_key.into();
                 key.reverse();
                 key
             }),
-            joinsplit_sig: tx.joinsplit_sig().map(|raw_sig| raw_sig.into()),
-            size: tx.as_bytes().len().try_into().ok(),
+            joinsplit_sig: tx.sprout_bundle().map(|b| b.joinsplit_sig),
+            size: tx.zcash_serialized_size().try_into().ok(),
             time: block_time,
             txid,
             in_active_chain,
@@ -871,9 +1064,127 @@ impl TransactionObject {
             version: tx.version(),
             version_group_id: tx.version_group_id().map(|id| id.to_be_bytes().to_vec()),
             lock_time: tx.raw_lock_time(),
-            expiry_height: tx.expiry_height(),
+            // zcashd includes expiryheight only for Overwinter+ transactions.
+            // For those, expiry_height of 0 means "no expiry" per ZIP-203.
+            expiry_height: if tx.is_overwintered() {
+                Some(tx.expiry_height().unwrap_or(Height(0)))
+            } else {
+                None
+            },
             block_hash,
             block_time,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::{block::Block, serialization::ZcashDeserializeInto};
+
+    /// `vjoinsplit` must be populated for transactions with Sprout JoinSplits.
+    ///
+    /// The existing `getrawtransaction` snapshots all use blocks that predate Sprout, so an empty
+    /// `vjoinsplit` is byte-identical to a correct one there and cannot catch a regression. This
+    /// uses mainnet block 419,201, which contains real JoinSplits.
+    #[test]
+    fn vjoinsplit_is_populated_for_sprout_transactions() {
+        let block: Block = zebra_test::vectors::BLOCK_MAINNET_419201_BYTES
+            .zcash_deserialize_into()
+            .expect("hard-coded test vector must deserialize");
+
+        let tx = block
+            .transactions
+            .iter()
+            .find(|tx| tx.sprout_joinsplit_descriptions().next().is_some())
+            .expect("block 419,201 contains a transaction with JoinSplits")
+            .clone();
+
+        let expected_count = tx.sprout_joinsplit_descriptions().count();
+        assert!(expected_count > 0);
+
+        let object = TransactionObject::from_transaction(
+            tx.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            tx.hash(),
+        );
+
+        assert_eq!(
+            object.joinsplits.len(),
+            expected_count,
+            "every JoinSplit must appear in vjoinsplit",
+        );
+
+        // Field-level check against the parsed transaction, in the RPC's display byte order.
+        let joinsplit = tx
+            .sprout_joinsplit_descriptions()
+            .next()
+            .expect("the transaction has JoinSplits");
+        let rendered = &object.joinsplits[0];
+
+        let reversed = |bytes: &[u8; 32]| {
+            let mut bytes = *bytes;
+            bytes.reverse();
+            bytes
+        };
+
+        assert_eq!(rendered.anchor, reversed(joinsplit.anchor()));
+        assert_eq!(rendered.nullifiers[0], reversed(&joinsplit.nullifiers()[0]));
+        assert_eq!(
+            rendered.commitments[0],
+            reversed(&joinsplit.commitments()[0])
+        );
+        assert_eq!(rendered.random_seed, reversed(joinsplit.random_seed()));
+        assert_eq!(rendered.macs[0], reversed(&joinsplit.macs()[0]));
+        assert_eq!(
+            rendered.old_public_value_zat,
+            i64::from(joinsplit.vpub_old())
+        );
+        assert_eq!(
+            rendered.new_public_value_zat,
+            i64::from(joinsplit.vpub_new())
+        );
+
+        // These two fields have no upstream accessor and are read back out of the wire encoding.
+        assert_eq!(rendered.ciphertexts.len(), 2);
+        assert!(rendered.ciphertexts.iter().all(|c| c.len() == 601));
+        assert_ne!(
+            rendered.one_time_pubkey, [0u8; 32],
+            "the ephemeral key must be read from the JoinSplit, not left zeroed",
+        );
+
+        // V4 JoinSplits carry Groth16 proofs.
+        assert_eq!(rendered.proof.len(), 192);
+    }
+
+    /// The `Default` impl and coinbase path legitimately have no JoinSplits.
+    #[test]
+    fn vjoinsplit_is_empty_for_coinbase() {
+        let block: Block = zebra_test::vectors::BLOCK_MAINNET_419201_BYTES
+            .zcash_deserialize_into()
+            .expect("hard-coded test vector must deserialize");
+
+        let coinbase = block.transactions[0].clone();
+        assert!(coinbase.is_coinbase());
+
+        let object = TransactionObject::from_transaction(
+            coinbase.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            coinbase.hash(),
+        );
+
+        assert!(object.joinsplits.is_empty());
+        assert!(TransactionObject::default().joinsplits.is_empty());
     }
 }

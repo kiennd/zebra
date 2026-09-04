@@ -4,6 +4,12 @@ use std::{io, net::Ipv6Addr, sync::Arc};
 
 use super::{AtLeastOne, CompactSizeMessage, SerializationError, MAX_PROTOCOL_MESSAGE_LEN};
 
+/// Initial-allocation cap for `zcash_deserialize_external_count`.
+///
+/// 1024 is large enough that honest messages amortize their growth to a few
+/// reallocations.
+const MAX_INITIAL_ALLOCATION: usize = 1024;
+
 /// Consensus-critical deserialization for Zcash.
 ///
 /// This trait provides a generic deserialization for consensus-critical
@@ -37,7 +43,8 @@ impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for Vec<T> {
 impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T> {
     fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
         let v: Vec<T> = (&mut reader).zcash_deserialize_into()?;
-        v.try_into()
+        let at_least_one: AtLeastOne<T> = v.try_into()?;
+        Ok(at_least_one)
     }
 }
 
@@ -92,7 +99,11 @@ pub fn zcash_deserialize_external_count<R: io::Read, T: ZcashDeserialize + Trust
         // for 128 bit memory spaces.)
         Err(_) => return Err(SerializationError::Parse("Vector longer than u64::MAX")),
     }
-    let mut vec = Vec::with_capacity(external_count);
+    // Cap the upfront reservation. The Vec grows via push() as elements
+    // arrive, so a peer-supplied `external_count` can't force a large
+    // allocation before any data is read. Fixes the deserializer-level
+    // case of GHSA-xr93-pcq3-pxf8.
+    let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
     for _ in 0..external_count {
         vec.push(T::zcash_deserialize(&mut reader)?);
     }
@@ -156,6 +167,24 @@ impl ZcashDeserialize for Ipv6Addr {
 
         Ok(Ipv6Addr::from(ipv6_addr))
     }
+}
+
+/// Consensus-critical deserialization with additional context.
+///
+/// Some types (e.g., `Transaction`, `Block`) require external context for
+/// deserialization that is not present in the byte stream itself. For example,
+/// `zcash_primitives::transaction::Transaction::read()` requires a `BranchId`
+/// which, for pre-V5 transactions, must be derived from the block height and
+/// network.
+///
+/// This trait extends `ZcashDeserialize` for types that need context without
+/// changing the signature of the context-free trait.
+pub trait ZcashDeserializeWithContext<C>: Sized {
+    /// Try to read `self` from the given `reader`, using the provided `context`.
+    fn zcash_deserialize_with_context<R: io::Read>(
+        reader: R,
+        context: &C,
+    ) -> Result<Self, SerializationError>;
 }
 
 /// Helper for deserializing more succinctly via type inference

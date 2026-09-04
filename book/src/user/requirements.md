@@ -6,14 +6,14 @@ Zebra has the following hardware requirements.
 
 - 4 CPU cores
 - 16 GB RAM
-- 300 GB available disk space 
+- 300 GB available disk space
 - 100 Mbps network connection, with 300 GB of uploads and downloads per month
 
 ## Minimum Hardware Requirements
 
 - 2 CPU cores
 - 4 GB RAM
-- 300 GB available disk space 
+- 300 GB available disk space
 
 [Zebra has successfully run on an Orange Pi Zero 2W with a 512 GB microSD card
 without any issues.](https://x.com/Zerodartz/status/1811460885996798159)
@@ -21,7 +21,9 @@ without any issues.](https://x.com/Zerodartz/status/1811460885996798159)
 ## Disk Requirements
 
 Zebra uses around 300 GB for cached Mainnet data, and 10 GB for cached Testnet
-data. We expect disk usage to grow over time.
+data. We expect disk usage to grow over time. Syncing from a
+[state snapshot](./snapshots.md) temporarily needs about twice that while the
+archive is extracted.
 
 Zebra cleans up its database periodically, and also when you shut it down or
 restart it. Changes are committed using RocksDB database transactions. If you
@@ -37,11 +39,18 @@ Zebra uses the following inbound and outbound TCP ports:
 - 18233 on Testnet
 
 If you configure Zebra with a specific
-[`listen_addr`](https://docs.rs/zebra_network/latest/zebra_network/struct.Config.html#structfield.listen_addr),
+[`listen_addr`](https://docs.rs/zebra-network/latest/zebra_network/config/struct.Config.html#structfield.listen_addr),
 it will advertise this address to other nodes for inbound connections. Outbound
-connections are required to sync, inbound connections are optional. Zebra also
-needs access to the Zcash DNS seeders, via the OS DNS resolver (usually port
-53).
+connections are required to sync, inbound connections are optional but
+recommended. Zebra also needs access to the Zcash DNS seeders, via the OS DNS
+resolver (usually port 53).
+
+If Zebra runs in Docker, publish the P2P port with `-p 8233:8233` (Mainnet) or
+`-p 18233:18233` (Testnet) so other peers can connect to it. See the
+[P2P section of the Docker guide](./docker.md#p2p-networking) for details. If
+the node sits behind a firewall or NAT, open the P2P port and consider setting
+[`external_addr`](https://docs.rs/zebra-network/latest/zebra_network/config/struct.Config.html#structfield.external_addr)
+to your public IP so peers can discover it.
 
 Zebra makes outbound connections to peers on any port. But `zcashd` prefers
 peers on the default ports, so that it can't be used for DDoS attacks on other

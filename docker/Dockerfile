@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# check=skip=UndefinedVar,UserExist # We use gosu in the entrypoint instead of USER directive
+# check=skip=UndefinedVar,UserExist # We use setpriv in the entrypoint instead of USER directive
 
 # If you want to include a file in the Docker image, add it to .dockerignore.
 #
@@ -13,7 +13,7 @@
 # We first set default values for build arguments used across the stages.
 # Each stage must define the build arguments (ARGs) it uses.
 
-ARG RUST_VERSION=1.89.0
+ARG RUST_VERSION=1.91.0
 
 ARG FEATURES="default-release-binaries"
 
@@ -25,18 +25,24 @@ ARG CARGO_HOME="${HOME}/.cargo"
 ARG CARGO_TARGET_DIR="${HOME}/target"
 
 # This stage prepares Zebra's build deps and captures build args as env vars.
-FROM rust:${RUST_VERSION}-trixie AS deps
+# rust:1.91.0-trixie
+FROM rust:${RUST_VERSION}-trixie@sha256:a0dba1c1b2c90585fc44421b55ddf8063323760dc644ba1d35f5b389ad3e8e14 AS deps
 SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 
 # Make the build platform available as a variable
 ARG BUILDPLATFORM
 
+# Forwarded from the caller workflow so rustc, dpkg, and other tools honour it.
+# A non-empty default is required: an empty value makes clang and usermod error.
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
 # Install zebra build deps
 RUN apt-get -qq update && \
     apt-get -qq install -y --no-install-recommends \
-    libclang-dev \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+    libclang-dev=1:19.0-* \
+    protobuf-compiler=3.21.12-* \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/log/* /var/cache/ldconfig/aux-cache
 
 # Build arguments and variables
 ARG CARGO_INCREMENTAL
@@ -53,6 +59,7 @@ ENV CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
 # We also download needed dependencies for tests to work, from other images.
 # An entrypoint.sh is only available in this step for easier test handling with variables.
 FROM deps AS tests
+SHELL ["/bin/bash", "-xo", "pipefail", "-c"]
 
 ARG SHORT_SHA
 ARG FEATURES
@@ -83,9 +90,9 @@ WORKDIR ${HOME}
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
-# Download and install the pre-built cargo-nextest binary.
+# Download and install cargo-nextest, curl and librocksdb-dev.
 RUN apt-get -qq update && \
-    apt-get -qq install -y --no-install-recommends curl && \
+    apt-get -qq install -y --no-install-recommends librocksdb-dev=9.10.0-* curl=8.14.1-* && \
     mkdir -p "${CARGO_HOME}/bin" && \
     case ${BUILDPLATFORM:-linux/$(uname -m)} in \
         "linux/amd64"|"linux/x86_64") ARCH="linux" ;; \
@@ -95,7 +102,10 @@ RUN apt-get -qq update && \
     curl -LsSf "https://get.nexte.st/latest/${ARCH}" | tar zxf - -C "${CARGO_HOME}/bin" && \
     apt-get -qq remove --purge -y curl && \
     apt-get -qq autoremove -y && \
-    rm -rf /var/lib/apt/lists/* /tmp/*
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/log/* /var/cache/ldconfig/aux-cache
+
+# Link RocksDB dynamically for faster test builds.
+ENV ROCKSDB_LIB_DIR="/usr/lib/"
 
 # Copy source code first to ensure consistent timestamps
 COPY --link --chown=${UID}:${GID} ./ ${HOME}
@@ -114,12 +124,13 @@ RUN [ -n "${SHORT_SHA}" ] && export SHORT_SHA="${SHORT_SHA}" || true; \
     chown -R ${UID}:${GID} ${CARGO_HOME} && \
     chown -R ${UID}:${GID} ${CARGO_TARGET_DIR}
 
-# Copy the lightwalletd binary and source files to be able to run tests
-COPY --link --from=electriccoinco/lightwalletd:v0.4.17 /usr/local/bin/lightwalletd /usr/local/bin/
-
-# Copy the gosu binary to be able to run the entrypoint as non-root user
-# and allow to change permissions for mounted cache directories
-COPY --link --from=tianon/gosu:trixie /gosu /usr/local/bin/
+# Copy the lightwalletd binary and source files to be able to run tests.
+#
+# This must be a lightwalletd release that can parse the transaction versions in
+# the blocks the tests sync: v6 transactions (version group ID 0xD884B698) were
+# introduced by NU6.3, so anything older than v0.5.0 stalls at the NU6.3
+# activation height and the lightwalletd tests time out.
+COPY --link --from=electriccoinco/lightwalletd:v0.5.3 /usr/local/bin/lightwalletd /usr/local/bin/
 
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
@@ -143,6 +154,9 @@ WORKDIR ${HOME}
 ARG CARGO_HOME
 ARG CARGO_TARGET_DIR
 
+# Strip absolute build paths from the binary so it doesn't depend on the build layout.
+ENV RUSTFLAGS="--remap-path-prefix=${HOME}=/zebra --remap-path-prefix=${CARGO_HOME}=/cargo"
+
 RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
     --mount=type=bind,source=tower-fallback,target=tower-fallback \
     --mount=type=bind,source=zebra-chain,target=zebra-chain \
@@ -165,10 +179,14 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
 
 # This stage starts from scratch using Debian and copies the built zebrad binary
 # from the `release` stage along with other binaries and files.
-FROM debian:trixie-slim AS runtime
+# debian:trixie-slim
+FROM debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 AS runtime
 
 ARG FEATURES
 ENV FEATURES=${FEATURES}
+
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 # Create a non-privileged user for running `zebrad`.
 #
@@ -178,7 +196,7 @@ ENV FEATURES=${FEATURES}
 #
 # We do not use the `--system` flag for user creation since:
 # 1. System user ranges (100-999) can collide with host system users
-#   (see: https://github.com/nginxinc/docker-nginx/issues/490)
+#   (see: https://github.com/nginx/docker-nginx/issues/490)
 # 2. There's no value added and warning messages can be raised at build time
 #   (see: https://github.com/dotnet/dotnet-docker/issues/4624)
 #
@@ -196,9 +214,9 @@ ENV HOME=${HOME}
 # Install curl for healtchecks and adduser for user/group creation
 RUN apt-get -q update && \
     apt-get -q install -y --no-install-recommends \
-    adduser \
-    curl \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+    adduser=3.152* \
+    curl=8.14.1-* \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/log/* /var/cache/ldconfig/aux-cache
 
 RUN addgroup --quiet --gid ${GID} ${USER} && \
     adduser --quiet --gid ${GID} --uid ${UID} --home ${HOME} ${USER} --disabled-password --gecos ""
@@ -207,13 +225,12 @@ WORKDIR ${HOME}
 RUN chown -R ${UID}:${GID} ${HOME}
 
 # We're explicitly NOT using the USER directive here.
-# Instead, we run as root initially and use gosu in the entrypoint.sh
+# Instead, we run as root initially and use setpriv in the entrypoint.sh
 # to step down to the non-privileged user. This allows us to change permissions
 # on mounted volumes before running the application as a non-root user.
-# User with UID=${UID} is created above and used via gosu in entrypoint.sh.
+# User with UID=${UID} is created above and used via setpriv in entrypoint.sh.
+# setpriv is part of util-linux, already included in debian:trixie-slim.
 
-# Copy the gosu binary to be able to run the entrypoint as non-root user
-COPY --link --from=tianon/gosu:trixie /gosu /usr/local/bin/
 COPY --link --from=release /usr/local/bin/zebrad /usr/local/bin/
 COPY --link --chown=${UID}:${GID} ./docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
@@ -228,3 +245,32 @@ CMD ["zebrad"]
 # - with mining enabled using S-nomp and `nheqminer`.
 #
 # We can add further functionality to this stage for further purposes.
+
+# zcashd-compat runtime image: the runtime image plus the hash-pinned zcashd
+# wallet sidecar (and its RPC client) from the ZcashFoundation/zcashd
+# `zebra-compat` release, for the supervised sidecar configuration
+# (`zebrad start --zcashd-compat` with `manage_zcashd = true`).
+#
+# The sidecar release only ships x86_64 Linux binaries, so this stage is
+# amd64-only (CI already builds non-`runtime` targets for amd64 only).
+# Override the ARGs to bake in a different sidecar release.
+FROM runtime AS runtime-zcashd-compat
+
+ARG ZCASHD_COMPAT_ARCHIVE_URL="https://github.com/ZcashFoundation/zcashd/releases/download/zebra-compat-v1.1.0/zcashd-zebra-compat-v1.1.0-linux-x86_64.tar.gz"
+ARG ZCASHD_COMPAT_ARCHIVE_SHA256="92f47c6ff84a99cf6c911f47c03d70d4a5181870cdc87dcb49036d1d4c346567"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# ca-certificates is needed for the HTTPS download: curl is installed above
+# with --no-install-recommends, which skips it.
+RUN apt-get -q update && \
+    apt-get -q install -y --no-install-recommends \
+    ca-certificates=20250419 \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/log/* /var/cache/ldconfig/aux-cache \
+    && curl -fsSL "${ZCASHD_COMPAT_ARCHIVE_URL}" -o /tmp/zcashd.tar.gz \
+    && echo "${ZCASHD_COMPAT_ARCHIVE_SHA256}  /tmp/zcashd.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/zcashd.tar.gz -C /tmp ./bin/zcashd ./bin/zcash-cli \
+    && install -m 0755 /tmp/bin/zcashd /tmp/bin/zcash-cli /usr/local/bin/ \
+    && rm -rf /tmp/zcashd.tar.gz /tmp/bin \
+    && /usr/local/bin/zcashd --version \
+    && /usr/local/bin/zcash-cli --version

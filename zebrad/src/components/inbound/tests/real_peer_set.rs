@@ -341,8 +341,10 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
     // We respond with an unrelated transaction, so the peer gives up on the request.
     let unrelated_response: Transaction =
         zebra_test::vectors::DUMMY_TX1.zcash_deserialize_into()?;
-    let unrelated_response =
-        Response::Transactions(vec![Available((unrelated_response.into(), None))]);
+    let unrelated_response = Response::Transactions(vec![Available((
+        std::sync::Arc::new(unrelated_response).into(),
+        None,
+    ))]);
 
     let (
         // real services
@@ -487,7 +489,7 @@ async fn outbound_tx_unrelated_response_notfound() -> Result<(), crate::BoxError
 async fn outbound_tx_partial_response_notfound() -> Result<(), crate::BoxError> {
     // We repeatedly respond with the same transaction, so the peer gives up on the second response.
     let repeated_tx: Transaction = zebra_test::vectors::DUMMY_TX1.zcash_deserialize_into()?;
-    let repeated_tx: UnminedTx = repeated_tx.into();
+    let repeated_tx: UnminedTx = std::sync::Arc::new(repeated_tx).into();
     let repeated_response = Response::Transactions(vec![
         Available((repeated_tx.clone(), None)),
         Available((repeated_tx.clone(), None)),
@@ -620,7 +622,12 @@ async fn setup(
     Buffer<BoxService<zebra_state::Request, zebra_state::Response, BoxError>, zebra_state::Request>,
     // mocked services
     MockService<zebra_consensus::Request, block::Hash, PanicAssertion, RouterError>,
-    MockService<transaction::Request, transaction::Response, PanicAssertion, TransactionError>,
+    MockService<
+        transaction::MempoolRequest,
+        transaction::MempoolResponse,
+        PanicAssertion,
+        TransactionError,
+    >,
     // real tasks
     JoinHandle<Result<(), BlockGossipError>>,
     JoinHandle<Result<(), BoxError>>,
@@ -700,6 +707,7 @@ async fn setup(
     let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let mempool_config = MempoolConfig::default();
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
+        &network,
         &mempool_config,
         peer_set.clone(),
         state_service.clone(),

@@ -31,10 +31,17 @@ image](https://hub.docker.com/r/zfnd/zebra/tags) or you can install it manually.
 This command will run our latest release, and sync it to the tip:
 
 ```sh
-docker run zfnd/zebra:latest
+docker run -d \
+  --name zebra \
+  -p 8233:8233 \
+  -v zebrad-cache:/home/zebra/.cache/zebra \
+  zfnd/zebra:latest
 ```
 
-For more information, read our [Docker documentation](https://zebra.zfnd.org/user/docker.html).
+The `-p 8233:8233` flag exposes the P2P port so other Zcash nodes can connect to
+yours, and `-v` persists the chain state across restarts (use port `18233` for
+Testnet). For more information, read our [Docker
+documentation](https://zebra.zfnd.org/user/docker.html).
 
 ### Manual Install
 
@@ -43,6 +50,7 @@ Building Zebra requires [Rust](https://www.rust-lang.org/tools/install),
 compiler. Below are quick summaries for installing these dependencies.
 
 [//]: # "The empty lines in the `summary` tag below are required for correct Markdown rendering."
+
 <details><summary>
 
 #### General Instructions for Installing Dependencies
@@ -60,6 +68,7 @@ compiler. Below are quick summaries for installing these dependencies.
 </details>
 
 [//]: # "The empty lines in the `summary` tag below are required for correct Markdown rendering."
+
 <details><summary>
 
 #### Dependencies on Arch Linux
@@ -70,8 +79,22 @@ compiler. Below are quick summaries for installing these dependencies.
 sudo pacman -S rust clang protobuf
 ```
 
-Note that the package `clang` includes `libclang` as well. The GCC version on
-Arch Linux has a broken build script in a `rocksdb` dependency. A workaround is:
+Note that the package `clang` includes `libclang` as well. If you hit a
+compiling failure in `rocksdb`, see the [GCC 15 workaround](#gcc-15-workaround)
+below.
+
+</details>
+
+<details><summary>
+
+#### GCC 15 workaround
+
+</summary>
+
+GCC 15, which is the default on many recent distros like Arch Linux and Ubuntu
+25 onwards, introduces a compiling failure in the version of the `rocksdb`
+dependency used by Zebra. A workaround is running the following before
+installing Zebra:
 
 ```sh
 export CXXFLAGS="$CXXFLAGS -include cstdint"
@@ -79,7 +102,20 @@ export CXXFLAGS="$CXXFLAGS -include cstdint"
 
 </details>
 
-Once you have the dependencies in place, you can install Zebra with:
+On `x86_64` or `aarch64` Linux (glibc 2.34+), you can skip the build dependencies
+and download a signed, pre-built binary with
+[`cargo binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall zebrad
+```
+
+The same binaries are attached to each
+[GitHub release](https://github.com/ZcashFoundation/zebra/releases), with a
+SHA-256 checksum, a Sigstore build-provenance attestation, and a Cosign signature.
+
+Otherwise, once you have the dependencies in place, you can build and install
+Zebra from source with:
 
 ```sh
 cargo install --locked zebrad
@@ -88,7 +124,7 @@ cargo install --locked zebrad
 Alternatively, you can install it from GitHub:
 
 ```sh
-cargo install --git https://github.com/ZcashFoundation/zebra --tag v2.5.0 zebrad
+cargo install --git https://github.com/ZcashFoundation/zebra --tag v6.0.0 zebrad
 ```
 
 You can start Zebra by running
@@ -133,7 +169,7 @@ The Zcash Foundation maintains the following resources documenting Zebra:
   APIs](https://docs.rs/zebrad/latest/zebrad/#zebra-crates) for the latest
   releases of the individual Zebra crates.
 
-- The [documentation of the internal APIs](https://doc-internal.zebra.zfnd.org)
+- The [documentation of the internal APIs](https://zebra.zfnd.org/internal)
   for the `main` branch of the whole Zebra monorepo.
 
 ## User support

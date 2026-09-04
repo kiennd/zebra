@@ -2,10 +2,11 @@
 //!
 //! A service that manages known unmined Zcash transactions.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, net::SocketAddr};
 
 use tokio::sync::oneshot;
 use zebra_chain::{
+    block,
     transaction::{self, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
@@ -84,6 +85,20 @@ pub enum Request {
     /// The transaction downloader checks for duplicates across IDs and transactions.
     Queue(Vec<Gossip>),
 
+    /// Queue candidate transactions received from a specific peer — either
+    /// transaction IDs advertised via an `Inv` message, or a full transaction
+    /// pushed via a `Tx` message — tagging each one with the sending peer so the
+    /// downloader can enforce a per-peer queue cap. This routes every
+    /// peer-originated candidate through the same per-peer admission accounting,
+    /// so a single peer cannot crowd out honest peers' transaction relay.
+    /// See `GHSA-4fc2-h7jh-287c` and `GHSA-m9xx-8rcj-vmgp`.
+    QueueFromPeer {
+        /// The candidate transactions received from the peer.
+        candidates: Vec<Gossip>,
+        /// The address of the peer that sent them.
+        source: SocketAddr,
+    },
+
     /// Check for newly verified transactions.
     ///
     /// The transaction downloader does not push transactions into the mempool.
@@ -107,6 +122,9 @@ pub enum Request {
 
     /// Request summary statistics from the mempool for `getmempoolinfo`.
     QueueStats,
+
+    /// Check whether a transparent output is spent in the mempool.
+    UnspentOutput(transparent::OutPoint),
 }
 
 /// A response to a mempool service request.
@@ -176,4 +194,23 @@ pub enum Response {
         /// Whether all transactions have been fully notified (regtest only)
         fully_notified: Option<bool>,
     },
+
+    /// Returns whether a transparent output is created or spent in the mempool, if present.
+    TransparentOutput(Option<CreatedOrSpent>),
+}
+
+/// Indicates whether an output was created or spent by a mempool transaction.
+#[derive(Debug)]
+pub enum CreatedOrSpent {
+    /// An unspent output that was created by a transaction in the mempool and not spent by any other mempool tx.
+    Created {
+        /// The output
+        output: transparent::Output,
+        /// The version
+        tx_version: u32,
+        /// The last seen hash
+        last_seen_hash: block::Hash,
+    },
+    /// Indicates that an output was spent by a mempool transaction.
+    Spent,
 }

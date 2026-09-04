@@ -1,16 +1,21 @@
 [package]
 name = "zebra-consensus"
-version = "3.1.1"
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+version = "15.0.0"
+authors.workspace = true
 description = "Implementation of Zcash consensus checks"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/ZcashFoundation/zebra"
-edition = "2021"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Disable bench auto-discovery so `benches/common.rs` is only compiled when
+# explicitly imported via `mod common;` from a bench.
+autobenches = false
 
 readme = "../README.md"
-homepage = "https://zfnd.org/zebra/"
+homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
-keywords = ["zebra", "zcash"]
+keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>
 categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
@@ -24,10 +29,11 @@ progress-bar = [
     "zebra-state/progress-bar",
 ]
 
-tx_v6 = ["zebra-chain/tx_v6", "zebra-state/tx_v6"]
-
 # Test-only features
 proptest-impl = ["proptest", "proptest-derive", "zebra-chain/proptest-impl", "zebra-state/proptest-impl"]
+
+# Exposes `block` (equihash + block::check) to fuzz harnesses; private in normal builds.
+fuzzing = []
 
 [dependencies]
 blake2b_simd = { workspace = true }
@@ -56,15 +62,19 @@ derive-getters = { workspace = true, features = ["auto_copy_getters"] }
 sapling-crypto = { workspace = true, features = ["multicore"]}
 orchard.workspace = true
 
+zcash_primitives.workspace = true
 zcash_proofs = { workspace = true, features = ["multicore", "bundled-prover"] }
+zcash_transparent = { workspace = true }
+libzcash_script = { workspace = true }
+zcash_script = { workspace = true }
 
-tower-fallback = { path = "../tower-fallback/", version = "0.2.41" }
-tower-batch-control = { path = "../tower-batch-control/", version = "1.0.1" }
+tower-fallback = { path = "../tower-fallback/", version = "0.2.43" }
+tower-batch-control = { path = "../tower-batch-control/", version = "1.1.1" }
 
-zebra-script = { path = "../zebra-script", version = "3.0.1" }
-zebra-state = { path = "../zebra-state", version = "3.1.1" }
-zebra-node-services = { path = "../zebra-node-services", version = "2.1.1" }
-zebra-chain = { path = "../zebra-chain", version = "3.1.0" }
+zebra-script = { path = "../zebra-script", version = "11.0.0" }
+zebra-state = { path = "../zebra-state", version = "13.0.0" }
+zebra-node-services = { path = "../zebra-node-services", version = "10.0.0" }
+zebra-chain = { path = "../zebra-chain", version = "12.0.0" }
 
 zcash_protocol.workspace = true
 
@@ -79,6 +89,7 @@ proptest-derive = { workspace = true, optional = true }
 color-eyre = { workspace = true }
 
 hex = { workspace = true }
+nonempty = { workspace = true }
 num-integer = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
@@ -88,9 +99,23 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 tracing-error = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-zebra-state = { path = "../zebra-state", version = "3.1.1", features = ["proptest-impl"] }
-zebra-chain = { path = "../zebra-chain", version = "3.1.0", features = ["proptest-impl"] }
-zebra-test = { path = "../zebra-test/", version = "2.0.1" }
+zebra-state = { path = "../zebra-state", features = ["proptest-impl"] }
+zebra-chain = { path = "../zebra-chain", features = ["proptest-impl"] }
+zebra-test = { path = "../zebra-test/" }
+
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[bench]]
+name = "groth16"
+harness = false
+
+[[bench]]
+name = "halo2"
+harness = false
+
+[[bench]]
+name = "sapling"
+harness = false
 
 [lints]
 workspace = true

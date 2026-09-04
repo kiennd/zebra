@@ -709,7 +709,6 @@ fn calculate_sapling_subtree(
         let sapling_note_commitments = block
             .sapling_note_commitments()
             .take(prev_remaining_notes)
-            .cloned()
             .collect();
 
         // This takes less than 1 second per tree, so we don't need to make it cancellable.
@@ -834,7 +833,6 @@ fn calculate_orchard_subtree(
         let orchard_note_commitments = block
             .orchard_note_commitments()
             .take(prev_remaining_notes)
-            .cloned()
             .collect();
 
         // This takes less than 1 second per tree, so we don't need to make it cancellable.
@@ -884,7 +882,7 @@ fn write_sapling_subtree(
         .write_batch(batch)
         .expect("writing sapling note commitment subtrees should always succeed.");
 
-    if subtree.index.0.is_multiple_of(100) {
+    if subtree.index.0 % 100 == 0 {
         info!(end_height = ?subtree.end_height, index = ?subtree.index.0, "calculated and added sapling subtree");
     }
     // This log happens about once per second on recent machines with SSD disks.
@@ -904,7 +902,7 @@ fn write_orchard_subtree(
         .write_batch(batch)
         .expect("writing orchard note commitment subtrees should always succeed.");
 
-    if subtree.index.0.is_multiple_of(100) {
+    if subtree.index.0 % 100 == 0 {
         info!(end_height = ?subtree.end_height, index = ?subtree.index.0, "calculated and added orchard subtree");
     }
     // This log happens about once per second on recent machines with SSD disks.

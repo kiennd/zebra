@@ -11,8 +11,9 @@ use tracing::instrument;
 use zebra_chain::{block, transparent};
 
 use crate::{
-    error::QueueAndCommitError, BoxError, CheckpointVerifiedBlock, CommitSemanticallyVerifiedError,
-    NonFinalizedState, SemanticallyVerifiedBlock,
+    error::{CommitBlockError, CommitCheckpointVerifiedError},
+    CheckpointVerifiedBlock, CommitSemanticallyVerifiedError, KnownBlock, NonFinalizedState,
+    SemanticallyVerifiedBlock,
 };
 
 #[cfg(test)]
@@ -21,7 +22,7 @@ mod tests;
 /// A queued checkpoint verified block, and its corresponding [`Result`] channel.
 pub type QueuedCheckpointVerified = (
     CheckpointVerifiedBlock,
-    oneshot::Sender<Result<block::Hash, BoxError>>,
+    oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
 );
 
 /// A queued semantically verified block, and its corresponding [`Result`] channel.
@@ -106,7 +107,14 @@ impl QueuedBlocks {
             .collect::<Vec<_>>();
 
         for queued in &queued_children {
-            self.by_height.remove(&queued.0.height);
+            if let Some(hashes) = self.by_height.get_mut(&queued.0.height) {
+                hashes.remove(&queued.0.hash);
+
+                if hashes.is_empty() {
+                    self.by_height.remove(&queued.0.height);
+                }
+            }
+
             // TODO: only remove UTXOs if there are no queued blocks with that UTXO
             //       (known_utxos is best-effort, so this is ok for now)
             for outpoint in queued.0.new_outputs.keys() {
@@ -139,15 +147,17 @@ impl QueuedBlocks {
         let mut by_height = self.by_height.split_off(&split_height);
         mem::swap(&mut self.by_height, &mut by_height);
 
-        for hash in by_height.into_iter().flat_map(|(_, hashes)| hashes) {
+        for hash in by_height.into_values().flatten() {
             let (expired_block, expired_sender) =
                 self.blocks.remove(&hash).expect("block is present");
             let parent_hash = &expired_block.block.header.previous_block_hash;
 
             // we don't care if the receiver was dropped
-            let _ = expired_sender.send(Err(
-                QueueAndCommitError::new_pruned(expired_block.height).into()
-            ));
+            let _ = expired_sender.send(Err(CommitBlockError::new_duplicate(
+                Some(expired_block.height.into()),
+                KnownBlock::Finalized,
+            )
+            .into()));
 
             // TODO: only remove UTXOs if there are no queued blocks with that UTXO
             //       (known_utxos is best-effort, so this is ok for now)
@@ -368,6 +378,27 @@ impl SentHashes {
     /// Returns true if SentHashes contains the `hash`
     pub fn contains(&self, hash: &block::Hash) -> bool {
         self.sent.contains_key(hash)
+    }
+
+    /// Removes a `hash` from `SentHashes`, dropping its outpoints from `known_utxos`
+    /// and its entry from whichever batch buffer holds it.
+    ///
+    /// Called when the block write task rejects a block, so that a subsequent
+    /// re-delivery of a block with the same hash is not short-circuited as a
+    /// "duplicate" against a rejected variant that never reached any chain.
+    pub fn remove(&mut self, hash: &block::Hash) {
+        let Some(outpoints) = self.sent.remove(hash) else {
+            return;
+        };
+
+        for outpoint in &outpoints {
+            self.known_utxos.remove(outpoint);
+        }
+
+        self.curr_buf.retain(|(h, _)| h != hash);
+        for buf in &mut self.bufs {
+            buf.retain(|(h, _)| h != hash);
+        }
     }
 
     /// Returns true if the chain can be forked at the provided hash

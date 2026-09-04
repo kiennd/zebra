@@ -19,6 +19,26 @@ on:
     # This is limited to the Zebra and lightwalletd Full Sync jobs
     - cron: 0 12 * * 5
 
+  #! Only this repository runs the weekly `schedule`. A copy of this workflow in any other
+  #! repository is scheduled independently by GitHub and would deploy into the same GCP
+  #! project, colliding on instance and disk names.
+  #!
+  #! The schedule guard means: "Run unless this is a scheduled event in the wrong repository."
+  #!
+  #! | Event           | Repository               | Guard |
+  #! |-----------------|--------------------------|-------|
+  #! | `schedule`      | `ZcashFoundation/zebra`  | true  |
+  #! | `schedule`      | any clone                | false |
+  #! | anything else   | any repository           | true  |
+  #!
+  #! The guard is on the three jobs that have no `needs:` — `build`, `get-available-disks`
+  #! and `get-available-disks-testnet` — so everything downstream skips with them, plus
+  #! `integration-tests-success` because it is `always()` and does not allow `build` to skip.
+  #! Guard any new job without `needs:`, and any downstream job whose `if:` can still be true
+  #! when its guarded dependencies are skipped, such as a job using `always()`.
+  #!
+  #! `workflow_dispatch`, `push` and `pull_request` are deliberately unaffected everywhere.
+
   workflow_dispatch:
     inputs:
       network:
@@ -53,7 +73,7 @@ on:
 
   pull_request:
     branches: [main]
-    types: [labeled]
+    types: [labeled, synchronize, reopened]
 
   push:
     # Run only on main branch updates that modify Rust code or dependencies.
@@ -126,14 +146,16 @@ jobs:
   build:
     name: Build CI Docker
     # Skip PRs from external repositories, let them pass, and then GitHub's Merge Queue will check them
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || github.event.label.name == 'run-stateful-tests') }}
+    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
     permissions:
       contents: read
       id-token: write
       pull-requests: write
       statuses: write
+      attestations: write # required by the called build workflow's merge job
     uses: ./.github/workflows/zfnd-build-docker-image.yml
     with:
+      source_sha: ${{ github.sha }}
       dockerfile_path: ./docker/Dockerfile
       dockerfile_target: tests
       image_name: ${{ vars.CI_IMAGE_NAME }}
@@ -155,7 +177,7 @@ jobs:
   get-available-disks:
     name: Check if cached state disks exist for ${{ inputs.network || vars.ZCASH_NETWORK }}
     # Skip PRs from external repositories, let them pass, and then GitHub's Merge Queue will check them
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || github.event.label.name == 'run-stateful-tests') }}
+    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
     permissions:
       contents: read
       id-token: write
@@ -169,7 +191,7 @@ jobs:
   # Some outputs are ignored, because we don't run those jobs on testnet.
   get-available-disks-testnet:
     name: Check if cached state disks exist for testnet
-    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || github.event.label.name == 'run-stateful-tests') }}
+    if: ${{ (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) && (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') }}
     permissions:
       contents: read
       id-token: write
@@ -203,7 +225,7 @@ jobs:
       app_name: zebrad
       test_id: sync-to-mandatory-checkpoint
       test_description: Test sync up to mandatory checkpoint
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=sync-to-mandatory-checkpoint-${{ (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet' && 'mainnet' || 'testnet' }},TEST_SYNC_TO_CHECKPOINT=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::sync::sync_to_mandatory_checkpoint_${{ (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet' && 'mainnet' || 'testnet' }})"
       network: ${{ inputs.network || vars.ZCASH_NETWORK }}
       # This test commonly less than 3 hours by October 2024, but now it takes longer
       is_long_test: true
@@ -231,7 +253,7 @@ jobs:
       app_name: zebrad
       test_id: sync-past-mandatory-checkpoint
       test_description: Test full validation sync from a cached state
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=sync-past-mandatory-checkpoint-${{ (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet' && 'mainnet' || 'testnet' }},TEST_SYNC_PAST_CHECKPOINT=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::sync::sync_past_mandatory_checkpoint_${{ (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet' && 'mainnet' || 'testnet' }})"
       needs_zebra_state: true
       saves_to_disk: false
       disk_suffix: checkpoint
@@ -256,7 +278,7 @@ jobs:
       contents: read
       id-token: write
     uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
-    if: ${{ github.event_name == 'schedule' || (needs.get-available-disks.result == 'success' && !fromJSON(needs.get-available-disks.outputs.zebra_tip_disk)) || (github.event.inputs.run-full-sync == 'true' && (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet') }}
+    if: ${{ (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') && (github.event_name == 'schedule' || (needs.get-available-disks.result == 'success' && !fromJSON(needs.get-available-disks.outputs.zebra_tip_disk)) || (github.event.inputs.run-full-sync == 'true' && (inputs.network || vars.ZCASH_NETWORK) == 'Mainnet')) }}
     concurrency:
       group: ${{ github.event_name == 'workflow_dispatch' && format('manual-{0}-sync-full-mainnet', github.run_id) || 'sync-full-mainnet' }}
       cancel-in-progress: false
@@ -267,7 +289,7 @@ jobs:
       test_id: sync-full-mainnet
       test_description: Test a full sync up to the tip
       # TODO: update the test to use {{ input.network }} instead?
-      test_variables: ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=sync-full-mainnet,SYNC_FULL_MAINNET_TIMEOUT_MINUTES=0
+      test_variables: ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=ci-e2e,NEXTEST_FILTER=test(=e2e::sync::sync_full_mainnet)
       # This test runs for longer than 6 hours, so it needs multiple jobs
       is_long_test: true
       needs_zebra_state: false
@@ -298,7 +320,7 @@ jobs:
       app_name: zebrad
       test_id: sync-update-mainnet
       test_description: Test syncing to tip with a Zebra tip state
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=sync-update-mainnet"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::sync::sync_update_mainnet)"
       needs_zebra_state: true
       # update the disk on every PR, to increase CI speed
       saves_to_disk: true
@@ -333,7 +355,7 @@ jobs:
       test_id: generate-checkpoints-mainnet
       test_description: Generate Zebra checkpoints on mainnet
       # TODO: update the test to use {{ input.network }} instead?
-      test_variables: ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=generate-checkpoints-mainnet
+      test_variables: ZEBRA_NETWORK__NETWORK=Mainnet,NEXTEST_PROFILE=ci-e2e,NEXTEST_FILTER=test(=e2e::checkpoints::generate_checkpoints_mainnet)
       needs_zebra_state: true
       # sync-update-mainnet updates the disk on every PR, so we don't need to do it here
       saves_to_disk: false
@@ -342,8 +364,7 @@ jobs:
   # zebra testnet checkpoint generation tests
   #
   # These tests will fail when testnet is unstable, they should not be required to merge.
-  #
-  # TODO: ignore failures on testnet, so any failures don't appear in the GitHub interface.
+  # Testnet jobs use continue-on-error so failures don't block PRs or appear as workflow failures.
 
   # Test that Zebra can run a full testnet sync, and regenerate chain tip Zebra cached state disks.
   # This job always runs on testnet, regardless of any inputs or variable settings.
@@ -361,7 +382,7 @@ jobs:
       contents: read
       id-token: write
     uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
-    if: ${{ (needs.get-available-disks-testnet.result == 'success' && !fromJSON(needs.get-available-disks-testnet.outputs.zebra_tip_disk)) || (github.event.inputs.run-full-sync == 'true' && (inputs.network || vars.ZCASH_NETWORK) == 'Testnet') }}
+    if: ${{ (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra') && (github.event_name == 'schedule' || (needs.get-available-disks-testnet.result == 'success' && !fromJSON(needs.get-available-disks-testnet.outputs.zebra_tip_disk)) || (github.event.inputs.run-full-sync == 'true' && (inputs.network || vars.ZCASH_NETWORK) == 'Testnet')) }}
     concurrency:
       group: ${{ github.event_name == 'workflow_dispatch' && format('manual-{0}-sync-full-testnet', github.run_id) || 'sync-full-testnet' }}
       cancel-in-progress: false
@@ -371,7 +392,7 @@ jobs:
       app_name: zebrad
       test_id: sync-full-testnet
       test_description: Test a full sync up to the tip on testnet
-      test_variables: ZEBRA_NETWORK__NETWORK=Testnet,NEXTEST_PROFILE=sync-full-testnet,SYNC_FULL_TESTNET_TIMEOUT_MINUTES=1
+      test_variables: ZEBRA_NETWORK__NETWORK=Testnet,NEXTEST_PROFILE=ci-e2e,NEXTEST_FILTER=test(=e2e::sync::sync_full_testnet)
       network: Testnet
       # A full testnet sync could take 2-10 hours in April 2023.
       # The time varies a lot due to the small number of nodes.
@@ -380,6 +401,7 @@ jobs:
       saves_to_disk: true
       force_save_to_disk: ${{ inputs.force_save_to_disk || false }}
       height_grep_text: current_height.*=.*Height.*\(
+      allow_failure: true
 
   # Test that Zebra can generate testnet checkpoints after syncing to the chain tip,
   # using a cached Zebra tip state.
@@ -406,7 +428,7 @@ jobs:
       app_name: zebrad
       test_id: generate-checkpoints-testnet
       test_description: Generate Zebra checkpoints on testnet
-      test_variables: ZEBRA_NETWORK__NETWORK=Testnet,NEXTEST_PROFILE=generate-checkpoints-testnet
+      test_variables: ZEBRA_NETWORK__NETWORK=Testnet,NEXTEST_PROFILE=ci-e2e,NEXTEST_FILTER=test(=e2e::checkpoints::generate_checkpoints_testnet)
       network: Testnet
       needs_zebra_state: true
       # update the disk on every PR, to increase CI speed
@@ -414,6 +436,7 @@ jobs:
       saves_to_disk: true
       force_save_to_disk: ${{ inputs.force_save_to_disk || false }}
       height_grep_text: zebra_tip_height.*=.*Height.*\(
+      allow_failure: true
 
   # lightwalletd cached tip state tests
 
@@ -444,7 +467,7 @@ jobs:
       app_name: lightwalletd
       test_id: lwd-sync-full
       test_description: Test lightwalletd full sync
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=lwd-sync-full,TEST_LIGHTWALLETD=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-e2e,NEXTEST_FILTER=test(=e2e::lightwalletd::lwd_sync_full),TEST_LIGHTWALLETD=1"
       # This test runs for longer than 6 hours, so it needs multiple jobs
       is_long_test: true
       needs_zebra_state: true
@@ -475,7 +498,7 @@ jobs:
       app_name: lightwalletd
       test_id: lwd-sync-update
       test_description: Test lightwalletd update sync with both states
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=lwd-sync-update,TEST_LIGHTWALLETD=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::lightwalletd::lwd_sync_update),TEST_LIGHTWALLETD=1"
       needs_zebra_state: true
       needs_lwd_state: true
       saves_to_disk: true
@@ -493,8 +516,8 @@ jobs:
   # Otherwise, if the state rebuild was skipped, runs immediately after the build job.
   #
   # TODO: move this job below the rest of the mainnet jobs that just use Zebra cached state
-  lwd-rpc-test:
-    name: Zebra tip JSON-RPC
+  rpc-get-block:
+    name: get block
     needs: [sync-full-mainnet, get-available-disks]
     permissions:
       contents: read
@@ -504,10 +527,10 @@ jobs:
     secrets:
       GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
     with:
-      app_name: lightwalletd
-      test_id: lwd-rpc-test
-      test_description: Test lightwalletd RPC with a Zebra tip state
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=lwd-rpc-test,TEST_LIGHTWALLETD=1"
+      app_name: zebrad
+      test_id: rpc-get-block
+      test_description: Test getblock RPC method via Zebra's rpc server
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::rpc::rpc_get_block_from_cached_state)"
       needs_zebra_state: true
       saves_to_disk: false
 
@@ -533,7 +556,7 @@ jobs:
       app_name: lightwalletd
       test_id: lwd-rpc-send-tx
       test_description: Test sending transactions via lightwalletd
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=lwd-rpc-send-tx,TEST_LIGHTWALLETD=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::lightwalletd::lwd_rpc_send_tx),TEST_LIGHTWALLETD=1"
       needs_zebra_state: true
       needs_lwd_state: true
       saves_to_disk: false
@@ -560,7 +583,7 @@ jobs:
       app_name: lightwalletd
       test_id: lwd-grpc-wallet
       test_description: Test gRPC calls via lightwalletd
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=lwd-grpc-wallet,TEST_LIGHTWALLETD=1"
+      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=ci-stateful,NEXTEST_FILTER=test(=stateful::lightwalletd::lwd_grpc_wallet),TEST_LIGHTWALLETD=1"
       needs_zebra_state: true
       needs_lwd_state: true
       saves_to_disk: false
@@ -568,60 +591,6 @@ jobs:
   ## getblocktemplate RPC tests using cached Zebra state on mainnet
   #
   # TODO: move these below the rest of the mainnet jobs that just use Zebra cached state
-
-  # Test that Zebra can handle a getblocktemplate RPC call, using a cached Zebra tip state
-  #
-  # Runs:
-  # - after every PR is merged to `main`
-  # - on every PR update
-  #
-  # If the state version has changed, waits for the new cached states to be created.
-  # Otherwise, if the state rebuild was skipped, runs immediately after the build job.
-  rpc-get-block-template:
-    name: get block template
-    needs: [sync-full-mainnet, get-available-disks]
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
-    if: ${{ !cancelled() && !failure() && ((needs.get-available-disks.result == 'success' && fromJSON(needs.get-available-disks.outputs.zebra_tip_disk)) || needs.sync-full-mainnet.result == 'success') && github.event.inputs.regenerate-disks != 'true' && github.event.inputs.run-full-sync != 'true' && github.event.inputs.run-lwd-sync != 'true' }}
-    secrets:
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-    with:
-      app_name: zebrad
-      test_id: rpc-get-block-template
-      test_description: Test getblocktemplate RPC method via Zebra's rpc server
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=rpc-get-block-template"
-      needs_zebra_state: true
-      needs_lwd_state: false
-      saves_to_disk: false
-
-  # Test that Zebra can handle a submit block RPC call, using a cached Zebra tip state
-  #
-  # Runs:
-  # - after every PR is merged to `main`
-  # - on every PR update
-  #
-  # If the state version has changed, waits for the new cached states to be created.
-  # Otherwise, if the state rebuild was skipped, runs immediately after the build job.
-  rpc-submit-block:
-    name: submit block
-    needs: [sync-full-mainnet, get-available-disks]
-    permissions:
-      contents: read
-      id-token: write
-    uses: ./.github/workflows/zfnd-deploy-integration-tests-gcp.yml
-    if: ${{ !cancelled() && !failure() && ((needs.get-available-disks.result == 'success' && fromJSON(needs.get-available-disks.outputs.zebra_tip_disk)) || needs.sync-full-mainnet.result == 'success') && github.event.inputs.regenerate-disks != 'true' && github.event.inputs.run-full-sync != 'true' && github.event.inputs.run-lwd-sync != 'true' }}
-    secrets:
-      GCP_SSH_PRIVATE_KEY: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
-    with:
-      app_name: zebrad
-      test_id: rpc-submit-block
-      test_description: Test submitting blocks via Zebra's rpc server
-      test_variables: "ZEBRA_NETWORK__NETWORK=${{ inputs.network || vars.ZCASH_NETWORK }},NEXTEST_PROFILE=rpc-submit-block"
-      needs_zebra_state: true
-      needs_lwd_state: false
-      saves_to_disk: false
 
   failure-issue:
     name: Open or update issues for main branch failures
@@ -638,22 +607,23 @@ jobs:
         sync-update-mainnet,
         generate-checkpoints-mainnet,
         lwd-sync-update,
-        lwd-rpc-test,
+        rpc-get-block,
         lwd-rpc-send-tx,
         lwd-grpc-wallet,
-        rpc-get-block-template,
-        rpc-submit-block,
       ]
     # Only open tickets for failed scheduled jobs, manual workflow runs, or `main` branch merges.
     # (PR statuses are already reported in the PR jobs list, and checked by GitHub's Merge Queue.)
     if: (failure() && github.event.pull_request == null) || (cancelled() && github.event.pull_request == null)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - uses: jayqi/failed-build-issue-action@1a893bbf43ef1c2a8705e2b115cd4f0fe3c5649b #v1.2.0
         with:
           title-template: "{{refname}} branch CI failed: {{eventName}} in {{workflow}}"
           # New failures open an issue with this label.
-          label-name: S-ci-fail-main-branch-auto-issue
+          label-name: ci-fail/main
           # If there is already an open issue with this label, any failures become comments on that issue.
           always-create-new-issue: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -665,7 +635,8 @@ jobs:
       ${{
         always() &&
         (!startsWith(github.event_name, 'pull') || !github.event.pull_request.head.repo.fork) &&
-        (github.event_name != 'pull_request' || github.event.label.name == 'run-stateful-tests')
+        (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-stateful-tests')) &&
+        (github.event_name != 'schedule' || github.repository == 'ZcashFoundation/zebra')
       }}
     needs:
       - build
@@ -678,15 +649,13 @@ jobs:
       - sync-full-testnet
       - generate-checkpoints-testnet
       - lwd-sync-update
-      - lwd-rpc-test
+      - rpc-get-block
       - lwd-rpc-send-tx
       - lwd-grpc-wallet
-      - rpc-get-block-template
-      - rpc-submit-block
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
         with:
-          allowed-skips: sync-to-mandatory-checkpoint,sync-full-mainnet,lwd-sync-full,sync-past-mandatory-checkpoint,sync-update-mainnet,generate-checkpoints-mainnet,sync-full-testnet,generate-checkpoints-testnet,lwd-sync-update,lwd-rpc-test,lwd-rpc-send-tx,lwd-grpc-wallet,rpc-get-block-template,rpc-submit-block
+          allowed-skips: sync-to-mandatory-checkpoint,sync-full-mainnet,lwd-sync-full,sync-past-mandatory-checkpoint,sync-update-mainnet,generate-checkpoints-mainnet,sync-full-testnet,generate-checkpoints-testnet,lwd-sync-update,rpc-get-block,lwd-rpc-send-tx,lwd-grpc-wallet
           jobs: ${{ toJSON(needs) }}

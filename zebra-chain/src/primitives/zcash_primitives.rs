@@ -9,12 +9,13 @@ use zcash_script::script;
 
 use crate::{
     amount::{Amount, NonNegative},
-    parameters::NetworkUpgrade,
     serialization::ZcashSerialize,
-    transaction::{AuthDigest, HashType, SigHash, Transaction},
+    transaction::{HashType, SigHash},
     transparent::{self, Script},
     Error,
 };
+
+use crate::{parameters::NetworkUpgrade, transaction::Transaction};
 
 // TODO: move copied and modified code to a separate module.
 //
@@ -218,59 +219,73 @@ pub(crate) struct PrecomputedTxData {
 impl PrecomputedTxData {
     /// Computes the data used for sighash or txid computation.
     ///
-    /// # Inputs
-    ///
-    /// - `tx`: the relevant transaction.
-    /// - `nu`: the network upgrade to which the transaction belongs.
-    /// - `all_previous_outputs`: the transparent Output matching each transparent input in `tx`.
-    ///
-    /// # Errors
-    ///
-    /// - If `tx` can't be converted to its `librustzcash` equivalent.
-    /// - If `nu` doesn't contain a consensus branch id convertible to its `librustzcash`
-    ///   equivalent.
-    ///
-    /// # Consensus
-    ///
-    /// > [NU5 only, pre-NU6] All transactions MUST use the NU5 consensus branch ID `0xF919A198` as
-    /// > defined in [ZIP-252].
-    ///
-    /// > [NU6 only] All transactions MUST use the NU6 consensus branch ID `0xC8E71055` as defined
-    /// > in  [ZIP-253].
-    ///
-    /// # Notes
-    ///
-    /// The check that ensures compliance with the two consensus rules stated above takes place in
-    /// the [`Transaction::to_librustzcash`] method. If the check fails, the tx can't be converted
-    /// to its `librustzcash` equivalent, which leads to an error. The check relies on the passed
-    /// `nu` parameter, which uniquely represents a consensus branch id and can, therefore, be used
-    /// as an equivalent to a consensus branch id. The desired `nu` is set either by the script or
-    /// tx verifier in `zebra-consensus`.
-    ///
-    /// [ZIP-252]: <https://zips.z.cash/zip-0252>
-    /// [ZIP-253]: <https://zips.z.cash/zip-0253>
+    /// For V4 transactions, uses the network upgrade's consensus branch ID for the sighash,
+    /// which must match the branch ID used when the transaction was signed.
+    /// Returns an error if `nu` doesn't have a valid consensus branch ID.
     pub(crate) fn new(
         tx: &Transaction,
         nu: NetworkUpgrade,
         all_previous_outputs: Arc<Vec<transparent::Output>>,
     ) -> Result<PrecomputedTxData, Error> {
-        let tx = tx.to_librustzcash(nu)?;
+        let branch_id = nu
+            .branch_id()
+            .and_then(|cbid| zcash_protocol::consensus::BranchId::try_from(cbid).ok())
+            .ok_or(Error::InvalidConsensusBranchId)?;
 
-        let txid_parts = tx.deref().digest(zp_tx::txid::TxIdDigester);
+        // For V5+ transactions, the branch_id is embedded and must match.
+        // For V4 transactions, use the network upgrade's branch_id for the sighash.
+        let tx_branch_id = tx.inner().deref().consensus_branch_id();
+        if tx.version() >= 5 && tx_branch_id != branch_id {
+            return Err(Error::InvalidConsensusBranchId);
+        }
 
-        let f_transparent = MapTransparent {
-            auth: TransparentAuth {
-                all_prev_outputs: all_previous_outputs.clone(),
-            },
-        };
+        Self::from_transaction_with_branch_id(tx, branch_id, all_previous_outputs)
+    }
 
-        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = tx.into_data().map_authorization(
-            f_transparent,
-            IdentityMap,
-            IdentityMap,
-            #[cfg(zcash_unstable = "zfuture")]
-            (),
+    /// Computes precomputed sighash data with an explicit consensus branch ID.
+    ///
+    /// Clones the transaction to get an owned `TransactionData` for `map_authorization`,
+    /// reconstructing with the correct `branch_id` for V1-V4 sighash computation.
+    fn from_transaction_with_branch_id(
+        tx: &crate::transaction::Transaction,
+        branch_id: zcash_protocol::consensus::BranchId,
+        all_previous_outputs: Arc<Vec<transparent::Output>>,
+    ) -> Result<PrecomputedTxData, Error> {
+        let inner = tx.inner();
+        let txid_parts = inner.deref().digest(zp_tx::txid::TxIdDigester);
+
+        // Clone the transaction to get an owned TransactionData we can transform.
+        // Reconstruct with the correct branch_id (the stored value may differ for
+        // V1-V4 transactions that were parsed without network context).
+        //
+        // The rebuild must preserve every bundle: losing the Ironwood one would leave
+        // `PrecomputedTxData::ironwood_bundle` empty, and the verifier queues an Ironwood proof
+        // check only when that returns `Some`.
+        let data = inner.clone().into_data();
+        let data_with_branch_id = crate::transaction::compat::transaction_data_from_parts(
+            data.version(),
+            branch_id,
+            data.lock_time(),
+            data.expiry_height(),
+            data.transparent_bundle().cloned(),
+            data.sprout_bundle().cloned(),
+            data.sapling_bundle().cloned(),
+            data.orchard_bundle().cloned(),
+            data.ironwood_bundle().cloned(),
         );
+
+        let tx_data: zp_tx::TransactionData<PrecomputedAuth> = data_with_branch_id
+            .map_authorization(
+                MapTransparent {
+                    auth: TransparentAuth {
+                        all_prev_outputs: all_previous_outputs.clone(),
+                    },
+                },
+                IdentityMap,
+                IdentityMap,
+                #[cfg(zcash_unstable = "zfuture")]
+                (),
+            );
 
         Ok(PrecomputedTxData {
             tx_data,
@@ -286,6 +301,16 @@ impl PrecomputedTxData {
         self.tx_data.orchard_bundle().cloned()
     }
 
+    /// Returns the Ironwood bundle in `tx_data` (NU6.3 onward).
+    ///
+    /// The Ironwood bundle reuses the Orchard bundle type; it differs only by pool (separate tree,
+    /// nullifier set, and value balance) and is verified under the NU6.3 Action circuit key.
+    pub fn ironwood_bundle(
+        &self,
+    ) -> Option<orchard::bundle::Bundle<orchard::bundle::Authorized, ZatBalance>> {
+        self.tx_data.ironwood_bundle().cloned()
+    }
+
     /// Returns the Sapling bundle in `tx_data`.
     pub fn sapling_bundle(
         &self,
@@ -293,6 +318,82 @@ impl PrecomputedTxData {
         self.tx_data.sapling_bundle().cloned()
     }
 }
+
+/// Internal error type returned by [`sighash_inner`] when a sighash request
+/// violates one of the documented preconditions of [`sighash`] or
+/// [`sighash_v4_raw`].
+///
+/// Public callers (`SigHasher::sighash`, `SigHasher::sighash_v4_raw`) document
+/// these conditions as panics, so they unwrap the result at the public
+/// boundary. Keeping the internal code `Result`-shaped avoids spreading
+/// `.expect()` calls across multiple locations whose justifications all
+/// depend on the same caller invariants.
+#[derive(Debug)]
+enum SighashError {
+    /// Caller passed an `input_index` greater than or equal to the number of
+    /// transparent inputs the caller declared in `all_previous_outputs`.
+    InputIndexOutOfBounds {
+        input_index: usize,
+        input_count: usize,
+    },
+    /// Caller asked for a transparent sighash on a transaction that
+    /// `zcash_primitives` parsed without a transparent bundle. This contradicts
+    /// the precondition that `Some((input_index, _))` is only passed for
+    /// transactions with at least one transparent input.
+    NoTransparentBundle,
+    /// `input_index` is within bounds for `all_previous_outputs` but out of
+    /// bounds for the transparent bundle's `vin` returned by
+    /// `zcash_primitives`. Reaching this branch indicates a serialize /
+    /// deserialize round-trip inconsistency between Zebra's `Transaction` and
+    /// the parsed `zcash_primitives::Transaction`, which would be a bug in
+    /// either crate.
+    BundleInputCountMismatch {
+        input_index: usize,
+        bundle_vin_len: usize,
+        all_prev_outputs_len: usize,
+    },
+    /// The previous output's value could not be converted to `Zatoshis`.
+    /// Reaching this branch means the caller passed an output whose amount
+    /// was not validated by the consensus rules before sighash computation.
+    InvalidPreviousOutputAmount,
+}
+
+impl std::fmt::Display for SighashError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputIndexOutOfBounds {
+                input_index,
+                input_count,
+            } => write!(
+                f,
+                "input_index {input_index} is out of bounds (transaction has \
+                 {input_count} transparent inputs)"
+            ),
+            Self::NoTransparentBundle => f.write_str(
+                "transparent sighash requested for a transaction with no \
+                 transparent bundle (vin and vout both empty)",
+            ),
+            Self::BundleInputCountMismatch {
+                input_index,
+                bundle_vin_len,
+                all_prev_outputs_len,
+            } => write!(
+                f,
+                "input_index {input_index} valid for all_previous_outputs (len \
+                 {all_prev_outputs_len}) but out of bounds for the parsed \
+                 transparent bundle (vin len {bundle_vin_len}); this indicates \
+                 a serialize/deserialize round-trip inconsistency"
+            ),
+            Self::InvalidPreviousOutputAmount => f.write_str(
+                "previous output amount could not be converted to Zatoshis; \
+                 the amount should have been validated before sighash \
+                 computation",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SighashError {}
 
 /// Compute a signature hash using librustzcash.
 ///
@@ -304,60 +405,127 @@ impl PrecomputedTxData {
 /// - `input_index_script_code`: a tuple with the index of the transparent Input
 ///   for which we are producing a sighash and the respective script code being
 ///   validated, or None if it's a shielded input.
+///
+/// # Panics
+///
+/// - if `input_index_script_code` is `Some((input_index, _))` and `input_index`
+///   is out of bounds for `precomputed_tx_data.all_previous_outputs`. The
+///   public callers in `zebra-chain` document this as a precondition.
+/// - if the previous output at `input_index` has a value that cannot be
+///   converted to `Zatoshis`. Output values are validated before sighash
+///   computation, so this branch is unreachable in practice.
 pub(crate) fn sighash(
     precomputed_tx_data: &PrecomputedTxData,
     hash_type: HashType,
     input_index_script_code: Option<(usize, Vec<u8>)>,
 ) -> SigHash {
+    sighash_inner(
+        precomputed_tx_data,
+        hash_type.try_into().expect("hash type should be canonical"),
+        input_index_script_code,
+    )
+    .expect(
+        "sighash precondition violated: callers must pass an in-bounds \
+         input_index when computing a transparent sighash, and the transaction \
+         must contain the transparent input being signed",
+    )
+}
+
+/// Compute a pre-V5 (V4) signature hash using the raw `hash_type` byte.
+///
+/// `zcashd` serializes the full raw byte into the V4 sighash preimage and only
+/// masks with `SIGHASH_MASK` (0x1f) for selection logic. Callers handling V5+
+/// transactions must use [`sighash`] instead so ZIP-244 strictness is enforced.
+///
+/// # Panics
+///
+/// Same preconditions as [`sighash`].
+pub(crate) fn sighash_v4_raw(
+    precomputed_tx_data: &PrecomputedTxData,
+    raw_hash_type: u8,
+    input_index_script_code: Option<(usize, Vec<u8>)>,
+) -> SigHash {
+    sighash_inner(
+        precomputed_tx_data,
+        zcash_transparent::sighash::SighashType::from_raw(raw_hash_type),
+        input_index_script_code,
+    )
+    .expect(
+        "sighash precondition violated: callers must pass an in-bounds \
+         input_index when computing a transparent sighash, and the transaction \
+         must contain the transparent input being signed",
+    )
+}
+
+/// Internal sighash computation that surfaces precondition violations through
+/// `Result` instead of spreading `.expect()` calls across multiple sites.
+///
+/// All callers in `zebra-chain` unwrap the returned `Result` at the public
+/// boundary, but funnelling the error variants through one type makes it
+/// obvious which preconditions each call site relies on.
+fn sighash_inner(
+    precomputed_tx_data: &PrecomputedTxData,
+    sighash_type: zcash_transparent::sighash::SighashType,
+    input_index_script_code: Option<(usize, Vec<u8>)>,
+) -> Result<SigHash, SighashError> {
     let lock_script: zcash_transparent::address::Script;
     let unlock_script: zcash_transparent::address::Script;
     let signable_input = match input_index_script_code {
         Some((input_index, script_code)) => {
-            let output = &precomputed_tx_data.all_previous_outputs[input_index];
+            // The `all_previous_outputs` vector is supplied by the caller in
+            // 1:1 correspondence with `tx.inputs()`, and the transparent
+            // bundle was produced by round-tripping the same transaction
+            // bytes through `zcash_primitives::Transaction::read`. Both have
+            // length equal to `tx.inputs().len()`, so an out-of-bounds index
+            // is a caller error that should be reported once here.
+            let all_prev_outputs_len = precomputed_tx_data.all_previous_outputs.len();
+            let output = precomputed_tx_data
+                .all_previous_outputs
+                .get(input_index)
+                .ok_or(SighashError::InputIndexOutOfBounds {
+                    input_index,
+                    input_count: all_prev_outputs_len,
+                })?;
+            // `zcash_primitives::Transaction::read` returns
+            // `transparent_bundle = None` only when both `vin` and `vout` are
+            // empty. The caller only reaches this branch with `Some(_)` when
+            // the transaction has at least one transparent input, so reaching
+            // a `None` here means the caller violated the precondition or
+            // librustzcash changed its behaviour.
+            let bundle = precomputed_tx_data
+                .tx_data
+                .transparent_bundle()
+                .ok_or(SighashError::NoTransparentBundle)?;
             lock_script = output.lock_script.clone().into();
             unlock_script = zcash_transparent::address::Script(script::Code(script_code));
-            zp_tx::sighash::SignableInput::Transparent(
-                zcash_transparent::sighash::SignableInput::from_parts(
-                    hash_type.try_into().expect("hash type should be ALL"),
-                    input_index,
-                    &unlock_script,
-                    &lock_script,
-                    output
-                        .value
-                        .try_into()
-                        .expect("amount was previously validated"),
-                ),
+            let value = output
+                .value
+                .try_into()
+                .map_err(|_| SighashError::InvalidPreviousOutputAmount)?;
+            let from_parts = zcash_transparent::sighash::SignableInput::from_parts(
+                bundle,
+                sighash_type,
+                input_index,
+                &unlock_script,
+                &lock_script,
+                value,
             )
+            .map_err(|_| SighashError::BundleInputCountMismatch {
+                input_index,
+                bundle_vin_len: bundle.vin.len(),
+                all_prev_outputs_len,
+            })?;
+            zp_tx::sighash::SignableInput::Transparent(from_parts)
         }
         None => zp_tx::sighash::SignableInput::Shielded,
     };
 
-    SigHash(
+    Ok(SigHash(
         *zp_tx::sighash::signature_hash(
             &precomputed_tx_data.tx_data,
             &signable_input,
             &precomputed_tx_data.txid_parts,
         )
         .as_ref(),
-    )
-}
-
-/// Compute the authorizing data commitment of this transaction as specified in [ZIP-244].
-///
-/// # Panics
-///
-/// If passed a pre-v5 transaction.
-///
-/// [ZIP-244]: https://zips.z.cash/zip-0244
-pub(crate) fn auth_digest(tx: &Transaction) -> AuthDigest {
-    let nu = tx.network_upgrade().expect("V5 tx has a network upgrade");
-
-    AuthDigest(
-        tx.to_librustzcash(nu)
-            .expect("V5 tx is convertible to its `zcash_params` equivalent")
-            .auth_commitment()
-            .as_ref()
-            .try_into()
-            .expect("digest has the correct size"),
-    )
+    ))
 }

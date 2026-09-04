@@ -7,10 +7,7 @@ use crate::{
     block::Height,
     parameters::{
         network::error::ParametersBuilderError,
-        subsidy::{
-            block_subsidy, funding_stream_values, FundingStreamReceiver, FUNDING_STREAMS_TESTNET,
-            FUNDING_STREAM_ECC_ADDRESSES_MAINNET, FUNDING_STREAM_ECC_ADDRESSES_TESTNET,
-        },
+        subsidy::{self, block_subsidy, funding_stream_values, FundingStreamReceiver},
         testnet::{
             self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
             ConfiguredFundingStreams, ConfiguredLockboxDisbursement, RegtestParameters,
@@ -355,7 +352,7 @@ fn check_configured_funding_stream_constraints() {
                 receiver: FundingStreamReceiver::Ecc,
                 numerator: 20,
                 addresses: Some(
-                    FUNDING_STREAM_ECC_ADDRESSES_TESTNET
+                    subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES
                         .map(Into::into)
                         .to_vec(),
                 ),
@@ -367,7 +364,7 @@ fn check_configured_funding_stream_constraints() {
                 receiver: FundingStreamReceiver::Ecc,
                 numerator: 100,
                 addresses: Some(
-                    FUNDING_STREAM_ECC_ADDRESSES_TESTNET
+                    subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES
                         .map(Into::into)
                         .to_vec(),
                 ),
@@ -386,7 +383,7 @@ fn check_configured_funding_stream_constraints() {
                         .expect("failed to build configured network")
                         .all_funding_streams()[0]
                         .clone(),
-                    FUNDING_STREAMS_TESTNET[0].clone(),
+                    subsidy::constants::testnet::FUNDING_STREAMS[0].clone(),
                 )
             } else {
                 (
@@ -399,7 +396,7 @@ fn check_configured_funding_stream_constraints() {
                         .expect("failed to build configured network")
                         .all_funding_streams()[1]
                         .clone(),
-                    FUNDING_STREAMS_TESTNET[1].clone(),
+                    subsidy::constants::testnet::FUNDING_STREAMS[1].clone(),
                 )
             };
 
@@ -457,7 +454,7 @@ fn check_configured_funding_stream_constraints() {
                     receiver: FundingStreamReceiver::Ecc,
                     numerator: 101,
                     addresses: Some(
-                        FUNDING_STREAM_ECC_ADDRESSES_TESTNET
+                        subsidy::constants::testnet::FUNDING_STREAM_ECC_ADDRESSES
                             .map(Into::into)
                             .to_vec(),
                     ),
@@ -475,7 +472,7 @@ fn check_configured_funding_stream_constraints() {
                     receiver: FundingStreamReceiver::Ecc,
                     numerator: 10,
                     addresses: Some(
-                        FUNDING_STREAM_ECC_ADDRESSES_MAINNET
+                        subsidy::constants::mainnet::FUNDING_STREAM_ECC_ADDRESSES
                             .map(Into::into)
                             .to_vec(),
                     ),
@@ -539,6 +536,22 @@ fn check_configured_funding_stream_regtest() {
         &expected_post_nu6_funding_streams,
         &regtest.all_funding_streams()[1]
     );
+}
+
+/// Check that `should_allow_unshielded_coinbase_spends` is enabled by default on Regtest,
+/// can be disabled via `RegtestParameters`, and does not change Regtest identity.
+#[test]
+fn check_regtest_should_allow_unshielded_coinbase_spends() {
+    let default_regtest = Network::new_regtest(Default::default());
+    assert!(default_regtest.is_regtest());
+    assert!(default_regtest.should_allow_unshielded_coinbase_spends());
+
+    let shielded_regtest = Network::new_regtest(RegtestParameters {
+        should_allow_unshielded_coinbase_spends: Some(false),
+        ..Default::default()
+    });
+    assert!(shielded_regtest.is_regtest());
+    assert!(!shielded_regtest.should_allow_unshielded_coinbase_spends());
 }
 
 #[test]
@@ -614,9 +627,145 @@ fn lockbox_input_value(network: &Network, height: Height) -> Amount<NonNegative>
     // Funding stream height range end bound is not incremented since it's an exclusive end bound
     let num_blocks_with_lockbox_output = (height.0 + 1)
         .min(post_nu6_funding_stream_height_range.end.0)
-        .checked_sub(post_nu6_funding_stream_height_range.start.0)
-        .unwrap_or_default();
+        .saturating_sub(post_nu6_funding_stream_height_range.start.0);
 
     (deferred_amount_per_block * num_blocks_with_lockbox_output.into())
         .expect("lockbox input value should fit in Amount")
+}
+
+#[test]
+fn funding_streams_default_values() {
+    let _init_guard = zebra_test::init();
+
+    let fs = vec![
+        ConfiguredFundingStreams {
+            height_range: Some(Height(1_028_500 - 1)..Height(2_796_000 - 1)),
+            // Will read from existing values
+            recipients: None,
+        },
+        ConfiguredFundingStreams {
+            // Will read from existing values
+            height_range: None,
+            recipients: Some(vec![
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 1,
+                    addresses: None,
+                },
+                ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::MajorGrants,
+                    numerator: 2,
+                    addresses: Some(
+                        subsidy::constants::testnet::POST_NU6_FUNDING_STREAM_FPF_ADDRESSES
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    ),
+                },
+            ]),
+        },
+    ];
+
+    let network = testnet::Parameters::build()
+        .with_funding_streams(fs)
+        .to_network()
+        .expect("failed to build configured network");
+
+    // Check if value hasn't changed
+    assert_eq!(
+        network.all_funding_streams()[0].height_range().clone(),
+        Height(1_028_500 - 1)..Height(2_796_000 - 1)
+    );
+    // Check if value was copied from default
+    assert_eq!(
+        network.all_funding_streams()[0]
+            .recipients()
+            .get(&FundingStreamReceiver::ZcashFoundation)
+            .unwrap()
+            .addresses(),
+        subsidy::constants::testnet::FUNDING_STREAMS[0]
+            .recipients()
+            .get(&FundingStreamReceiver::ZcashFoundation)
+            .unwrap()
+            .addresses()
+    );
+    // Check if value was copied from default
+    assert_eq!(
+        network.all_funding_streams()[1].height_range(),
+        subsidy::constants::testnet::FUNDING_STREAMS[1].height_range()
+    );
+    // Check if value hasn't changed
+    assert_eq!(
+        network.all_funding_streams()[1]
+            .recipients()
+            .get(&FundingStreamReceiver::Deferred)
+            .unwrap()
+            .numerator(),
+        1
+    );
+}
+
+/// Checks the temporary Orchard-disabling soft fork height accessors, including the
+/// activation-height boundary used to trigger a mempool reset.
+#[test]
+fn temporary_orchard_disabling_soft_fork_heights() {
+    let _init_guard = zebra_test::init();
+
+    // Mainnet uses a fixed activation height.
+    let mainnet_height = Height(3_363_426);
+    assert_eq!(
+        Network::Mainnet.temporary_orchard_disabling_soft_fork_height(),
+        Some(mainnet_height),
+    );
+    assert!(!Network::Mainnet
+        .temporary_orchard_disabling_soft_fork_active((mainnet_height - 1).unwrap()),);
+    assert!(Network::Mainnet.temporary_orchard_disabling_soft_fork_active(mainnet_height));
+    // Only the exact activation height is the boundary that triggers a reset.
+    assert!(!Network::Mainnet
+        .is_temporary_orchard_disabling_soft_fork_activation_height((mainnet_height - 1).unwrap()));
+    assert!(
+        Network::Mainnet.is_temporary_orchard_disabling_soft_fork_activation_height(mainnet_height)
+    );
+    assert!(!Network::Mainnet
+        .is_temporary_orchard_disabling_soft_fork_activation_height((mainnet_height + 1).unwrap()));
+
+    // The default Testnet uses a fixed activation height, below its NU6.2 activation height.
+    let testnet_default_height = Height(4_048_500);
+    assert_eq!(
+        Network::new_default_testnet().temporary_orchard_disabling_soft_fork_height(),
+        Some(testnet_default_height),
+    );
+
+    // Regtest does not apply the temporary Orchard-disabling soft fork.
+    assert_eq!(
+        Network::new_regtest(Default::default()).temporary_orchard_disabling_soft_fork_height(),
+        None,
+    );
+
+    // A configured Testnet uses its configured height.
+    let testnet_height = Height(2_000_000);
+    let configured = testnet::Parameters::build()
+        .with_temporary_orchard_disabling_soft_fork_height(testnet_height)
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(
+        configured.temporary_orchard_disabling_soft_fork_height(),
+        Some(testnet_height),
+    );
+    assert!(configured.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
+    assert!(!configured
+        .is_temporary_orchard_disabling_soft_fork_activation_height((testnet_height + 1).unwrap()));
+
+    // A Testnet with the soft fork disabled has no activation height.
+    let disabled = testnet::Parameters::build()
+        .disable_temporary_orchard_disabling_soft_fork()
+        .to_network()
+        .expect("failed to build configured network");
+
+    assert_eq!(
+        disabled.temporary_orchard_disabling_soft_fork_height(),
+        None,
+    );
+    assert!(!disabled.is_temporary_orchard_disabling_soft_fork_activation_height(testnet_height));
 }

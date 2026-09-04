@@ -1,9 +1,22 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project adheres to [Semantic Versioning](https://semver.org).
+
+## [4.0.0] - 2026-07-02
+
+### Removed
+
+- The `tx_v6` cargo feature; v6 transaction test support no longer needs a feature gate
+  ([#10762](https://github.com/ZcashFoundation/zebra/pull/10762))
+
+## [3.0.0] - 2026-03-12
+
+### Breaking Changes
+
+- `mock_service::MockService::expect_no_requests` now returns `()` instead of its previous return type.
 
 ## [2.0.0] - 2025-10-15
 
@@ -14,7 +27,6 @@ use `orchard::bundle::BatchValidator` in the transaction verifier ([#9308](https
 
 - `MockService::expect_no_requests` now returns `()` (it previously returned a value).
 - Removed now-unused test data ([#9308](https://github.com/ZcashFoundation/zebra/pull/9308))
-
 
 ## [1.0.1] - 2025-08-07
 

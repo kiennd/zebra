@@ -15,6 +15,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::RangeInclusive,
+    sync::Arc,
 };
 
 use rocksdb::ColumnFamily;
@@ -40,7 +41,7 @@ use crate::{
         },
         zebra_db::ZebraDb,
     },
-    BoxError, FromDisk, IntoDisk,
+    FromDisk, IntoDisk,
 };
 
 use super::super::TypedColumnFamily;
@@ -187,18 +188,29 @@ impl ZebraDb {
         Some(utxo)
     }
 
-    /// Returns the unspent transparent outputs for a [`transparent::Address`],
-    /// if they are in the finalized state.
+    /// Returns the unspent transparent outputs for a [`transparent::Address`] in the finalized
+    /// chain `query_height_range`, at most `limit` of them.
+    ///
+    /// If the address has no finalized UTXOs, or the `query_height_range` is totally outside
+    /// the finalized block range, returns an empty list.
     pub fn address_utxos(
         &self,
         address: &transparent::Address,
+        query_height_range: RangeInclusive<Height>,
+        limit: Option<usize>,
     ) -> BTreeMap<OutputLocation, transparent::Output> {
         let address_location = match self.address_location(address) {
             Some(address_location) => address_location,
             None => return BTreeMap::new(),
         };
 
-        let output_locations = self.address_utxo_locations(address_location);
+        // Skip this address if its first UTXO is after the end height.
+        if address_location.height() > *query_height_range.end() {
+            return BTreeMap::new();
+        }
+
+        let output_locations =
+            self.address_utxo_locations(address_location, query_height_range, limit);
 
         // Ignore any outputs spent by blocks committed during this query
         output_locations
@@ -214,46 +226,29 @@ impl ZebraDb {
             .collect()
     }
 
-    /// Returns the unspent transparent output locations for a [`transparent::Address`],
-    /// if they are in the finalized state.
+    /// Returns the unspent transparent output locations for a [`transparent::Address`] in the
+    /// finalized chain `query_height_range`, at most `limit` of them.
     pub fn address_utxo_locations(
         &self,
         address_location: AddressLocation,
+        query_height_range: RangeInclusive<Height>,
+        limit: Option<usize>,
     ) -> BTreeSet<AddressUnspentOutput> {
         let utxo_loc_by_transparent_addr_loc = self
             .db
             .cf_handle("utxo_loc_by_transparent_addr_loc")
             .unwrap();
 
-        // Manually fetch the entire addresses' UTXO locations
-        let mut addr_unspent_outputs = BTreeSet::new();
+        // A potentially invalid key representing the first UTXO sent to the address,
+        // or the query start height.
+        let unspent_output_range =
+            AddressUnspentOutput::address_iterator_range(address_location, query_height_range);
 
-        // An invalid key representing the minimum possible output
-        let mut unspent_output = AddressUnspentOutput::address_iterator_start(address_location);
-
-        loop {
-            // Seek to a valid entry for this address, or the first entry for the next address
-            unspent_output = match self
-                .db
-                .zs_next_key_value_from(&utxo_loc_by_transparent_addr_loc, &unspent_output)
-            {
-                Some((unspent_output, ())) => unspent_output,
-                // We're finished with the final address in the column family
-                None => break,
-            };
-
-            // We found the next address, so we're finished with this address
-            if unspent_output.address_location() != address_location {
-                break;
-            }
-
-            addr_unspent_outputs.insert(unspent_output);
-
-            // A potentially invalid key representing the next possible output
-            unspent_output.address_iterator_next();
-        }
-
-        addr_unspent_outputs
+        self.db
+            .zs_forward_range_iter(&utxo_loc_by_transparent_addr_loc, unspent_output_range)
+            .map(|(unspent_output, ())| unspent_output)
+            .take(limit.unwrap_or(usize::MAX))
+            .collect()
     }
 
     /// Returns the transaction hash for an [`TransactionLocation`].
@@ -356,9 +351,14 @@ impl ZebraDb {
         )
     }
 
-    /// Returns the UTXOs for `addresses` in the finalized chain.
+    /// Returns the UTXOs for `addresses` in the finalized chain `query_height_range`,
+    /// at most `limit` of them per address.
     ///
     /// If none of the addresses has finalized UTXOs, returns an empty list.
+    ///
+    /// The per-address `limit` is enough for the caller to apply a global limit of the same
+    /// size: the first `limit` UTXOs across all addresses can only contain UTXOs that are
+    /// among the first `limit` for their own address.
     ///
     /// # Correctness
     ///
@@ -372,10 +372,12 @@ impl ZebraDb {
     pub fn partial_finalized_address_utxos(
         &self,
         addresses: &HashSet<transparent::Address>,
+        query_height_range: RangeInclusive<Height>,
+        limit: Option<usize>,
     ) -> BTreeMap<OutputLocation, transparent::Output> {
         addresses
             .iter()
-            .flat_map(|address| self.address_utxos(address))
+            .flat_map(|address| self.address_utxos(address, query_height_range.clone(), limit))
             .collect()
     }
 
@@ -495,13 +497,6 @@ impl ZebraDb {
 impl DiskWriteBatch {
     /// Prepare a database batch containing `finalized.block`'s transparent transaction indexes,
     /// and return it (without actually writing anything).
-    ///
-    /// If this method returns an error, it will be propagated,
-    /// and the batch should not be written to the database.
-    ///
-    /// # Errors
-    ///
-    /// - Propagates any errors from updating note commitment trees
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_transparent_transaction_batch(
         &mut self,
@@ -516,23 +511,37 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
-    ) -> Result<(), BoxError> {
+    ) {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
 
-        // Update created and spent transparent outputs
+        // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
+        // before crediting outputs within each transaction. This ordering keeps every
+        // intermediate per-address balance within the consensus range, even when the block
+        // contains a same-address transparent self-spend chain whose batch credit-first
+        // intermediate balance would otherwise exceed MAX_MONEY.
+        Self::prepare_transparent_address_balance_updates(
+            network,
+            *height,
+            &block.transactions,
+            spent_utxos_by_outpoint,
+            &mut address_balances,
+        );
+
+        // Write the new and spent transparent output index entries. These passes no longer
+        // touch `address_balances`; they only read each entry's `address_location()`.
         self.prepare_new_transparent_outputs_batch(
             db,
             network,
             new_outputs_by_out_loc,
-            &mut address_balances,
-        )?;
+            &address_balances,
+        );
         self.prepare_spent_transparent_outputs_batch(
             db,
             network,
             spent_utxos_by_out_loc,
-            &mut address_balances,
-        )?;
+            &address_balances,
+        );
 
         // Index the transparent addresses that spent in each transaction
         for (tx_index, transaction) in block.transactions.iter().enumerate() {
@@ -547,10 +556,96 @@ impl DiskWriteBatch {
                 #[cfg(feature = "indexer")]
                 out_loc_by_outpoint,
                 &address_balances,
-            )?;
+            );
         }
 
-        self.prepare_transparent_balances_batch(db, address_balances)
+        self.prepare_transparent_balances_batch(db, address_balances);
+    }
+
+    /// Update `address_balances` in memory for the transparent transfers in `transactions`,
+    /// processed transaction-by-transaction in block order, debiting inputs before crediting
+    /// outputs within each transaction.
+    ///
+    /// This mirrors `zcashd`'s `UpdateCoins` and is what allows a same-address transparent
+    /// self-spend chain in one block to be applied without the intermediate per-address
+    /// balance exceeding `MAX_MONEY`. For any consensus-valid block, every per-step
+    /// intermediate balance stays inside the [`Amount`] constraint of the enclosing
+    /// `AddressBalanceLocationUpdates` variant.
+    ///
+    /// This function does not touch the RocksDB batch; index writes are still handled by
+    /// [`Self::prepare_new_transparent_outputs_batch`] and
+    /// [`Self::prepare_spent_transparent_outputs_batch`], which read but no longer mutate
+    /// `address_balances`.
+    fn prepare_transparent_address_balance_updates(
+        network: &Network,
+        height: Height,
+        transactions: &[Arc<Transaction>],
+        spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        address_balances: &mut AddressBalanceLocationUpdates,
+    ) {
+        fn update_per_tx<
+            C: Constraint + Copy + std::fmt::Debug,
+            T: std::ops::DerefMut<Target = AddressBalanceLocationInner<C>>
+                + From<AddressBalanceLocationInner<C>>,
+        >(
+            addr_locs: &mut HashMap<transparent::Address, T>,
+            network: &Network,
+            height: Height,
+            transactions: &[Arc<Transaction>],
+            spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        ) {
+            for (tx_index, transaction) in transactions.iter().enumerate() {
+                // Debit transparent inputs first. Coinbase inputs have no outpoint, so
+                // `filter_map(Input::outpoint)` skips them.
+                for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
+                    let spent_utxo = spent_utxos_by_outpoint
+                        .get(&spent_outpoint)
+                        .expect("spent outpoint must already be resolved");
+                    if let Some(sending_address) = spent_utxo.output.address(network) {
+                        let addr_loc = addr_locs
+                            .get_mut(&sending_address)
+                            .expect("spent outputs must already have an address balance");
+
+                        addr_loc
+                            .spend_output(&spent_utxo.output)
+                            .expect("balance underflow already checked");
+                    }
+                }
+
+                // Then credit transparent outputs.
+                for (output_index, output) in transaction.outputs().iter().enumerate() {
+                    if let Some(receiving_address) = output.address(network) {
+                        let new_output_location =
+                            OutputLocation::from_usize(height, tx_index, output_index);
+
+                        let addr_loc = addr_locs.entry(receiving_address).or_insert_with(|| {
+                            AddressBalanceLocationInner::new(new_output_location).into()
+                        });
+
+                        addr_loc
+                            .receive_output(output)
+                            .expect("balance overflow already checked");
+                    }
+                }
+            }
+        }
+
+        match address_balances {
+            AddressBalanceLocationUpdates::Merge(balance_changes) => update_per_tx(
+                balance_changes,
+                network,
+                height,
+                transactions,
+                spent_utxos_by_outpoint,
+            ),
+            AddressBalanceLocationUpdates::Insert(balances) => update_per_tx(
+                balances,
+                network,
+                height,
+                transactions,
+                spent_utxos_by_outpoint,
+            ),
+        }
     }
 
     /// Prepare a database batch for the new UTXOs in `new_outputs_by_out_loc`.
@@ -562,7 +657,10 @@ impl DiskWriteBatch {
     ///
     /// without actually writing anything.
     ///
-    /// Also modifies the `address_balances` for these new UTXOs.
+    /// `address_balances` must already be populated for every transparent address that
+    /// receives one of these outputs (see
+    /// [`Self::prepare_transparent_address_balance_updates`]); this function only reads
+    /// `address_location()` from it.
     ///
     /// # Errors
     ///
@@ -573,8 +671,8 @@ impl DiskWriteBatch {
         db: &DiskDb,
         network: &Network,
         new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
-        address_balances: &mut AddressBalanceLocationUpdates,
-    ) -> Result<(), BoxError> {
+        address_balances: &AddressBalanceLocationUpdates,
+    ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
         let utxo_loc_by_transparent_addr_loc =
             db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap();
@@ -586,52 +684,16 @@ impl DiskWriteBatch {
             let unspent_output = &utxo.output;
             let receiving_address = unspent_output.address(network);
 
-            // Update the address balance by adding this UTXO's value
             if let Some(receiving_address) = receiving_address {
-                // TODO: fix up tests that use missing outputs,
-                //       then replace entry() with get_mut().expect()
-
-                // In memory:
-                // - create the balance for the address, if needed.
-                // - create or fetch the link from the address to the AddressLocation
-                //   (the first location of the address in the chain).
-
-                fn update_addr_loc<
-                    C: Constraint + Copy + std::fmt::Debug,
-                    T: std::ops::DerefMut<Target = AddressBalanceLocationInner<C>>
-                        + From<AddressBalanceLocationInner<C>>,
-                >(
-                    addr_locs: &mut HashMap<transparent::Address, T>,
-                    receiving_address: transparent::Address,
-                    new_output_location: &OutputLocation,
-                    unspent_output: &transparent::Output,
-                ) -> AddressLocation {
-                    let addr_loc = addr_locs.entry(receiving_address).or_insert_with(|| {
-                        AddressBalanceLocationInner::new(*new_output_location).into()
-                    });
-
-                    // Update the balance for the address in memory.
-                    addr_loc
-                        .receive_output(unspent_output)
-                        .expect("balance overflow already checked");
-
-                    addr_loc.address_location()
-                }
-
-                // Update the balance for the address in memory.
                 let receiving_address_location = match address_balances {
-                    AddressBalanceLocationUpdates::Merge(balance_changes) => update_addr_loc(
-                        balance_changes,
-                        receiving_address,
-                        new_output_location,
-                        unspent_output,
-                    ),
-                    AddressBalanceLocationUpdates::Insert(balances) => update_addr_loc(
-                        balances,
-                        receiving_address,
-                        new_output_location,
-                        unspent_output,
-                    ),
+                    AddressBalanceLocationUpdates::Merge(balance_changes) => balance_changes
+                        .get(&receiving_address)
+                        .expect("address must be in address_balances after the balance update pass")
+                        .address_location(),
+                    AddressBalanceLocationUpdates::Insert(balances) => balances
+                        .get(&receiving_address)
+                        .expect("address must be in address_balances after the balance update pass")
+                        .address_location(),
                 };
 
                 // Create a link from the AddressLocation to the new OutputLocation in the database.
@@ -657,8 +719,6 @@ impl DiskWriteBatch {
             // to get an output.)
             self.zs_insert(&utxo_by_out_loc, new_output_location, unspent_output);
         }
-
-        Ok(())
     }
 
     /// Prepare a database batch for the spent outputs in `spent_utxos_by_out_loc`.
@@ -669,7 +729,10 @@ impl DiskWriteBatch {
     ///
     /// without actually writing anything.
     ///
-    /// Also modifies the `address_balances` for these new UTXOs.
+    /// `address_balances` must already be populated for every transparent address that
+    /// spends one of these outputs (see
+    /// [`Self::prepare_transparent_address_balance_updates`]); this function only reads
+    /// `address_location()` from it.
     ///
     /// # Errors
     ///
@@ -680,8 +743,8 @@ impl DiskWriteBatch {
         db: &DiskDb,
         network: &Network,
         spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
-        address_balances: &mut AddressBalanceLocationUpdates,
-    ) -> Result<(), BoxError> {
+        address_balances: &AddressBalanceLocationUpdates,
+    ) {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
         let utxo_loc_by_transparent_addr_loc =
             db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap();
@@ -693,36 +756,17 @@ impl DiskWriteBatch {
             let spent_output = &utxo.output;
             let sending_address = spent_output.address(network);
 
-            // Fetch the balance, and the link from the address to the AddressLocation, from memory.
+            // Fetch the link from the address to the AddressLocation, from memory.
             if let Some(sending_address) = sending_address {
-                fn update_addr_loc<
-                    C: Constraint + Copy + std::fmt::Debug,
-                    T: std::ops::DerefMut<Target = AddressBalanceLocationInner<C>>
-                        + From<AddressBalanceLocationInner<C>>,
-                >(
-                    addr_locs: &mut HashMap<transparent::Address, T>,
-                    sending_address: transparent::Address,
-                    spent_output: &transparent::Output,
-                ) -> AddressLocation {
-                    let addr_loc = addr_locs
-                        .get_mut(&sending_address)
-                        .expect("spent outputs must already have an address balance");
-
-                    // Update the address balance by subtracting this UTXO's value, in memory.
-                    addr_loc
-                        .spend_output(spent_output)
-                        .expect("balance underflow already checked");
-
-                    addr_loc.address_location()
-                }
-
                 let address_location = match address_balances {
-                    AddressBalanceLocationUpdates::Merge(balance_changes) => {
-                        update_addr_loc(balance_changes, sending_address, spent_output)
-                    }
-                    AddressBalanceLocationUpdates::Insert(balances) => {
-                        update_addr_loc(balances, sending_address, spent_output)
-                    }
+                    AddressBalanceLocationUpdates::Merge(balance_changes) => balance_changes
+                        .get(&sending_address)
+                        .expect("spent outputs must already have an address balance")
+                        .address_location(),
+                    AddressBalanceLocationUpdates::Insert(balances) => balances
+                        .get(&sending_address)
+                        .expect("spent outputs must already have an address balance")
+                        .address_location(),
                 };
 
                 // Delete the link from the AddressLocation to the spent OutputLocation in the database.
@@ -735,8 +779,6 @@ impl DiskWriteBatch {
             // Delete the OutputLocation, and the copy of the spent Output in the database.
             self.zs_delete(&utxo_by_out_loc, spent_output_location);
         }
-
-        Ok(())
     }
 
     /// Prepare a database batch indexing the transparent addresses that spent in this transaction.
@@ -763,7 +805,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         address_balances: &AddressBalanceLocationUpdates,
-    ) -> Result<(), BoxError> {
+    ) {
         let db = &zebra_db.db;
         let tx_loc_by_transparent_addr_loc =
             db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap();
@@ -812,8 +854,6 @@ impl DiskWriteBatch {
                     .zs_insert(spent_output_location, &spending_tx_location);
             }
         }
-
-        Ok(())
     }
 
     /// Prepare a database batch containing `finalized.block`'s:
@@ -829,7 +869,7 @@ impl DiskWriteBatch {
         &mut self,
         db: &DiskDb,
         address_balances: AddressBalanceLocationUpdates,
-    ) -> Result<(), BoxError> {
+    ) {
         let balance_by_transparent_addr = db.cf_handle(BALANCE_BY_TRANSPARENT_ADDR).unwrap();
 
         // Update all the changed address balances in the database.
@@ -855,7 +895,5 @@ impl DiskWriteBatch {
                 }
             }
         };
-
-        Ok(())
     }
 }

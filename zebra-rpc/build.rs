@@ -5,38 +5,79 @@ use std::{
     process::Command,
 };
 
-// 0.1.0-alpha.2
+// 0.1.0-alpha.2 - https://github.com/zcash/wallet/commit/027e5e2139b2ca8f0317edb9d802b03a46e9aa4c
 const ZALLET_COMMIT: Option<&str> = Some("027e5e2139b2ca8f0317edb9d802b03a46e9aa4c");
+
+// Zaino last tested commit - https://github.com/zingolabs/zaino/commit/559510ffcc62a5a6e7bb20db5e3329654542c8b1
+// TODO: Zaino is not currently built by this build script.
+#[allow(dead_code)]
+const ZAINO_COMMIT: Option<&str> = Some("559510ffcc62a5a6e7bb20db5e3329654542c8b1");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     build_or_copy_proto()?;
     build_zallet_for_qa_tests();
+    build_rpc_schema()?;
 
     Ok(())
 }
 
 fn build_or_copy_proto() -> Result<(), Box<dyn std::error::Error>> {
-    const PROTO_FILE_PATH: &str = "proto/indexer.proto";
+    // Zebra's indexer API.
+    build_or_copy_proto_set(
+        &["proto/indexer.proto"],
+        &[""],
+        "indexer_descriptor.bin",
+        &["indexer_descriptor.bin", "zebra.indexer.rpc.rs"],
+        true,
+    )?;
 
+    // The lightwalletd `CompactTxStreamer` client API.
+    //
+    // `service.proto` imports `compact_formats.proto`, so both are compiled with
+    // the `proto` directory as the include path.
+    build_or_copy_proto_set(
+        &["proto/service.proto", "proto/compact_formats.proto"],
+        &["proto"],
+        "lightwalletd_descriptor.bin",
+        &["lightwalletd_descriptor.bin", "cash.z.wallet.sdk.rpc.rs"],
+        false,
+    )?;
+
+    Ok(())
+}
+
+/// Compiles the given proto files if `protoc` and the proto files are available,
+/// copying the generated files into `proto/__generated__/` so they can be checked in.
+/// Otherwise, copies the checked-in generated files into `OUT_DIR`.
+fn build_or_copy_proto_set(
+    proto_files: &[&str],
+    include_dirs: &[&str],
+    descriptor_name: &str,
+    file_names: &[&str],
+    serde_derives: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR").map(PathBuf::from)?;
-    let file_names = ["indexer_descriptor.bin", "zebra.indexer.rpc.rs"];
 
-    let is_proto_file_available = Path::new(PROTO_FILE_PATH).exists();
+    let are_proto_files_available = proto_files.iter().all(|path| Path::new(path).exists());
     let is_protoc_available = env::var_os("PROTOC")
         .map(PathBuf::from)
         .or_else(|| which::which("protoc").ok())
         .is_some();
 
-    if is_proto_file_available && is_protoc_available {
-        tonic_prost_build::configure()
-            .type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]")
-            .file_descriptor_set_path(out_dir.join("indexer_descriptor.bin"))
-            .compile_protos(&[PROTO_FILE_PATH], &[""])?;
+    if are_proto_files_available && is_protoc_available {
+        let mut config =
+            tonic_prost_build::configure().file_descriptor_set_path(out_dir.join(descriptor_name));
+
+        if serde_derives {
+            config = config.type_attribute(".", "#[derive(serde::Deserialize, serde::Serialize)]");
+        }
+
+        config.compile_protos(proto_files, include_dirs)?;
 
         for file_name in file_names {
             let out_path = out_dir.join(file_name);
             let generated_path = format!("proto/__generated__/{file_name}");
-            if fs::read_to_string(&out_path).ok() != fs::read_to_string(&generated_path).ok() {
+            if fs::read(&out_path).ok() != fs::read(&generated_path).ok() {
                 fs::copy(out_path, generated_path)?;
             }
         }
@@ -109,4 +150,13 @@ fn build_zallet_for_qa_tests() {
             )
         });
     }
+}
+
+fn build_rpc_schema() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = env::var("OUT_DIR").map(PathBuf::from)?;
+    let json_rpc_methods_rs = "src/methods.rs";
+    let trait_names = ["Rpc"];
+    openrpsee::generate_openrpc(json_rpc_methods_rs, &trait_names, false, &out_dir)?;
+
+    Ok(())
 }

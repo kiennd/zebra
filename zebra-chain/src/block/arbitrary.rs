@@ -8,6 +8,7 @@ use crate::{
     fmt::{HexDebug, SummaryDebug},
     history_tree::HistoryTree,
     parameters::{NetworkUpgrade::*, GENESIS_PREVIOUS_BLOCK_HASH},
+    primitives::zcash_history::BlockCommitmentTreeRoots,
     serialization::{self, BytesInDisplayOrder},
     transaction::arbitrary::MAX_ARBITRARY_ITEMS,
     transparent::{
@@ -429,6 +430,11 @@ impl Block {
             let mut chain_value_pools = ValueBalance::zero();
             let mut sapling_tree = sapling::tree::NoteCommitmentTree::default();
             let mut orchard_tree = orchard::tree::NoteCommitmentTree::default();
+            // Ironwood reuses the Orchard note commitment tree type. Generated v6 transactions
+            // (NU6.3+) can carry Ironwood bundles, whose note commitments are appended below and
+            // threaded through the V3 history node so commitments match validation. For pre-NU6.3
+            // chains this stays empty, and its real empty-tree root is used the same way.
+            let mut ironwood_tree = orchard::tree::NoteCommitmentTree::default();
             // The history tree usually takes care of "creating itself". But this
             // only works when blocks are pushed into it starting from genesis
             // (or at least pre-Heartwood, where the tree is not required).
@@ -463,10 +469,22 @@ impl Block {
                         //       using `NoteCommitmentTrees::update_trees_parallel()`
                         if generate_valid_commitments && *height != Height(0) {
                             for sapling_note_commitment in transaction.sapling_note_commitments() {
-                                sapling_tree.append(*sapling_note_commitment).unwrap();
+                                sapling_tree.append(sapling_note_commitment).unwrap();
                             }
                             for orchard_note_commitment in transaction.orchard_note_commitments() {
-                                orchard_tree.append(*orchard_note_commitment).unwrap();
+                                use halo2::pasta::group::ff::PrimeField;
+                                let cm =
+                                    pallas::Base::from_repr(orchard_note_commitment.to_bytes())
+                                        .expect("valid orchard note commitment");
+                                orchard_tree.append(cm).unwrap();
+                            }
+                            for ironwood_note_commitment in transaction.ironwood_note_commitments()
+                            {
+                                use halo2::pasta::group::ff::PrimeField;
+                                let cm =
+                                    pallas::Base::from_repr(ironwood_note_commitment.to_bytes())
+                                        .expect("valid ironwood note commitment");
+                                ironwood_tree.append(cm).unwrap();
                             }
                         }
                         new_transactions.push(Arc::new(transaction));
@@ -529,8 +547,11 @@ impl Block {
                             .push(
                                 &current.network,
                                 Arc::new(block.clone()),
-                                &sapling_tree.root(),
-                                &orchard_tree.root(),
+                                BlockCommitmentTreeRoots {
+                                    sapling: &sapling_tree.root(),
+                                    orchard: &orchard_tree.root(),
+                                    ironwood: &ironwood_tree.root(),
+                                },
                             )
                             .unwrap();
                     } else {
@@ -538,8 +559,11 @@ impl Block {
                             HistoryTree::from_block(
                                 &current.network,
                                 Arc::new(block.clone()),
-                                &sapling_tree.root(),
-                                &orchard_tree.root(),
+                                BlockCommitmentTreeRoots {
+                                    sapling: &sapling_tree.root(),
+                                    orchard: &orchard_tree.root(),
+                                    ironwood: &ironwood_tree.root(),
+                                },
                             )
                             .unwrap(),
                         );
@@ -582,6 +606,12 @@ where
         + Copy
         + 'static,
 {
+    // Coinbase transactions must not contain Sapling spends (GHSA-rgwx-8r98-p34c).
+    // The arbitrary `Transaction` strategies generate transparent-only transactions, so there
+    // is no generated Sapling shielded data to clear here. The deserialization rejection path
+    // is still exercised by the `transaction_roundtrip` proptest and the GHSA-rgwx-8r98-p34c
+    // reproduction vector in `zebra-chain`.
+
     let mut spend_restriction = transaction.coinbase_spend_restriction(&Network::Mainnet, height);
     let mut new_inputs = Vec::new();
     let mut spent_outputs = HashMap::new();
@@ -613,7 +643,7 @@ where
     }
 
     // delete invalid inputs
-    *transaction.inputs_mut() = new_inputs;
+    transaction = transaction.with_transparent_inputs(new_inputs);
 
     let (_remaining_transaction_value, new_chain_value_pools) = transaction
         .fix_chain_value_pools(*chain_value_pools, &spent_outputs)
@@ -685,7 +715,7 @@ where
             )
             .is_ok()
         {
-            *transaction.outputs_mut() = Vec::new();
+            *transaction = transaction.clone().with_transparent_outputs(vec![]);
             *spend_restriction = delete_transparent_outputs;
 
             return Some(*candidate_outpoint);

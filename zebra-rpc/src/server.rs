@@ -14,7 +14,10 @@ use jsonrpsee::server::{middleware::rpc::RpcServiceBuilder, Server, ServerHandle
 use tokio::task::JoinHandle;
 use tracing::*;
 
-use zebra_chain::{chain_sync_status::ChainSyncStatus, chain_tip::ChainTip, parameters::Network};
+use zebra_chain::{
+    block::MAX_BLOCK_BYTES, chain_sync_status::ChainSyncStatus, chain_tip::ChainTip,
+    parameters::Network,
+};
 use zebra_consensus::router::service_trait::BlockVerifierService;
 use zebra_network::AddressBookPeers;
 use zebra_node_services::mempool::MempoolService;
@@ -25,7 +28,8 @@ use crate::{
     methods::{RpcImpl, RpcServer as _},
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer,
-        rpc_call_compatibility::FixRpcResponseMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
+        rpc_tracing::RpcTracingMiddleware,
     },
 };
 
@@ -33,6 +37,8 @@ pub mod cookie;
 pub mod error;
 pub mod http_request_compatibility;
 pub mod rpc_call_compatibility;
+pub mod rpc_metrics;
+pub mod rpc_tracing;
 
 #[cfg(test)]
 mod tests;
@@ -70,6 +76,13 @@ impl fmt::Debug for RpcServer {
 
 /// The message to log when logging the RPC server's listen address
 pub const OPENED_RPC_ENDPOINT_MSG: &str = "Opened RPC endpoint at ";
+
+/// The message to log when logging the lightwalletd gRPC server's listen address.
+///
+/// Deliberately distinct from [`OPENED_RPC_ENDPOINT_MSG`], and not a superstring of it:
+/// tests find listen addresses by scraping these messages out of the log, and some read
+/// several in a row and rely on their order.
+pub const OPENED_LIGHTWALLETD_ENDPOINT_MSG: &str = "Opened lightwalletd gRPC endpoint at ";
 
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
 
@@ -114,13 +127,16 @@ impl RpcServer {
             .listen_addr
             .expect("caller should make sure listen_addr is set");
 
+        // The largest RPC request is submitblock, which sends a full block
+        // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
+        let max_request_body_size = (MAX_BLOCK_BYTES as usize) * 2 + 1024;
         let http_middleware_layer = if conf.enable_cookie_auth {
             let cookie = Cookie::default();
             cookie::write_to_disk(&cookie, &conf.cookie_dir)
                 .expect("Zebra must be able to write the auth cookie to the disk");
-            HttpRequestMiddlewareLayer::new(Some(cookie))
+            HttpRequestMiddlewareLayer::new(Some(cookie), max_request_body_size)
         } else {
-            HttpRequestMiddlewareLayer::new(None)
+            HttpRequestMiddlewareLayer::new(None, max_request_body_size)
         };
 
         // Increase concurrent request limit to handle more requests
@@ -132,17 +148,15 @@ impl RpcServer {
 
         let rpc_middleware = RpcServiceBuilder::new()
             .rpc_logger(1024)
-            .layer_fn(FixRpcResponseMiddleware::new);
+            .layer_fn(FixRpcResponseMiddleware::new)
+            .layer_fn(RpcMetricsMiddleware::new)
+            .layer_fn(RpcTracingMiddleware::new);
 
         let server = Server::builder()
             .http_only()
             .set_http_middleware(http_middleware)
             .set_rpc_middleware(rpc_middleware)
-            .max_response_body_size(
-                conf.max_response_body_size
-                    .try_into()
-                    .expect("should be valid"),
-            )
+            .max_response_body_size(conf.max_response_body_size)
             .build(listen_addr)
             .await?;
 
