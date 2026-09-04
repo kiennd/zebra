@@ -143,7 +143,9 @@ impl RpcServer {
         // Default is typically 1024, we increase it to 10000
         const MAX_CONCURRENT_REQUESTS: usize = 10_000;
         let http_middleware = tower::ServiceBuilder::new()
-            .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
+            .layer(tower::limit::ConcurrencyLimitLayer::new(
+                MAX_CONCURRENT_REQUESTS,
+            ))
             .layer(http_middleware_layer);
 
         let rpc_middleware = RpcServiceBuilder::new()

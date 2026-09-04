@@ -642,16 +642,14 @@ impl FromDisk for transparent::Address {
         let address_variant = address_variant[0];
         let hash_bytes = hash_bytes.try_into().unwrap();
 
-        let network = if address_variant < 2 {
-            NetworkKind::Mainnet
-        } else {
-            NetworkKind::Testnet
-        };
-
-        if address_variant % 2 == 0 {
-            transparent::Address::from_pub_key_hash(network, hash_bytes)
-        } else {
-            transparent::Address::from_script_hash(network, hash_bytes)
+        match address_variant {
+            0 => transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, hash_bytes),
+            1 => transparent::Address::from_script_hash(NetworkKind::Mainnet, hash_bytes),
+            2 => transparent::Address::from_pub_key_hash(NetworkKind::Testnet, hash_bytes),
+            3 => transparent::Address::from_script_hash(NetworkKind::Testnet, hash_bytes),
+            4 => transparent::Address::from_tex(NetworkKind::Mainnet, hash_bytes),
+            5 => transparent::Address::from_tex(NetworkKind::Testnet, hash_bytes),
+            _ => panic!("invalid transparent address variant: {address_variant}"),
         }
     }
 }

@@ -371,7 +371,7 @@ impl PartialEq for NonFinalizedBlocksListener {
 
 impl Eq for NonFinalizedBlocksListener {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 /// A response to a read-only
 /// [`ReadStateService`](crate::service::ReadStateService)'s [`ReadRequest`].
 pub enum ReadResponse {
@@ -522,7 +522,10 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::SnapshotData`] with all snapshot data.
     SnapshotData {
         /// List of (date_key, snapshot_data) pairs, sorted by date.
-        snapshots: Vec<(crate::service::finalized_state::SnapshotDateKey, crate::service::finalized_state::SnapshotData)>,
+        snapshots: Vec<(
+            crate::service::finalized_state::SnapshotDateKey,
+            crate::service::finalized_state::SnapshotData,
+        )>,
     },
 
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]

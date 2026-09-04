@@ -201,3 +201,40 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         "received counts the existing V plus two intra-block credits of V",
     );
 }
+
+/// Address and holder counts represent addresses with spendable balances, rather than every
+/// historical address retained by the balance index.
+#[test]
+fn address_counts_exclude_zero_balances() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let zero_address = Address::from_script_hash(NetworkKind::Mainnet, [0x00; 20]);
+    let funded_address = Address::from_script_hash(NetworkKind::Mainnet, [0x01; 20]);
+    let funded_balance = Amount::<NonNegative>::try_from(1u64).expect("1 zatoshi is valid");
+
+    let zero_balance = AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 0, 0));
+    let mut positive_balance =
+        AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 1, 0));
+    *positive_balance.balance_mut() = funded_balance;
+
+    let zebra_db = new_ephemeral_zebra_db(&network);
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_transparent_balances_batch(
+        zebra_db.db(),
+        AddressBalanceLocationUpdates::Insert(HashMap::from([
+            (zero_address, zero_balance),
+            (funded_address, positive_balance),
+        ])),
+    );
+    zebra_db
+        .write_batch(batch)
+        .expect("ephemeral db accepts address balances");
+
+    assert_eq!(zebra_db.holder_count(), 1);
+    assert_eq!(zebra_db.address_count(), 1);
+    assert_eq!(
+        zebra_db.top_addresses_by_balance(10),
+        vec![(funded_address, funded_balance)],
+    );
+}

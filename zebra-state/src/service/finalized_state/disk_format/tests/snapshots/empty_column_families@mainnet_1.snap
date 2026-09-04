@@ -8,8 +8,10 @@ expression: empty_column_families
   "ironwood_nullifiers: no entries",
   "orchard_note_commitment_subtree: no entries",
   "orchard_nullifiers: no entries",
+  "realtime_snapshot_data: no entries",
   "sapling_note_commitment_subtree: no entries",
   "sapling_nullifiers: no entries",
+  "snapshot_data_by_date: no entries",
   "sprout_nullifiers: no entries",
   "tx_loc_by_spent_out_loc: no entries",
 ]

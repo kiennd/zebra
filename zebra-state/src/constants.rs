@@ -50,9 +50,11 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 ///   the `ironwood` pool (read code accepts 32/40/48-byte records). Also widens the history-tree
 ///   `zcash_history::Entry` records from 253 to 326 bytes, because NU6.3 adds Ironwood fields to
 ///   `zcash_history::NodeData` (read code accepts the legacy 253-byte width and zero-pads it up to
-///   the current width). New CFs are created and the wider records are read in place when the
-///   database is opened, so this is a major bump that is restorable from the previous major
-///   database format version (no resync, no data migration).
+///   the current width). Snapshot records now include the Ironwood value pool and metrics: read
+///   code accepts the legacy 184-byte and transitional 192-byte widths, while new records use 212
+///   bytes. New CFs are created and the wider records are read in place when the database is opened,
+///   so this is a major bump that is restorable from the previous major database format version (no
+///   resync or data migration).
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a

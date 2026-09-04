@@ -5,7 +5,9 @@ use proptest::prelude::*;
 use zebra_chain::{
     amount::{Amount, NonNegative},
     block::{self, Height},
-    orchard, sapling, sprout,
+    orchard,
+    parameters::NetworkKind,
+    sapling, sprout,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction::{self, Transaction},
     transparent,
@@ -20,7 +22,7 @@ use crate::service::finalized_state::{
             AddressBalanceLocation, AddressLocation, AddressTransaction, AddressUnspentOutput,
             OutputLocation,
         },
-        IntoDisk, TransactionLocation,
+        FromDisk, IntoDisk, TransactionLocation,
     },
 };
 
@@ -144,6 +146,39 @@ fn roundtrip_transparent_address() {
     let _init_guard = zebra_test::init();
 
     proptest!(|(val in any::<transparent::Address>())| assert_value_properties(val));
+}
+
+#[test]
+fn roundtrip_all_transparent_address_disk_variants() {
+    let _init_guard = zebra_test::init();
+
+    let hash_bytes = [0x5a; 20];
+    let addresses = [
+        transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, hash_bytes),
+        transparent::Address::from_script_hash(NetworkKind::Mainnet, hash_bytes),
+        transparent::Address::from_pub_key_hash(NetworkKind::Testnet, hash_bytes),
+        transparent::Address::from_script_hash(NetworkKind::Testnet, hash_bytes),
+        transparent::Address::from_tex(NetworkKind::Mainnet, hash_bytes),
+        transparent::Address::from_tex(NetworkKind::Testnet, hash_bytes),
+    ];
+
+    for (expected_variant, address) in (0u8..=5).zip(addresses) {
+        let disk_bytes = address.as_bytes();
+
+        assert_eq!(disk_bytes[0], expected_variant);
+        assert_eq!(transparent::Address::from_bytes(disk_bytes), address);
+    }
+}
+
+#[test]
+#[should_panic(expected = "invalid transparent address variant: 6")]
+fn reject_unknown_transparent_address_disk_variant() {
+    let _init_guard = zebra_test::init();
+
+    let mut disk_bytes = [0u8; 21];
+    disk_bytes[0] = 6;
+
+    let _ = transparent::Address::from_bytes(disk_bytes);
 }
 
 #[test]

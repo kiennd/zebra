@@ -23,7 +23,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    MAX_BLOCK_REORG_HEIGHT, SemanticallyVerifiedBlock, ValidateContextError,
+    SemanticallyVerifiedBlock, ValidateContextError, MAX_BLOCK_REORG_HEIGHT,
 };
 
 // These types are used in doc links
@@ -37,6 +37,20 @@ use crate::service::{
 ///
 /// We allow enough space for multiple concurrent chain forks with errors.
 const PARENT_ERROR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
+
+/// The maximum best-chain tip age that can trigger a realtime snapshot.
+const REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS: i64 = 3 * 60 * 60;
+
+/// Returns `true` when a finalized block should also update the realtime snapshot.
+fn should_create_realtime_snapshot(
+    enable_realtime_check: bool,
+    non_finalized_len: u32,
+    tip_age_seconds: i64,
+) -> bool {
+    enable_realtime_check
+        && (1..=MAX_BLOCK_REORG_HEIGHT).contains(&non_finalized_len)
+        && tip_age_seconds < REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS
+}
 
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
@@ -69,7 +83,7 @@ pub(crate) fn validate_and_commit_non_finalized(
 /// Check snapshot conditions and create snapshots if needed.
 /// This function is called when blocks are finalized, either through the finalized block channel
 /// (during catch-up) or via commit_finalized_direct (when fully synced).
-/// 
+///
 /// `enable_realtime_check`: if true, enables checking for realtime snapshot conditions (when fully synced);
 ///                          if false, only daily snapshots are considered (during catch-up)
 fn check_and_create_snapshot(
@@ -80,15 +94,18 @@ fn check_and_create_snapshot(
     next_snapshot_timestamp: &mut Option<i64>,
     enable_realtime_check: bool,
 ) {
-    
-    // Set realtime snapshot flag based on parameter and non-finalized length
-    // Only create realtime snapshots if non-finalized length is less than 100
     let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
     let current_time = chrono::Utc::now().timestamp();
-    // Calculate time difference (how old the block is relative to current time)
-    let time_diff = current_time - block_timestamp;
-    let should_realtime_snapshot = enable_realtime_check && non_finalized_len > 0 && non_finalized_len < 100 && time_diff < 3 * 3600;
-    
+    let finalized_block_age_seconds = current_time - block_timestamp;
+    // The finalized block is one rollback window behind the tip, so its timestamp can be many
+    // hours old even when Zebra is synced. Use the non-finalized tip to detect sync progress.
+    let tip_age_seconds = non_finalized_state
+        .best_tip_block()
+        .map(|tip| current_time - tip.block.header.time.timestamp())
+        .unwrap_or(i64::MAX);
+    let should_realtime_snapshot =
+        should_create_realtime_snapshot(enable_realtime_check, non_finalized_len, tip_age_seconds);
+
     let should_daily_snapshot = if block_height.0 == 0 {
         true
     } else {
@@ -103,10 +120,10 @@ fn check_and_create_snapshot(
             }
         }
     };
-    
+
     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
-    
-    // Log snapshot decision for every block
+
+    // Log each positive snapshot decision.
     if should_snapshot {
         tracing::info!(
             ?block_height,
@@ -115,11 +132,12 @@ fn check_and_create_snapshot(
             should_daily_snapshot,
             should_realtime_snapshot,
             non_finalized_len,
-            time_diff,
+            finalized_block_age_seconds,
+            tip_age_seconds,
             "snapshot will be created"
         );
-    } 
-    
+    }
+
     if should_snapshot {
         let network = non_finalized_state.network.clone();
         // Prioritize daily snapshots: use block date for daily snapshots,
@@ -133,7 +151,7 @@ fn check_and_create_snapshot(
         } else {
             "unknown"
         };
-        
+
         tracing::info!(
             ?block_height,
             snapshot_type,
@@ -142,14 +160,17 @@ fn check_and_create_snapshot(
             use_current_date,
             "creating snapshot"
         );
-        
+
         // Retry snapshot until it succeeds - snapshot is required
         let mut retry_count = 0u32;
         let mut delay_ms = 100u64; // Start with 100ms delay
         const MAX_DELAY_MS: u64 = 10_000; // Cap at 10 seconds
-        
+
         loop {
-            match finalized_state.db.store_snapshot_data(block_height, &network, use_current_date) {
+            match finalized_state
+                .db
+                .store_snapshot_data(block_height, &network, use_current_date)
+            {
                 Ok(()) => {
                     if retry_count > 0 {
                         tracing::info!(
@@ -159,7 +180,7 @@ fn check_and_create_snapshot(
                             "snapshot stored successfully after retries"
                         );
                     }
-                    
+
                     if should_daily_snapshot {
                         // Calculate the start of the next UTC day (00:00:00 UTC)
                         let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
@@ -167,19 +188,22 @@ fn check_and_create_snapshot(
                                 // Fallback: if timestamp conversion fails, use epoch
                                 chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
                             });
-                        
+
                         // Get the start of the current UTC day (00:00:00 UTC)
                         let current_date = current_datetime.date_naive();
-                        
+
                         // Get the start of the next day at 00:00:00 UTC
                         let next_date = current_date + chrono::Duration::days(1);
-                        let next_datetime = next_date.and_hms_opt(0, 0, 0)
+                        let next_datetime = next_date
+                            .and_hms_opt(0, 0, 0)
                             .expect("00:00:00 should always be valid");
-                        let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                            next_datetime,
-                            chrono::Utc,
-                        ).timestamp();
-                        
+                        let next_timestamp =
+                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                                next_datetime,
+                                chrono::Utc,
+                            )
+                            .timestamp();
+
                         *next_snapshot_timestamp = Some(next_timestamp);
                     }
                     break; // Success, exit retry loop
@@ -194,10 +218,10 @@ fn check_and_create_snapshot(
                         delay_ms,
                         "failed to store snapshot data to RocksDB, retrying"
                     );
-                    
-                    // Exponential backoff with jitter
+
+                    // Exponential backoff
                     std::thread::sleep(Duration::from_millis(delay_ms));
-                    
+
                     // Exponential backoff: double the delay, capped at MAX_DELAY_MS
                     delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
                 }
@@ -206,11 +230,39 @@ fn check_and_create_snapshot(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn realtime_snapshot_tracks_the_reorg_window() {
+        assert!(should_create_realtime_snapshot(
+            true,
+            MAX_BLOCK_REORG_HEIGHT,
+            0,
+        ));
+        assert!(!should_create_realtime_snapshot(
+            true,
+            MAX_BLOCK_REORG_HEIGHT + 1,
+            0,
+        ));
+        assert!(!should_create_realtime_snapshot(true, 0, 0));
+        assert!(!should_create_realtime_snapshot(
+            false,
+            MAX_BLOCK_REORG_HEIGHT,
+            0,
+        ));
+        assert!(!should_create_realtime_snapshot(
+            true,
+            MAX_BLOCK_REORG_HEIGHT,
+            REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS,
+        ));
+    }
+}
+
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
 /// channels with the latest non-finalized [`ChainTipBlock`] and
 /// [`Chain`].
-///
-/// `last_zebra_mined_log_height` is used to rate-limit logging.
 ///
 /// If `backup_dir_path` is `Some`, the non-finalized state is written to the backup
 /// directory before updating the channels.
@@ -412,7 +464,7 @@ impl WriteBlockWorkerTask {
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees = None;
-        
+
         // Initialize next_snapshot_timestamp from the most recent daily snapshot in the database
         // This handles the case where the node is restarted
         // Use recent_daily_snapshot_data to exclude realtime snapshots
@@ -430,7 +482,8 @@ impl WriteBlockWorkerTask {
                 let next_timestamp = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
                     next_datetime,
                     chrono::Utc,
-                ).timestamp();
+                )
+                .timestamp();
                 Some(next_timestamp)
             });
 
@@ -479,12 +532,12 @@ impl WriteBlockWorkerTask {
                     let block_timestamp = finalized.block.header.time.timestamp();
                     let tip_block = ChainTipBlock::from(finalized);
                     let block_height = tip_block.height;
-                    
+
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     // Check snapshot conditions and create snapshots if needed
                     // During catch-up (commit_finalized), use daily snapshots
                     check_and_create_snapshot(
-                        &finalized_state,
+                        finalized_state,
                         non_finalized_state,
                         block_height,
                         block_timestamp,
@@ -635,31 +688,36 @@ impl WriteBlockWorkerTask {
             {
                 tracing::trace!("finalizing block past the reorg limit");
                 let contextually_verified_with_trees = non_finalized_state.finalize();
-                
+
                 // Extract block information before committing for snapshot logging
                 let (block_height, block_timestamp) = match &contextually_verified_with_trees {
-                    crate::request::FinalizableBlock::Checkpoint { checkpoint_verified } => {
+                    crate::request::FinalizableBlock::Checkpoint {
+                        checkpoint_verified,
+                    } => {
                         let height = checkpoint_verified.height;
                         let timestamp = checkpoint_verified.block.header.time.timestamp();
                         (height, timestamp)
                     }
-                    crate::request::FinalizableBlock::Contextual { contextually_verified, .. } => {
+                    crate::request::FinalizableBlock::Contextual {
+                        contextually_verified,
+                        ..
+                    } => {
                         let height = contextually_verified.height;
                         let timestamp = contextually_verified.block.header.time.timestamp();
                         (height, timestamp)
                     }
                 };
-                
+
                 prev_finalized_note_commitment_trees = finalized_state
                             .commit_finalized_direct(contextually_verified_with_trees, prev_finalized_note_commitment_trees.take(), "commit contextually-verified request")
                             .expect(
                                 "unexpected finalized block commit error: note commitment and history trees were already checked by the non-finalized state",
                             ).1.into();
-                
-                // Check snapshot conditions and create snapshots if needed
-                // This ensures logging happens even when fully synced (blocks finalized via commit_finalized_direct)
+
+                // Check snapshot conditions and create snapshots for blocks finalized directly
+                // while the full verifier is synced.
                 check_and_create_snapshot(
-                    &finalized_state,
+                    finalized_state,
                     non_finalized_state,
                     block_height,
                     block_timestamp,

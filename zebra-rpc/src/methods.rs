@@ -144,10 +144,14 @@ include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 pub(super) const PARAM_VERBOSE_DESC: &str =
     "Boolean flag to indicate verbosity, true for a json object, false for hex encoded data.";
 pub(super) const PARAM_POOL_DESC: &str =
-    "The pool from which subtrees should be returned. Either \"sapling\" or \"orchard\".";
+    "The pool from which subtrees should be returned: \"sapling\", \"orchard\", or \"ironwood\".";
 pub(super) const PARAM_START_INDEX_DESC: &str =
     "The index of the first 2^16-leaf subtree to return.";
-pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to return.";
+pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of items to return.";
+pub(super) const PARAM_START_DATE_DESC: &str =
+    "The first snapshot date to return, in YY:MM:DD format.";
+pub(super) const PARAM_END_DATE_DESC: &str =
+    "The last snapshot date to return, in YY:MM:DD format.";
 pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the parameters.";
 pub(super) const PARAM_INDEX_DESC: &str = "The index of the subtree to return.";
 pub(super) const PARAM_RAW_TRANSACTION_HEX_DESC: &str = "The hex-encoded raw transaction bytes.";
@@ -281,26 +285,20 @@ pub trait Rpc {
     ///
     /// This operation scans the entire balance column family and may be slow.
     #[method(name = "gettopaddresses")]
-    async fn get_top_addresses(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<GetTopAddressesResponse>;
+    async fn get_top_addresses(&self, limit: Option<usize>) -> Result<GetTopAddressesResponse>;
 
     /// Returns holder count snapshots stored in the database.
     ///
     /// method: post
     /// tags: address
     ///
-    /// Returns a list of (height, holder_count) pairs for blocks where
-    /// the height is divisible by 1000, sorted by height.
+    /// Returns daily and latest realtime holder-count snapshots, sorted by date.
     ///
     /// # Parameters
     ///
     /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire holder count column family and may be slow.
+    /// Reads at most `limit` daily records plus the latest realtime record.
     #[method(name = "getholdercountsnapshots")]
     async fn get_holder_count_snapshots(
         &self,
@@ -312,10 +310,10 @@ pub trait Rpc {
     /// method: post
     /// tags: blockchain
     ///
-    /// Returns a list of snapshot data for blocks where the height is divisible by 1000, sorted by height.
+    /// Returns daily and latest realtime snapshots, sorted by date.
     /// Each snapshot contains:
     /// - holder_count: Number of addresses with non-zero balances
-    /// - pool_values: All 5 value pool balances (transparent, sprout, sapling, orchard, deferred)
+    /// - pool_values: All 6 value pool balances (transparent, sprout, sapling, orchard, deferred, ironwood)
     /// - difficulty: Mining difficulty at that height
     /// - total_issuance: Total ZEC issued up to that height
     /// - inflation_rate: Annual inflation rate percentage
@@ -325,14 +323,9 @@ pub trait Rpc {
     ///
     /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
     ///
-    /// # Warning
-    ///
-    /// This operation scans the snapshot data column family and may be slow.
+    /// Reads at most `limit` daily records plus the latest realtime record.
     #[method(name = "getsnapshotdata")]
-    async fn get_snapshot_data(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<GetSnapshotDataResponse>;
+    async fn get_snapshot_data(&self, limit: Option<usize>) -> Result<GetSnapshotDataResponse>;
 
     /// Returns dashboard data from snapshots filtered by date range.
     ///
@@ -461,7 +454,7 @@ pub trait Rpc {
     #[method(name = "getrawmempool")]
     async fn get_raw_mempool(&self, verbose: Option<bool>) -> Result<GetRawMempoolResponse>;
 
-    /// Returns information about the given block's Sapling & Orchard tree state.
+    /// Returns information about the given block's Sapling, Orchard, and Ironwood tree state.
     ///
     /// zcashd reference: [`z_gettreestate`](https://zcash.github.io/rpc/z_gettreestate.html)
     /// method: post
@@ -480,7 +473,7 @@ pub trait Rpc {
     #[method(name = "z_gettreestate")]
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse>;
 
-    /// Returns information about a range of Sapling or Orchard subtrees.
+    /// Returns information about a range of Sapling, Orchard, or Ironwood subtrees.
     ///
     /// zcashd reference: [`z_getsubtreesbyindex`](https://zcash.github.io/rpc/z_getsubtreesbyindex.html) - TODO: fix link
     /// method: post
@@ -488,7 +481,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `pool`: (string, required) The pool from which subtrees should be returned. Either "sapling" or "orchard".
+    /// - `pool`: (string, required) The pool from which subtrees should be returned: "sapling", "orchard", or "ironwood".
     /// - `start_index`: (number, required) The index of the first 2^16-leaf subtree to return.
     /// - `limit`: (number, optional) The maximum number of subtree values to return.
     ///
@@ -1391,10 +1384,7 @@ where
         }
     }
 
-    async fn get_top_addresses(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<GetTopAddressesResponse> {
+    async fn get_top_addresses(&self, limit: Option<usize>) -> Result<GetTopAddressesResponse> {
         let limit = limit.unwrap_or(10);
         let request = zebra_state::ReadRequest::TopAddressesByBalance { limit };
         let response = self
@@ -1426,7 +1416,7 @@ where
     ) -> Result<GetHolderCountSnapshotsResponse> {
         // Reuse the snapshot data API and extract holder_count
         let snapshot_response = self.get_snapshot_data(limit).await?;
-        
+
         Ok(GetHolderCountSnapshotsResponse {
             snapshots: snapshot_response
                 .snapshots()
@@ -1451,43 +1441,48 @@ where
             if parts.len() != 3 {
                 return Err(format!("Expected format YY:MM:DD, got: {}", date_str));
             }
-            
-            let year = parts[0].parse::<u8>()
+
+            let year = parts[0]
+                .parse::<u8>()
                 .map_err(|_| format!("Invalid year: {}", parts[0]))?;
-            let month = parts[1].parse::<u8>()
+            let month = parts[1]
+                .parse::<u8>()
                 .map_err(|_| format!("Invalid month: {}", parts[1]))?;
-            let day = parts[2].parse::<u8>()
+            let day = parts[2]
+                .parse::<u8>()
                 .map_err(|_| format!("Invalid day: {}", parts[2]))?;
-            
-            if month < 1 || month > 12 {
+
+            if !(1..=12).contains(&month) {
                 return Err(format!("Month must be 1-12, got: {}", month));
             }
-            if day < 1 || day > 31 {
+            if !(1..=31).contains(&day) {
                 return Err(format!("Day must be 1-31, got: {}", day));
             }
-            
+
             Ok((year, month, day))
         }
-        
+
         // Parse date strings to (year, month, day) tuples for comparison
         let start_date_tuple = if let Some(date_str) = start_date.as_ref() {
-            Some(parse_date_key(date_str)
-                .map_err(|e| ErrorObject::owned(
+            Some(parse_date_key(date_str).map_err(|e| {
+                ErrorObject::owned(
                     ErrorCode::InvalidParams.code(),
                     format!("Invalid start_date format: {}", e),
                     None::<()>,
-                ))?)
+                )
+            })?)
         } else {
             None
         };
-        
+
         let end_date_tuple = if let Some(date_str) = end_date.as_ref() {
-            Some(parse_date_key(date_str)
-                .map_err(|e| ErrorObject::owned(
+            Some(parse_date_key(date_str).map_err(|e| {
+                ErrorObject::owned(
                     ErrorCode::InvalidParams.code(),
                     format!("Invalid end_date format: {}", e),
                     None::<()>,
-                ))?)
+                )
+            })?)
         } else {
             None
         };
@@ -1504,11 +1499,13 @@ where
 
         let all_snapshots = match snapshot_response {
             zebra_state::ReadResponse::SnapshotData { snapshots } => snapshots,
-            _ => return Err(ErrorObject::owned(
-                ErrorCode::InternalError.code(),
-                "Unexpected response type".to_string(),
-                None::<()>,
-            ).into()),
+            _ => {
+                return Err(ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    "Unexpected response type".to_string(),
+                    None::<()>,
+                ))
+            }
         };
 
         // Filter by date range
@@ -1516,8 +1513,8 @@ where
             .into_iter()
             .filter(|(date_key, _)| {
                 let date_tuple = (date_key.year, date_key.month, date_key.day);
-                let matches_start = start_date_tuple.map_or(true, |start| date_tuple >= start);
-                let matches_end = end_date_tuple.map_or(true, |end| date_tuple <= end);
+                let matches_start = start_date_tuple.is_none_or(|start| date_tuple >= start);
+                let matches_end = end_date_tuple.is_none_or(|end| date_tuple <= end);
                 matches_start && matches_end
             })
             .collect();
@@ -1528,7 +1525,10 @@ where
             .map(|(date_key, snapshot_data)| {
                 let pool_values = snapshot_data.pool_values();
                 SnapshotDataEntry {
-                    date_key: format!("{:02}:{:02}:{:02}", date_key.year, date_key.month, date_key.day),
+                    date_key: format!(
+                        "{:02}:{:02}:{:02}",
+                        date_key.year, date_key.month, date_key.day
+                    ),
                     height: snapshot_data.block_height(),
                     holder_count: snapshot_data.holder_count(),
                     pool_transparent: pool_values.transparent_amount(),
@@ -1536,16 +1536,19 @@ where
                     pool_sapling: pool_values.sapling_amount(),
                     pool_orchard: pool_values.orchard_amount(),
                     pool_deferred: pool_values.deferred_amount(),
+                    pool_ironwood: pool_values.ironwood_amount(),
                     difficulty: snapshot_data.work_difficulty(),
                     total_issuance: snapshot_data.total_issuance(),
                     inflation_rate_percent: snapshot_data.inflation_rate_percent(),
                     block_timestamp: snapshot_data.block_timestamp(),
                     transparent_tx_count: snapshot_data.transparent_tx_count(),
                     transparent_coinbase_tx_count: snapshot_data.transparent_coinbase_tx_count(),
-                    shielded_coinbase_migration_tx_count: snapshot_data.shielded_coinbase_migration_tx_count(),
+                    shielded_coinbase_migration_tx_count: snapshot_data
+                        .shielded_coinbase_migration_tx_count(),
                     sprout_tx_count: snapshot_data.sprout_tx_count(),
                     sapling_tx_count: snapshot_data.sapling_tx_count(),
                     orchard_tx_count: snapshot_data.orchard_tx_count(),
+                    ironwood_tx_count: snapshot_data.ironwood_tx_count(),
                     transparent_inflow: snapshot_data.transparent_inflow(),
                     transparent_outflow: snapshot_data.transparent_outflow(),
                     sprout_inflow: snapshot_data.sprout_inflow(),
@@ -1554,6 +1557,8 @@ where
                     sapling_outflow: snapshot_data.sapling_outflow(),
                     orchard_inflow: snapshot_data.orchard_inflow(),
                     orchard_outflow: snapshot_data.orchard_outflow(),
+                    ironwood_inflow: snapshot_data.ironwood_inflow(),
+                    ironwood_outflow: snapshot_data.ironwood_outflow(),
                     average_block_time: snapshot_data.average_block_time(),
                     average_block_fee_zat: snapshot_data.average_block_fee_zat(),
                     average_block_size: snapshot_data.average_block_size(),
@@ -1561,15 +1566,10 @@ where
             })
             .collect();
 
-        Ok(GetDashboardDataResponse {
-            entries,
-        })
+        Ok(GetDashboardDataResponse { entries })
     }
 
-    async fn get_snapshot_data(
-        &self,
-        limit: Option<usize>,
-    ) -> Result<GetSnapshotDataResponse> {
+    async fn get_snapshot_data(&self, limit: Option<usize>) -> Result<GetSnapshotDataResponse> {
         let limit = limit.unwrap_or(100);
         let request = zebra_state::ReadRequest::SnapshotData { limit };
         let response = self
@@ -1580,46 +1580,51 @@ where
             .map_misc_error()?;
 
         match response {
-            zebra_state::ReadResponse::SnapshotData { snapshots } => {
-                Ok(GetSnapshotDataResponse {
-                    snapshots: snapshots
-                        .into_iter()
-                        .map(|(date_key, snapshot_data)| {
-                            SnapshotDataEntry {
-                                date_key: format!("{:02}:{:02}:{:02}", date_key.year, date_key.month, date_key.day),
-                                height: snapshot_data.block_height(),
-                                holder_count: snapshot_data.holder_count(),
-                                pool_transparent: snapshot_data.pool_values().transparent_amount(),
-                                pool_sprout: snapshot_data.pool_values().sprout_amount(),
-                                pool_sapling: snapshot_data.pool_values().sapling_amount(),
-                                pool_orchard: snapshot_data.pool_values().orchard_amount(),
-                                pool_deferred: snapshot_data.pool_values().deferred_amount(),
-                                difficulty: snapshot_data.work_difficulty(),
-                                total_issuance: snapshot_data.total_issuance(),
-                                inflation_rate_percent: snapshot_data.inflation_rate_percent(),
-                                block_timestamp: snapshot_data.block_timestamp(),
-                                transparent_tx_count: snapshot_data.transparent_tx_count(),
-                                transparent_coinbase_tx_count: snapshot_data.transparent_coinbase_tx_count(),
-                                shielded_coinbase_migration_tx_count: snapshot_data.shielded_coinbase_migration_tx_count(),
-                                sprout_tx_count: snapshot_data.sprout_tx_count(),
-                                sapling_tx_count: snapshot_data.sapling_tx_count(),
-                                orchard_tx_count: snapshot_data.orchard_tx_count(),
-                                transparent_inflow: snapshot_data.transparent_inflow(),
-                                transparent_outflow: snapshot_data.transparent_outflow(),
-                                sprout_inflow: snapshot_data.sprout_inflow(),
-                                sprout_outflow: snapshot_data.sprout_outflow(),
-                                sapling_inflow: snapshot_data.sapling_inflow(),
-                                sapling_outflow: snapshot_data.sapling_outflow(),
-                                orchard_inflow: snapshot_data.orchard_inflow(),
-                                orchard_outflow: snapshot_data.orchard_outflow(),
-                                average_block_time: snapshot_data.average_block_time(),
-                                average_block_fee_zat: snapshot_data.average_block_fee_zat(),
-                                average_block_size: snapshot_data.average_block_size(),
-                            }
-                        })
-                        .collect(),
-                })
-            }
+            zebra_state::ReadResponse::SnapshotData { snapshots } => Ok(GetSnapshotDataResponse {
+                snapshots: snapshots
+                    .into_iter()
+                    .map(|(date_key, snapshot_data)| SnapshotDataEntry {
+                        date_key: format!(
+                            "{:02}:{:02}:{:02}",
+                            date_key.year, date_key.month, date_key.day
+                        ),
+                        height: snapshot_data.block_height(),
+                        holder_count: snapshot_data.holder_count(),
+                        pool_transparent: snapshot_data.pool_values().transparent_amount(),
+                        pool_sprout: snapshot_data.pool_values().sprout_amount(),
+                        pool_sapling: snapshot_data.pool_values().sapling_amount(),
+                        pool_orchard: snapshot_data.pool_values().orchard_amount(),
+                        pool_deferred: snapshot_data.pool_values().deferred_amount(),
+                        pool_ironwood: snapshot_data.pool_values().ironwood_amount(),
+                        difficulty: snapshot_data.work_difficulty(),
+                        total_issuance: snapshot_data.total_issuance(),
+                        inflation_rate_percent: snapshot_data.inflation_rate_percent(),
+                        block_timestamp: snapshot_data.block_timestamp(),
+                        transparent_tx_count: snapshot_data.transparent_tx_count(),
+                        transparent_coinbase_tx_count: snapshot_data
+                            .transparent_coinbase_tx_count(),
+                        shielded_coinbase_migration_tx_count: snapshot_data
+                            .shielded_coinbase_migration_tx_count(),
+                        sprout_tx_count: snapshot_data.sprout_tx_count(),
+                        sapling_tx_count: snapshot_data.sapling_tx_count(),
+                        orchard_tx_count: snapshot_data.orchard_tx_count(),
+                        ironwood_tx_count: snapshot_data.ironwood_tx_count(),
+                        transparent_inflow: snapshot_data.transparent_inflow(),
+                        transparent_outflow: snapshot_data.transparent_outflow(),
+                        sprout_inflow: snapshot_data.sprout_inflow(),
+                        sprout_outflow: snapshot_data.sprout_outflow(),
+                        sapling_inflow: snapshot_data.sapling_inflow(),
+                        sapling_outflow: snapshot_data.sapling_outflow(),
+                        orchard_inflow: snapshot_data.orchard_inflow(),
+                        orchard_outflow: snapshot_data.orchard_outflow(),
+                        ironwood_inflow: snapshot_data.ironwood_inflow(),
+                        ironwood_outflow: snapshot_data.ironwood_outflow(),
+                        average_block_time: snapshot_data.average_block_time(),
+                        average_block_fee_zat: snapshot_data.average_block_fee_zat(),
+                        average_block_size: snapshot_data.average_block_size(),
+                    })
+                    .collect(),
+            }),
             _ => unreachable!("Unexpected response from state service: {response:?}"),
         }
     }
@@ -4233,33 +4238,14 @@ pub struct GetAddressBalanceResponse {
 pub use self::GetAddressBalanceResponse as AddressBalance;
 
 /// Response to [`RpcServer::get_address_count`] RPC method.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetAddressCountResponse {
     /// The total number of addresses with balances.
     pub count: usize,
 }
 
 /// A single address with its balance for [`GetTopAddressesResponse`].
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct TopAddress {
     /// The address string.
     pub address: String,
@@ -4268,32 +4254,14 @@ pub struct TopAddress {
 }
 
 /// Response to [`RpcServer::get_top_addresses`] RPC method.
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetTopAddressesResponse {
     /// List of top addresses with their balances, sorted by balance descending.
     pub addresses: Vec<TopAddress>,
 }
 
 /// A single holder count snapshot entry.
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct HolderCountSnapshot {
     /// The date key at which this snapshot was taken (format: "YY:MM:DD").
     pub date_key: String,
@@ -4306,31 +4274,15 @@ pub struct HolderCountSnapshot {
 }
 
 /// Response to [`RpcServer::get_holder_count_snapshots`] RPC method.
-#[derive(
-    Clone,
-    Debug,
-    Eq,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetHolderCountSnapshotsResponse {
-    /// List of holder count snapshots, sorted by height.
+    /// List of holder count snapshots, sorted by date.
     pub snapshots: Vec<HolderCountSnapshot>,
 }
 
 /// A single snapshot data entry.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct SnapshotDataEntry {
     /// The date key at which this snapshot was taken (format: "YY:MM:DD").
     pub date_key: String,
@@ -4355,6 +4307,11 @@ pub struct SnapshotDataEntry {
     /// Deferred pool value (in zatoshis).
     #[getter(copy)]
     pub pool_deferred: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    /// Ironwood pool value (in zatoshis).
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub pool_ironwood: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
     /// Mining work difficulty (as a multiple of the minimum difficulty, f64).
     /// This matches the value returned by the `getdifficulty` RPC method.
     pub difficulty: f64,
@@ -4377,10 +4334,10 @@ pub struct SnapshotDataEntry {
     pub transparent_coinbase_tx_count: u32,
     /// Number of shielded coinbase migration transactions (from previous snapshot to this snapshot).
     /// These are transactions that spend coinbase UTXOs and send to shielded addresses.
-    /// Note: This is an approximation and may include some non-migration transactions.
     #[getter(copy)]
     pub shielded_coinbase_migration_tx_count: u32,
     /// Number of sprout transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase migration transactions to avoid double counting.
     #[getter(copy)]
     pub sprout_tx_count: u32,
     /// Number of sapling transactions (from previous snapshot to this snapshot).
@@ -4391,30 +4348,46 @@ pub struct SnapshotDataEntry {
     /// Excludes shielded coinbase migration transactions to avoid double counting.
     #[getter(copy)]
     pub orchard_tx_count: u32,
+    /// Number of Ironwood transactions (from previous snapshot to this snapshot).
+    /// Excludes shielded coinbase migration transactions to avoid double counting.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub ironwood_tx_count: u32,
     /// Transparent pool inflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub transparent_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub transparent_inflow: u64,
     /// Transparent pool outflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub transparent_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub transparent_outflow: u64,
     /// Sprout pool inflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub sprout_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub sprout_inflow: u64,
     /// Sprout pool outflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub sprout_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub sprout_outflow: u64,
     /// Sapling pool inflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub sapling_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub sapling_inflow: u64,
     /// Sapling pool outflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub sapling_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub sapling_outflow: u64,
     /// Orchard pool inflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub orchard_inflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub orchard_inflow: u64,
     /// Orchard pool outflow (from previous snapshot to this snapshot, in zatoshis).
     #[getter(copy)]
-    pub orchard_outflow: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
+    pub orchard_outflow: u64,
+    /// Ironwood pool inflow (from previous snapshot to this snapshot, in zatoshis).
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub ironwood_inflow: u64,
+    /// Ironwood pool outflow (from previous snapshot to this snapshot, in zatoshis).
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub ironwood_outflow: u64,
     /// Average block time in seconds (from previous snapshot to this snapshot).
     #[getter(copy)]
     pub average_block_time: f32,
@@ -4427,33 +4400,88 @@ pub struct SnapshotDataEntry {
 }
 
 /// Response to [`RpcServer::get_snapshot_data`] RPC method.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetSnapshotDataResponse {
-    /// List of snapshot data entries, sorted by height.
+    /// List of snapshot data entries, sorted by date.
     pub snapshots: Vec<SnapshotDataEntry>,
 }
 
 /// Response to [`RpcServer::get_dashboard_data`] RPC method.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    Getters,
-    new,
-)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetDashboardDataResponse {
     /// List of dashboard data entries, sorted by date.
     pub entries: Vec<SnapshotDataEntry>,
+}
+
+#[cfg(test)]
+mod snapshot_data_entry_ironwood_tests {
+    use super::SnapshotDataEntry;
+    use zebra_chain::amount::{Amount, NonNegative};
+
+    #[test]
+    fn ironwood_fields_round_trip_and_default_when_missing() {
+        let zero = Amount::<NonNegative>::zero();
+        let ironwood = Amount::try_from(42u64).expect("test amount must be valid");
+        let entry = SnapshotDataEntry {
+            date_key: "26:09:04".to_string(),
+            height: 1,
+            holder_count: 2,
+            pool_transparent: zero,
+            pool_sprout: zero,
+            pool_sapling: zero,
+            pool_orchard: zero,
+            pool_deferred: zero,
+            pool_ironwood: ironwood,
+            difficulty: 3.5,
+            total_issuance: zero,
+            inflation_rate_percent: 4.5,
+            block_timestamp: 5,
+            transparent_tx_count: 6,
+            transparent_coinbase_tx_count: 7,
+            shielded_coinbase_migration_tx_count: 8,
+            sprout_tx_count: 9,
+            sapling_tx_count: 10,
+            orchard_tx_count: 11,
+            ironwood_tx_count: 12,
+            transparent_inflow: 0,
+            transparent_outflow: 0,
+            sprout_inflow: 0,
+            sprout_outflow: 0,
+            sapling_inflow: 0,
+            sapling_outflow: 0,
+            orchard_inflow: 0,
+            orchard_outflow: 0,
+            ironwood_inflow: 42,
+            ironwood_outflow: 43,
+            average_block_time: 13.5,
+            average_block_fee_zat: zero,
+            average_block_size: 14,
+        };
+
+        let mut json = serde_json::to_value(&entry).expect("snapshot entry must serialize");
+        let round_trip: SnapshotDataEntry =
+            serde_json::from_value(json.clone()).expect("snapshot entry must deserialize");
+        assert_eq!(round_trip, entry);
+
+        let object = json
+            .as_object_mut()
+            .expect("snapshot entry must serialize as an object");
+        for field in [
+            "pool_ironwood",
+            "ironwood_tx_count",
+            "ironwood_inflow",
+            "ironwood_outflow",
+        ] {
+            assert!(object.remove(field).is_some(), "missing {field} JSON field");
+        }
+
+        let legacy: SnapshotDataEntry =
+            serde_json::from_value(json).expect("legacy snapshot JSON must deserialize");
+        assert_eq!(legacy.pool_ironwood, zero);
+        assert_eq!(legacy.ironwood_tx_count, 0);
+        assert_eq!(legacy.ironwood_inflow, 0);
+        assert_eq!(legacy.ironwood_outflow, 0);
+    }
 }
 
 /// Parameters of [`RpcServer::get_address_utxos`] RPC method.

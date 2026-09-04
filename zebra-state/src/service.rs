@@ -1679,70 +1679,32 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // For the get_address_count RPC.
-            ReadRequest::AddressCount => {
-                let state = self.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(move || {
-                        let count = state.db.address_count();
-
-                        // The work is done in the future.
-                        timer.finish(module_path!(), line!(), "ReadRequest::AddressCount");
-
-                        Ok(ReadResponse::AddressCount { count })
-                    })
-                })
-                .wait_for_panics()
-            }
+            ReadRequest::AddressCount => Ok(ReadResponse::AddressCount {
+                count: state.db.address_count(),
+            }),
 
             // For the get_top_addresses RPC.
             ReadRequest::HolderCountSnapshots { limit } => {
-                let timer = CodeTimer::start();
-                let state = self.clone();
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(move || {
-                        // Reuse snapshot data logic and extract holder_count
-                        let snapshots = state.db.recent_snapshot_data(limit)
-                            .into_iter()
-                            .map(|(date_key, snapshot_data)| (date_key, snapshot_data.holder_count()))
-                            .collect();
-                        timer.finish(module_path!(), line!(), "ReadRequest::HolderCountSnapshots");
-                        Ok(ReadResponse::HolderCountSnapshots { snapshots })
-                    })
-                })
-                .wait_for_panics()
+                // Reuse snapshot data logic and extract holder_count.
+                let snapshots = state
+                    .db
+                    .recent_snapshot_data(limit)
+                    .into_iter()
+                    .map(|(date_key, snapshot_data)| (date_key, snapshot_data.holder_count()))
+                    .collect();
+
+                Ok(ReadResponse::HolderCountSnapshots { snapshots })
             }
             ReadRequest::SnapshotData { limit } => {
-                let timer = CodeTimer::start();
-                let state = self.clone();
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(move || {
-                        // Use efficient reverse iteration to get only the last N snapshots
-                        let snapshots = state.db.recent_snapshot_data(limit);
-                        timer.finish(module_path!(), line!(), "ReadRequest::SnapshotData");
-                        Ok(ReadResponse::SnapshotData { snapshots })
-                    })
-                })
-                .wait_for_panics()
+                // Use efficient reverse iteration to get only the last N snapshots.
+                let snapshots = state.db.recent_snapshot_data(limit);
+
+                Ok(ReadResponse::SnapshotData { snapshots })
             }
             ReadRequest::TopAddressesByBalance { limit } => {
-                let state = self.clone();
+                let addresses = state.db.top_addresses_by_balance(limit);
 
-                tokio::task::spawn_blocking(move || {
-                    span.in_scope(move || {
-                        let addresses = state.db.top_addresses_by_balance(limit);
-
-                        // The work is done in the future.
-                        timer.finish(
-                            module_path!(),
-                            line!(),
-                            "ReadRequest::TopAddressesByBalance",
-                        );
-
-                        Ok(ReadResponse::TopAddressesByBalance { addresses })
-                    })
-                })
-                .wait_for_panics()
+                Ok(ReadResponse::TopAddressesByBalance { addresses })
             }
 
             // For the get_address_tx_ids RPC.

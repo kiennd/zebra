@@ -388,10 +388,7 @@ impl ZebraDb {
     /// This operation scans the entire balance column family and may be slow.
     /// It should be run in a blocking thread to avoid hanging the tokio executor.
     pub fn address_count(&self) -> usize {
-        let balance_by_transparent_addr = self.address_balance_cf();
-        self.db
-            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
-            .count()
+        self.holder_count()
     }
 
     /// Returns the number of holders (addresses with non-zero balances) in the finalized state.
@@ -403,26 +400,21 @@ impl ZebraDb {
     pub fn holder_count(&self) -> usize {
         let balance_by_transparent_addr = self.address_balance_cf();
         self.db
-            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
-            .filter(|(_address, balance_location): &(transparent::Address, AddressBalanceLocation)| {
-                balance_location.balance() > Amount::<NonNegative>::zero()
-            })
+            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(
+                &balance_by_transparent_addr,
+                ..,
+            )
+            .filter(
+                |(_address, balance_location): &(transparent::Address, AddressBalanceLocation)| {
+                    balance_location.balance() > Amount::<NonNegative>::zero()
+                },
+            )
             .count()
     }
 
     // Snapshot-related methods have been moved to the `snapshot` module.
     // Use `zebra_db::snapshot::*` functions instead.
 
-    /// Returns the top N addresses by balance in the finalized state.
-    ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
-    /// It should be run in a blocking thread to avoid hanging the tokio executor.
-    ///
-    /// # Parameters
-    ///
-    /// - `limit`: Maximum number of addresses to return
     /// Returns the top N addresses by balance in the finalized state.
     ///
     /// # Warning
@@ -441,15 +433,20 @@ impl ZebraDb {
 
         let mut addresses_with_balances: Vec<(transparent::Address, Amount<NonNegative>)> = self
             .db
-            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(&balance_by_transparent_addr, ..)
-            .filter_map(|(address, balance_location): (transparent::Address, AddressBalanceLocation)| {
-                let balance = balance_location.balance();
-                if balance > Amount::<NonNegative>::zero() {
-                    Some((address, balance))
-                } else {
-                    None
-                }
-            })
+            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(
+                &balance_by_transparent_addr,
+                ..,
+            )
+            .filter_map(
+                |(address, balance_location): (transparent::Address, AddressBalanceLocation)| {
+                    let balance = balance_location.balance();
+                    if balance > Amount::<NonNegative>::zero() {
+                        Some((address, balance))
+                    } else {
+                        None
+                    }
+                },
+            )
             .collect();
 
         // Sort by balance descending

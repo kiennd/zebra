@@ -1416,9 +1416,7 @@ pub enum ReadRequest {
 
     /// Returns holder count snapshots stored in the database.
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire holder count column family and may be slow.
+    /// Reads at most `limit` daily records plus the latest realtime record.
     HolderCountSnapshots {
         /// Maximum number of snapshots to return.
         limit: usize,
@@ -1426,9 +1424,7 @@ pub enum ReadRequest {
 
     /// Returns snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
     ///
-    /// # Warning
-    ///
-    /// This operation scans the snapshot data column family and may be slow.
+    /// Reads at most `limit` daily records plus the latest realtime record.
     SnapshotData {
         /// Maximum number of snapshots to return.
         limit: usize,
