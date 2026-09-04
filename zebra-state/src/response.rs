@@ -501,9 +501,9 @@ pub enum ReadResponse {
         received: u64,
     },
 
-    /// Response to [`ReadRequest::AddressCount`] with the total number of addresses.
+    /// Response to [`ReadRequest::AddressCount`] with the funded transparent address count.
     AddressCount {
-        /// The total number of addresses with balances.
+        /// The number of transparent addresses with positive finalized balances.
         count: usize,
     },
 
@@ -513,9 +513,10 @@ pub enum ReadResponse {
         addresses: Vec<(transparent::Address, Amount<NonNegative>)>,
     },
 
-    /// Response to [`ReadRequest::HolderCountSnapshots`] with all holder count snapshots.
+    /// Response to [`ReadRequest::HolderCountSnapshots`] with all funded transparent address
+    /// count snapshots. The variant retains its legacy name for compatibility.
     HolderCountSnapshots {
-        /// List of (date_key, holder_count) pairs, sorted by date.
+        /// List of (date key, funded transparent address count) pairs, sorted by date.
         snapshots: Vec<(crate::service::finalized_state::SnapshotDateKey, u64)>,
     },
 

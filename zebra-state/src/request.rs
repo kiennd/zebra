@@ -1397,11 +1397,10 @@ pub enum ReadRequest {
     /// balance of the set of addresses.
     AddressBalance(HashSet<transparent::Address>),
 
-    /// Returns the total number of addresses with balances in the finalized state.
+    /// Returns the number of transparent addresses with positive balances in the finalized state.
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
+    /// The count is read in O(1) when the analytics accumulator is available. Legacy databases
+    /// fall back to scanning the balance column family.
     AddressCount,
 
     /// Returns the top N addresses by balance in the finalized state.
@@ -1414,7 +1413,10 @@ pub enum ReadRequest {
         limit: usize,
     },
 
-    /// Returns holder count snapshots stored in the database.
+    /// Returns funded transparent address count snapshots stored in the database.
+    ///
+    /// The variant retains its legacy name for compatibility. It does not count people, shielded
+    /// addresses, or shielded holders.
     ///
     /// Reads at most `limit` daily records plus the latest realtime record.
     HolderCountSnapshots {
@@ -1422,10 +1424,25 @@ pub enum ReadRequest {
         limit: usize,
     },
 
-    /// Returns snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
+    /// Returns snapshot data (funded transparent address count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
     ///
     /// Reads at most `limit` daily records plus the latest realtime record.
     SnapshotData {
+        /// Maximum number of snapshots to return.
+        limit: usize,
+    },
+
+    /// Returns snapshot data within an inclusive date range.
+    ///
+    /// Dates use the `(year, month, day)` components of [`SnapshotDateKey`], and results are
+    /// returned in ascending date order. The result is capped at `limit` records.
+    ///
+    /// [`SnapshotDateKey`]: crate::service::finalized_state::SnapshotDateKey
+    SnapshotDataByDateRange {
+        /// Optional inclusive start date as `(year, month, day)`.
+        start_date: Option<(u8, u8, u8)>,
+        /// Optional inclusive end date as `(year, month, day)`.
+        end_date: Option<(u8, u8, u8)>,
         /// Maximum number of snapshots to return.
         limit: usize,
     },
@@ -1540,6 +1557,12 @@ pub enum ReadRequest {
 }
 
 impl ReadRequest {
+    /// Maximum number of addresses returned by a top-address request.
+    pub const MAX_TOP_ADDRESSES_RESULTS: usize = 1_000;
+
+    /// Maximum number of snapshot records returned by a public request.
+    pub const MAX_SNAPSHOT_DATA_RESULTS: usize = 10_000;
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -1573,6 +1596,7 @@ impl ReadRequest {
             ReadRequest::TopAddressesByBalance { .. } => "top_addresses_by_balance",
             ReadRequest::HolderCountSnapshots { .. } => "holder_count_snapshots",
             ReadRequest::SnapshotData { .. } => "snapshot_data",
+            ReadRequest::SnapshotDataByDateRange { .. } => "snapshot_data_by_date_range",
             ReadRequest::TransactionIdsByAddresses { .. } => "transaction_ids_by_addresses",
             ReadRequest::UtxosByAddresses { .. } => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {

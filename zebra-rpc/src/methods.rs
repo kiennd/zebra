@@ -40,7 +40,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use derive_getters::Getters;
 use derive_new::new;
 use futures::{future::OptionFuture, stream::FuturesOrdered, StreamExt, TryFutureExt};
@@ -175,6 +175,83 @@ pub(super) const PARAM_N_DESC: &str = "The output index in the transaction.";
 pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
     "Whether to include mempool transactions in the response.";
 
+const DEFAULT_TOP_ADDRESSES_RESULTS: usize = 10;
+const DEFAULT_SNAPSHOT_DATA_RESULTS: usize = 100;
+const DEFAULT_DASHBOARD_DATA_RESULTS: usize = ReadRequest::MAX_SNAPSHOT_DATA_RESULTS;
+
+fn validated_rpc_limit(
+    limit: Option<usize>,
+    default: usize,
+    maximum: usize,
+) -> std::result::Result<usize, String> {
+    let limit = limit.unwrap_or(default);
+    if limit > maximum {
+        return Err(format!("limit must be at most {maximum}, got {limit}"));
+    }
+
+    Ok(limit)
+}
+
+fn validated_paginated_rpc_limit(
+    limit: Option<usize>,
+    default: usize,
+    maximum: usize,
+) -> std::result::Result<usize, String> {
+    let limit = validated_rpc_limit(limit, default, maximum)?;
+    if limit == 0 {
+        return Err("limit must be at least 1 for a paginated request".to_string());
+    }
+
+    Ok(limit)
+}
+
+fn parse_snapshot_date(date: &str) -> std::result::Result<(u8, u8, u8), String> {
+    let bytes = date.as_bytes();
+    let has_exact_format = bytes.len() == 8
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 2 | 5) || byte.is_ascii_digit());
+    if !has_exact_format {
+        return Err(format!("expected format YY:MM:DD, got: {date}"));
+    }
+
+    let year = date[0..2]
+        .parse::<u8>()
+        .map_err(|_| format!("invalid year: {}", &date[0..2]))?;
+    let month = date[3..5]
+        .parse::<u8>()
+        .map_err(|_| format!("invalid month: {}", &date[3..5]))?;
+    let day = date[6..8]
+        .parse::<u8>()
+        .map_err(|_| format!("invalid day: {}", &date[6..8]))?;
+
+    NaiveDate::from_ymd_opt(2000 + i32::from(year), u32::from(month), u32::from(day))
+        .ok_or_else(|| format!("date does not exist: {date}"))?;
+
+    Ok((year, month, day))
+}
+
+fn validate_snapshot_date_range(
+    start_date: Option<(u8, u8, u8)>,
+    end_date: Option<(u8, u8, u8)>,
+) -> std::result::Result<(), String> {
+    if start_date
+        .zip(end_date)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err("start_date must not be after end_date".to_string());
+    }
+
+    Ok(())
+}
+
+fn invalid_params(message: impl Into<String>) -> ErrorObject<'static> {
+    ErrorObject::owned(ErrorCode::InvalidParams.code(), message.into(), None::<()>)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -261,16 +338,28 @@ pub trait Rpc {
         address_strings: GetAddressBalanceRequest,
     ) -> Result<GetAddressBalanceResponse>;
 
-    /// Returns the total number of addresses with balances in the finalized state.
+    /// Returns the number of transparent addresses with positive balances in the finalized state.
+    ///
+    /// This legacy method does not count people, shielded addresses, or shielded holders.
     ///
     /// method: post
     /// tags: address
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
+    /// The count is read in O(1) from the analytics accumulator. Databases created before that
+    /// accumulator was introduced fall back to a full balance-index scan per request.
     #[method(name = "getaddresscount")]
     async fn get_address_count(&self) -> Result<GetAddressCountResponse>;
+
+    /// Returns the number of transparent addresses with positive balances in the finalized state.
+    ///
+    /// method: post
+    /// tags: address
+    ///
+    /// This metric is not a count of people, shielded addresses, or shielded holders.
+    #[method(name = "getfundedtransparentaddresscount")]
+    async fn get_funded_transparent_address_count(
+        &self,
+    ) -> Result<GetFundedTransparentAddressCountResponse>;
 
     /// Returns the top N addresses by balance in the finalized state.
     ///
@@ -279,7 +368,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `limit`: (number, optional, default=10) Maximum number of addresses to return
+    /// - `limit`: (number, optional, default=10, maximum=1000) Maximum number of addresses to return
     ///
     /// # Warning
     ///
@@ -287,16 +376,18 @@ pub trait Rpc {
     #[method(name = "gettopaddresses")]
     async fn get_top_addresses(&self, limit: Option<usize>) -> Result<GetTopAddressesResponse>;
 
-    /// Returns holder count snapshots stored in the database.
+    /// Legacy alias for funded transparent address count snapshots stored in the database.
     ///
     /// method: post
     /// tags: address
     ///
-    /// Returns daily and latest realtime holder-count snapshots, sorted by date.
+    /// Returns daily and latest realtime funded transparent address count snapshots, sorted by
+    /// date. The legacy response field remains `holder_count` for compatibility, but it does not
+    /// count people, shielded addresses, or shielded holders.
     ///
     /// # Parameters
     ///
-    /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
+    /// - `limit`: (number, optional, default=100, maximum=10000) Maximum number of snapshots to return
     ///
     /// Reads at most `limit` daily records plus the latest realtime record.
     #[method(name = "getholdercountsnapshots")]
@@ -305,14 +396,33 @@ pub trait Rpc {
         limit: Option<usize>,
     ) -> Result<GetHolderCountSnapshotsResponse>;
 
-    /// Returns snapshot data (holder count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
+    /// Returns funded transparent address count snapshots stored in the database.
+    ///
+    /// method: post
+    /// tags: address
+    ///
+    /// Counts transparent addresses whose finalized balance is greater than zero. It does not
+    /// count people, shielded addresses, or shielded holders.
+    ///
+    /// # Parameters
+    ///
+    /// - `limit`: (number, optional, default=100, maximum=10000) Maximum number of snapshots to return
+    ///
+    /// Reads at most `limit` daily records plus the latest realtime record.
+    #[method(name = "getfundedtransparentaddresscountsnapshots")]
+    async fn get_funded_transparent_address_count_snapshots(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetFundedTransparentAddressCountSnapshotsResponse>;
+
+    /// Returns snapshot data (funded transparent address count, pool values, difficulty, issuance, inflation, timestamp) stored in the database.
     ///
     /// method: post
     /// tags: blockchain
     ///
     /// Returns daily and latest realtime snapshots, sorted by date.
     /// Each snapshot contains:
-    /// - holder_count: Number of addresses with non-zero balances
+    /// - funded_transparent_address_count: Number of transparent addresses with positive finalized balances
     /// - pool_values: All 6 value pool balances (transparent, sprout, sapling, orchard, deferred, ironwood)
     /// - difficulty: Mining difficulty at that height
     /// - total_issuance: Total ZEC issued up to that height
@@ -321,7 +431,7 @@ pub trait Rpc {
     ///
     /// # Parameters
     ///
-    /// - `limit`: (number, optional, default=100) Maximum number of snapshots to return
+    /// - `limit`: (number, optional, default=100, maximum=10000) Maximum number of snapshots to return
     ///
     /// Reads at most `limit` daily records plus the latest realtime record.
     #[method(name = "getsnapshotdata")]
@@ -336,15 +446,20 @@ pub trait Rpc {
     ///
     /// - `start_date`: (string, optional) Start date in format "YY:MM:DD" (e.g., "24:01:01"). If not provided, starts from earliest snapshot.
     /// - `end_date`: (string, optional) End date in format "YY:MM:DD" (e.g., "24:12:31"). If not provided, ends at latest snapshot.
+    /// - `limit`: (number, optional, default=10000, minimum=1, maximum=10000) Maximum number of snapshots to return.
     ///
     /// # Notes
     ///
-    /// Returns dashboard data including supply, holder count, transaction counts, and other metrics within the date range.
+    /// Returns dashboard data including supply, funded transparent address count, transaction
+    /// counts, and other metrics within the date range.
+    /// When more records are available, `next_start_date` contains the inclusive start date for
+    /// the next page.
     #[method(name = "getdashboarddata")]
     async fn get_dashboard_data(
         &self,
         start_date: Option<String>,
         end_date: Option<String>,
+        limit: Option<usize>,
     ) -> Result<GetDashboardDataResponse>;
 
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
@@ -1384,8 +1499,24 @@ where
         }
     }
 
+    async fn get_funded_transparent_address_count(
+        &self,
+    ) -> Result<GetFundedTransparentAddressCountResponse> {
+        let legacy_response = self.get_address_count().await?;
+
+        Ok(GetFundedTransparentAddressCountResponse {
+            funded_transparent_address_count: u64::try_from(legacy_response.count)
+                .expect("usize always fits in u64 on supported Zebra platforms"),
+        })
+    }
+
     async fn get_top_addresses(&self, limit: Option<usize>) -> Result<GetTopAddressesResponse> {
-        let limit = limit.unwrap_or(10);
+        let limit = validated_rpc_limit(
+            limit,
+            DEFAULT_TOP_ADDRESSES_RESULTS,
+            ReadRequest::MAX_TOP_ADDRESSES_RESULTS,
+        )
+        .map_err(invalid_params)?;
         let request = zebra_state::ReadRequest::TopAddressesByBalance { limit };
         let response = self
             .read_state
@@ -1414,7 +1545,7 @@ where
         &self,
         limit: Option<usize>,
     ) -> Result<GetHolderCountSnapshotsResponse> {
-        // Reuse the snapshot data API and extract holder_count
+        // Preserve the legacy endpoint and JSON field while sourcing the honestly named metric.
         let snapshot_response = self.get_snapshot_data(limit).await?;
 
         Ok(GetHolderCountSnapshotsResponse {
@@ -1424,7 +1555,26 @@ where
                 .map(|snapshot| HolderCountSnapshot {
                     date_key: snapshot.date_key().clone(),
                     height: snapshot.height(),
-                    holder_count: snapshot.holder_count(),
+                    holder_count: snapshot.funded_transparent_address_count(),
+                })
+                .collect(),
+        })
+    }
+
+    async fn get_funded_transparent_address_count_snapshots(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetFundedTransparentAddressCountSnapshotsResponse> {
+        let snapshot_response = self.get_snapshot_data(limit).await?;
+
+        Ok(GetFundedTransparentAddressCountSnapshotsResponse {
+            snapshots: snapshot_response
+                .snapshots()
+                .iter()
+                .map(|snapshot| FundedTransparentAddressCountSnapshot {
+                    date_key: snapshot.date_key().clone(),
+                    height: snapshot.height(),
+                    funded_transparent_address_count: snapshot.funded_transparent_address_count(),
                 })
                 .collect(),
         })
@@ -1434,62 +1584,33 @@ where
         &self,
         start_date: Option<String>,
         end_date: Option<String>,
+        limit: Option<usize>,
     ) -> Result<GetDashboardDataResponse> {
-        // Helper function to parse date string "YY:MM:DD" to (year, month, day) tuple
-        fn parse_date_key(date_str: &str) -> std::result::Result<(u8, u8, u8), String> {
-            let parts: Vec<&str> = date_str.split(':').collect();
-            if parts.len() != 3 {
-                return Err(format!("Expected format YY:MM:DD, got: {}", date_str));
-            }
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_DASHBOARD_DATA_RESULTS,
+            ReadRequest::MAX_SNAPSHOT_DATA_RESULTS,
+        )
+        .map_err(invalid_params)?;
+        let start_date_tuple = start_date
+            .as_deref()
+            .map(parse_snapshot_date)
+            .transpose()
+            .map_err(|error| invalid_params(format!("invalid start_date: {error}")))?;
+        let end_date_tuple = end_date
+            .as_deref()
+            .map(parse_snapshot_date)
+            .transpose()
+            .map_err(|error| invalid_params(format!("invalid end_date: {error}")))?;
 
-            let year = parts[0]
-                .parse::<u8>()
-                .map_err(|_| format!("Invalid year: {}", parts[0]))?;
-            let month = parts[1]
-                .parse::<u8>()
-                .map_err(|_| format!("Invalid month: {}", parts[1]))?;
-            let day = parts[2]
-                .parse::<u8>()
-                .map_err(|_| format!("Invalid day: {}", parts[2]))?;
+        validate_snapshot_date_range(start_date_tuple, end_date_tuple).map_err(invalid_params)?;
 
-            if !(1..=12).contains(&month) {
-                return Err(format!("Month must be 1-12, got: {}", month));
-            }
-            if !(1..=31).contains(&day) {
-                return Err(format!("Day must be 1-31, got: {}", day));
-            }
-
-            Ok((year, month, day))
-        }
-
-        // Parse date strings to (year, month, day) tuples for comparison
-        let start_date_tuple = if let Some(date_str) = start_date.as_ref() {
-            Some(parse_date_key(date_str).map_err(|e| {
-                ErrorObject::owned(
-                    ErrorCode::InvalidParams.code(),
-                    format!("Invalid start_date format: {}", e),
-                    None::<()>,
-                )
-            })?)
-        } else {
-            None
+        // Ask for one extra indexed record so the response can expose a stable next-page cursor.
+        let snapshot_request = zebra_state::ReadRequest::SnapshotDataByDateRange {
+            start_date: start_date_tuple,
+            end_date: end_date_tuple,
+            limit: limit.saturating_add(1),
         };
-
-        let end_date_tuple = if let Some(date_str) = end_date.as_ref() {
-            Some(parse_date_key(date_str).map_err(|e| {
-                ErrorObject::owned(
-                    ErrorCode::InvalidParams.code(),
-                    format!("Invalid end_date format: {}", e),
-                    None::<()>,
-                )
-            })?)
-        } else {
-            None
-        };
-
-        // Get all snapshots (we'll filter by date range in memory)
-        // For better performance with large datasets, we could add a new ReadRequest type
-        let snapshot_request = zebra_state::ReadRequest::SnapshotData { limit: 10000 };
         let snapshot_response = self
             .read_state
             .clone()
@@ -1497,7 +1618,7 @@ where
             .await
             .map_misc_error()?;
 
-        let all_snapshots = match snapshot_response {
+        let mut snapshots = match snapshot_response {
             zebra_state::ReadResponse::SnapshotData { snapshots } => snapshots,
             _ => {
                 return Err(ErrorObject::owned(
@@ -1508,19 +1629,16 @@ where
             }
         };
 
-        // Filter by date range
-        let filtered_snapshots: Vec<_> = all_snapshots
-            .into_iter()
-            .filter(|(date_key, _)| {
-                let date_tuple = (date_key.year, date_key.month, date_key.day);
-                let matches_start = start_date_tuple.is_none_or(|start| date_tuple >= start);
-                let matches_end = end_date_tuple.is_none_or(|end| date_tuple <= end);
-                matches_start && matches_end
-            })
-            .collect();
+        let next_start_date = snapshots.get(limit).map(|(date_key, _)| {
+            format!(
+                "{:02}:{:02}:{:02}",
+                date_key.year, date_key.month, date_key.day
+            )
+        });
+        snapshots.truncate(limit);
 
         // Build response entries with all dashboard data (reusing SnapshotDataEntry)
-        let entries: Vec<SnapshotDataEntry> = filtered_snapshots
+        let entries: Vec<SnapshotDataEntry> = snapshots
             .into_iter()
             .map(|(date_key, snapshot_data)| {
                 let pool_values = snapshot_data.pool_values();
@@ -1530,7 +1648,8 @@ where
                         date_key.year, date_key.month, date_key.day
                     ),
                     height: snapshot_data.block_height(),
-                    holder_count: snapshot_data.holder_count(),
+                    funded_transparent_address_count: snapshot_data
+                        .funded_transparent_address_count(),
                     pool_transparent: pool_values.transparent_amount(),
                     pool_sprout: pool_values.sprout_amount(),
                     pool_sapling: pool_values.sapling_amount(),
@@ -1566,11 +1685,19 @@ where
             })
             .collect();
 
-        Ok(GetDashboardDataResponse { entries })
+        Ok(GetDashboardDataResponse {
+            entries,
+            next_start_date,
+        })
     }
 
     async fn get_snapshot_data(&self, limit: Option<usize>) -> Result<GetSnapshotDataResponse> {
-        let limit = limit.unwrap_or(100);
+        let limit = validated_rpc_limit(
+            limit,
+            DEFAULT_SNAPSHOT_DATA_RESULTS,
+            ReadRequest::MAX_SNAPSHOT_DATA_RESULTS,
+        )
+        .map_err(invalid_params)?;
         let request = zebra_state::ReadRequest::SnapshotData { limit };
         let response = self
             .read_state
@@ -1589,7 +1716,8 @@ where
                             date_key.year, date_key.month, date_key.day
                         ),
                         height: snapshot_data.block_height(),
-                        holder_count: snapshot_data.holder_count(),
+                        funded_transparent_address_count: snapshot_data
+                            .funded_transparent_address_count(),
                         pool_transparent: snapshot_data.pool_values().transparent_amount(),
                         pool_sprout: snapshot_data.pool_values().sprout_amount(),
                         pool_sapling: snapshot_data.pool_values().sapling_amount(),
@@ -4240,8 +4368,15 @@ pub use self::GetAddressBalanceResponse as AddressBalance;
 /// Response to [`RpcServer::get_address_count`] RPC method.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetAddressCountResponse {
-    /// The total number of addresses with balances.
+    /// The number of transparent addresses with positive finalized balances.
     pub count: usize,
+}
+
+/// Response to [`RpcServer::get_funded_transparent_address_count`] RPC method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetFundedTransparentAddressCountResponse {
+    /// The number of transparent addresses with positive finalized balances.
+    pub funded_transparent_address_count: u64,
 }
 
 /// A single address with its balance for [`GetTopAddressesResponse`].
@@ -4260,7 +4395,7 @@ pub struct GetTopAddressesResponse {
     pub addresses: Vec<TopAddress>,
 }
 
-/// A single holder count snapshot entry.
+/// A single entry returned by the legacy holder-count endpoint.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct HolderCountSnapshot {
     /// The date key at which this snapshot was taken (format: "YY:MM:DD").
@@ -4268,7 +4403,10 @@ pub struct HolderCountSnapshot {
     /// The block height at which this snapshot was taken.
     #[getter(copy)]
     pub height: u32,
-    /// The number of holders (addresses with non-zero balances) at this height.
+    /// The number of funded transparent addresses at this height.
+    ///
+    /// This legacy field name is kept for JSON compatibility. It is not a count of people,
+    /// shielded addresses, or shielded holders.
     #[getter(copy)]
     pub holder_count: u64,
 }
@@ -4276,8 +4414,29 @@ pub struct HolderCountSnapshot {
 /// Response to [`RpcServer::get_holder_count_snapshots`] RPC method.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetHolderCountSnapshotsResponse {
-    /// List of holder count snapshots, sorted by date.
+    /// List of funded transparent address count snapshots using the legacy field name, sorted by
+    /// date.
     pub snapshots: Vec<HolderCountSnapshot>,
+}
+
+/// A single funded transparent address count snapshot entry.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct FundedTransparentAddressCountSnapshot {
+    /// The date key at which this snapshot was taken (format: "YY:MM:DD").
+    pub date_key: String,
+    /// The block height at which this snapshot was taken.
+    #[getter(copy)]
+    pub height: u32,
+    /// The number of transparent addresses with a positive finalized balance at this height.
+    #[getter(copy)]
+    pub funded_transparent_address_count: u64,
+}
+
+/// Response to [`RpcServer::get_funded_transparent_address_count_snapshots`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetFundedTransparentAddressCountSnapshotsResponse {
+    /// List of funded transparent address count snapshots, sorted by date.
+    pub snapshots: Vec<FundedTransparentAddressCountSnapshot>,
 }
 
 /// A single snapshot data entry.
@@ -4289,9 +4448,13 @@ pub struct SnapshotDataEntry {
     /// The block height at which this snapshot was taken.
     #[getter(copy)]
     pub height: u32,
-    /// The number of holders (addresses with non-zero balances) at this height.
+    /// The number of transparent addresses with a positive finalized balance at this height.
+    ///
+    /// This is not a count of people, shielded addresses, or shielded holders. The legacy
+    /// `holder_count` key is accepted when deserializing older cached JSON.
+    #[serde(alias = "holder_count")]
     #[getter(copy)]
-    pub holder_count: u64,
+    pub funded_transparent_address_count: u64,
     /// Transparent pool value (in zatoshis).
     #[getter(copy)]
     pub pool_transparent: zebra_chain::amount::Amount<zebra_chain::amount::NonNegative>,
@@ -4411,11 +4574,15 @@ pub struct GetSnapshotDataResponse {
 pub struct GetDashboardDataResponse {
     /// List of dashboard data entries, sorted by date.
     pub entries: Vec<SnapshotDataEntry>,
+    /// Inclusive start date for the next page, or `None` when this is the final page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub next_start_date: Option<String>,
 }
 
 #[cfg(test)]
 mod snapshot_data_entry_ironwood_tests {
-    use super::SnapshotDataEntry;
+    use super::{FundedTransparentAddressCountSnapshot, HolderCountSnapshot, SnapshotDataEntry};
     use zebra_chain::amount::{Amount, NonNegative};
 
     #[test]
@@ -4425,7 +4592,7 @@ mod snapshot_data_entry_ironwood_tests {
         let entry = SnapshotDataEntry {
             date_key: "26:09:04".to_string(),
             height: 1,
-            holder_count: 2,
+            funded_transparent_address_count: 2,
             pool_transparent: zero,
             pool_sprout: zero,
             pool_sapling: zero,
@@ -4459,9 +4626,24 @@ mod snapshot_data_entry_ironwood_tests {
         };
 
         let mut json = serde_json::to_value(&entry).expect("snapshot entry must serialize");
+        assert_eq!(json["funded_transparent_address_count"], 2);
+        assert!(json.get("holder_count").is_none());
+
         let round_trip: SnapshotDataEntry =
             serde_json::from_value(json.clone()).expect("snapshot entry must deserialize");
         assert_eq!(round_trip, entry);
+
+        let mut legacy_named_json = json.clone();
+        let legacy_object = legacy_named_json
+            .as_object_mut()
+            .expect("snapshot entry must serialize as an object");
+        let funded_count = legacy_object
+            .remove("funded_transparent_address_count")
+            .expect("new snapshot JSON must contain the funded address count");
+        legacy_object.insert("holder_count".to_string(), funded_count);
+        let legacy_named_entry: SnapshotDataEntry = serde_json::from_value(legacy_named_json)
+            .expect("legacy holder_count JSON must deserialize");
+        assert_eq!(legacy_named_entry, entry);
 
         let object = json
             .as_object_mut()
@@ -4481,6 +4663,67 @@ mod snapshot_data_entry_ironwood_tests {
         assert_eq!(legacy.ironwood_tx_count, 0);
         assert_eq!(legacy.ironwood_inflow, 0);
         assert_eq!(legacy.ironwood_outflow, 0);
+    }
+
+    #[test]
+    fn funded_address_count_json_is_honest_and_legacy_endpoint_stays_compatible() {
+        let funded = FundedTransparentAddressCountSnapshot {
+            date_key: "26:09:04".to_string(),
+            height: 1,
+            funded_transparent_address_count: 2,
+        };
+        let funded_json = serde_json::to_value(funded).expect("funded count must serialize");
+        assert_eq!(funded_json["funded_transparent_address_count"], 2);
+        assert!(funded_json.get("holder_count").is_none());
+
+        let legacy = HolderCountSnapshot {
+            date_key: "26:09:04".to_string(),
+            height: 1,
+            holder_count: 2,
+        };
+        let legacy_json = serde_json::to_value(legacy).expect("legacy count must serialize");
+        assert_eq!(legacy_json["holder_count"], 2);
+        assert!(legacy_json
+            .get("funded_transparent_address_count")
+            .is_none());
+    }
+}
+
+#[cfg(test)]
+mod custom_rpc_validation_tests {
+    use super::{
+        parse_snapshot_date, validate_snapshot_date_range, validated_paginated_rpc_limit,
+        validated_rpc_limit,
+    };
+
+    #[test]
+    fn limits_are_defaulted_and_bounded() {
+        assert_eq!(validated_rpc_limit(None, 10, 100), Ok(10));
+        assert_eq!(validated_rpc_limit(Some(0), 10, 100), Ok(0));
+        assert_eq!(validated_rpc_limit(Some(100), 10, 100), Ok(100));
+        assert!(validated_rpc_limit(Some(101), 10, 100).is_err());
+        assert_eq!(validated_paginated_rpc_limit(None, 10, 100), Ok(10));
+        assert!(validated_paginated_rpc_limit(Some(0), 10, 100).is_err());
+    }
+
+    #[test]
+    fn snapshot_dates_require_exact_real_calendar_dates() {
+        assert_eq!(parse_snapshot_date("24:02:29"), Ok((24, 2, 29)));
+        assert!(parse_snapshot_date("23:02:29").is_err());
+        assert!(parse_snapshot_date("24:02:30").is_err());
+        assert!(parse_snapshot_date("1:02:03").is_err());
+        assert!(parse_snapshot_date("123:01:01").is_err());
+        assert!(parse_snapshot_date("24-01-01").is_err());
+        assert!(parse_snapshot_date("ab:01:01").is_err());
+    }
+
+    #[test]
+    fn snapshot_date_ranges_are_ordered() {
+        assert!(validate_snapshot_date_range(Some((24, 1, 1)), Some((24, 1, 1))).is_ok());
+        assert!(validate_snapshot_date_range(Some((24, 1, 1)), Some((24, 1, 2))).is_ok());
+        assert!(validate_snapshot_date_range(Some((24, 1, 2)), Some((24, 1, 1))).is_err());
+        assert!(validate_snapshot_date_range(None, Some((24, 1, 1))).is_ok());
+        assert!(validate_snapshot_date_range(Some((24, 1, 1)), None).is_ok());
     }
 }
 

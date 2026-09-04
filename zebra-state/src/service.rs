@@ -24,7 +24,7 @@ use std::{
 };
 
 use futures::future::FutureExt;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tower::{util::BoxService, Service, ServiceExt};
 use tracing::{instrument, Instrument, Span};
 
@@ -85,6 +85,17 @@ pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation}
 use write::NonFinalizedWriteMessage;
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
+
+/// Full address-index scans are deliberately kept below Tokio's blocking-thread concurrency.
+const MAX_CONCURRENT_EXPENSIVE_READS: usize = 2;
+
+fn try_acquire_expensive_read_permit(
+    semaphore: Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, BoxError> {
+    semaphore
+        .try_acquire_owned()
+        .map_err(|_| BoxError::from("too many concurrent expensive state reads"))
+}
 
 pub use self::traits::{ReadState, State};
 
@@ -226,6 +237,10 @@ pub struct ReadStateService {
     /// This chain is updated concurrently with requests,
     /// so it might include some block data that is also in `best_mem`.
     db: ZebraDb,
+
+    /// Limits address-index scans even if the request future is cancelled after its blocking task
+    /// has started. The owned permit is moved into that blocking task.
+    expensive_read_semaphore: Arc<Semaphore>,
 
     /// A shared handle to a task that writes blocks to the [`NonFinalizedState`] or [`FinalizedState`],
     /// once the queues have received all their parent blocks.
@@ -979,6 +994,7 @@ impl ReadStateService {
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
+            expensive_read_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPENSIVE_READS)),
         };
 
         tracing::debug!("created new read-only state service");
@@ -1395,6 +1411,13 @@ impl Service<ReadRequest> for ReadStateService {
         let timed_span = TimedSpan::new(timer, span);
         let state = self.clone();
 
+        let is_expensive_read = match &req {
+            ReadRequest::AddressCount => true,
+            ReadRequest::TopAddressesByBalance { limit } => *limit > 0,
+            _ => false,
+        };
+        let expensive_read_semaphore = self.expensive_read_semaphore.clone();
+
         if let ReadRequest::NonFinalizedBlocksListener { known_chain_tips } = req {
             // The non-finalized blocks listener is used to notify the state service
             // about new blocks that have been added to the non-finalized state.
@@ -1680,29 +1703,61 @@ impl Service<ReadRequest> for ReadStateService {
 
             // For the get_address_count RPC.
             ReadRequest::AddressCount => Ok(ReadResponse::AddressCount {
-                count: state.db.address_count(),
+                count: state
+                    .db
+                    .funded_transparent_address_count()
+                    .and_then(|count| usize::try_from(count).ok())
+                    // Legacy databases do not have the persistent accumulator singleton.
+                    .unwrap_or_else(|| state.db.address_count()),
             }),
 
-            // For the get_top_addresses RPC.
+            // For the legacy get_holder_count_snapshots state request.
             ReadRequest::HolderCountSnapshots { limit } => {
-                // Reuse snapshot data logic and extract holder_count.
+                // Preserve the legacy request name while returning the funded transparent address
+                // count stored in each snapshot.
                 let snapshots = state
                     .db
-                    .recent_snapshot_data(limit)
+                    .recent_snapshot_data(limit.min(ReadRequest::MAX_SNAPSHOT_DATA_RESULTS))
                     .into_iter()
-                    .map(|(date_key, snapshot_data)| (date_key, snapshot_data.holder_count()))
+                    .map(|(date_key, snapshot_data)| {
+                        (date_key, snapshot_data.funded_transparent_address_count())
+                    })
                     .collect();
 
                 Ok(ReadResponse::HolderCountSnapshots { snapshots })
             }
             ReadRequest::SnapshotData { limit } => {
                 // Use efficient reverse iteration to get only the last N snapshots.
-                let snapshots = state.db.recent_snapshot_data(limit);
+                let snapshots = state
+                    .db
+                    .recent_snapshot_data(limit.min(ReadRequest::MAX_SNAPSHOT_DATA_RESULTS));
+
+                Ok(ReadResponse::SnapshotData { snapshots })
+            }
+            ReadRequest::SnapshotDataByDateRange {
+                start_date,
+                end_date,
+                limit,
+            } => {
+                let to_date_key =
+                    |(year, month, day)| finalized_state::SnapshotDateKey::new(year, month, day);
+                let start_date = start_date.map(to_date_key);
+                let end_date = end_date.map(to_date_key);
+
+                // Fetch by the RocksDB key range instead of fetching recent records and filtering
+                // them in the RPC layer. One extra record is allowed for pagination detection.
+                let snapshots = state.db.snapshot_data_by_date_range_limited(
+                    start_date,
+                    end_date,
+                    limit.min(ReadRequest::MAX_SNAPSHOT_DATA_RESULTS.saturating_add(1)),
+                );
 
                 Ok(ReadResponse::SnapshotData { snapshots })
             }
             ReadRequest::TopAddressesByBalance { limit } => {
-                let addresses = state.db.top_addresses_by_balance(limit);
+                let addresses = state
+                    .db
+                    .top_addresses_by_balance(limit.min(ReadRequest::MAX_TOP_ADDRESSES_RESULTS));
 
                 Ok(ReadResponse::TopAddressesByBalance { addresses })
             }
@@ -1885,6 +1940,22 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::IsTransparentOutputSpent(is_spent.is_none()))
             }
         };
+
+        if is_expensive_read {
+            return async move {
+                let permit = try_acquire_expensive_read_permit(expensive_read_semaphore)?;
+
+                timed_span
+                    .spawn_blocking(move || {
+                        // Keep the permit in the non-cancellable blocking task. Dropping the RPC
+                        // future detaches the task, but cannot release this permit early.
+                        let _permit = permit;
+                        request_handler()
+                    })
+                    .await
+            }
+            .boxed();
+        }
 
         timed_span.spawn_blocking(request_handler)
     }

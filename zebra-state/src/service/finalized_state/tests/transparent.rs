@@ -211,12 +211,26 @@ fn address_counts_exclude_zero_balances() {
     let network = Network::Mainnet;
     let zero_address = Address::from_script_hash(NetworkKind::Mainnet, [0x00; 20]);
     let funded_address = Address::from_script_hash(NetworkKind::Mainnet, [0x01; 20]);
+    let richest_address = Address::from_script_hash(NetworkKind::Mainnet, [0x02; 20]);
+    let first_tied_address = Address::from_script_hash(NetworkKind::Mainnet, [0x03; 20]);
+    let second_tied_address = Address::from_script_hash(NetworkKind::Mainnet, [0x04; 20]);
     let funded_balance = Amount::<NonNegative>::try_from(1u64).expect("1 zatoshi is valid");
+    let tied_balance = Amount::<NonNegative>::try_from(2u64).expect("2 zatoshis is valid");
+    let richest_balance = Amount::<NonNegative>::try_from(3u64).expect("3 zatoshis is valid");
 
     let zero_balance = AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 0, 0));
     let mut positive_balance =
         AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 1, 0));
     *positive_balance.balance_mut() = funded_balance;
+    let mut richest_balance_location =
+        AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 2, 0));
+    *richest_balance_location.balance_mut() = richest_balance;
+    let mut first_tied_balance_location =
+        AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 3, 0));
+    *first_tied_balance_location.balance_mut() = tied_balance;
+    let mut second_tied_balance_location =
+        AddressBalanceLocation::new(OutputLocation::from_usize(Height(1), 4, 0));
+    *second_tied_balance_location.balance_mut() = tied_balance;
 
     let zebra_db = new_ephemeral_zebra_db(&network);
     let mut batch = DiskWriteBatch::new();
@@ -225,16 +239,23 @@ fn address_counts_exclude_zero_balances() {
         AddressBalanceLocationUpdates::Insert(HashMap::from([
             (zero_address, zero_balance),
             (funded_address, positive_balance),
+            (richest_address, richest_balance_location),
+            (first_tied_address, first_tied_balance_location),
+            (second_tied_address, second_tied_balance_location),
         ])),
     );
     zebra_db
         .write_batch(batch)
         .expect("ephemeral db accepts address balances");
 
-    assert_eq!(zebra_db.holder_count(), 1);
-    assert_eq!(zebra_db.address_count(), 1);
+    assert_eq!(zebra_db.holder_count(), 4);
+    assert_eq!(zebra_db.address_count(), 4);
+    assert!(zebra_db.top_addresses_by_balance(0).is_empty());
     assert_eq!(
-        zebra_db.top_addresses_by_balance(10),
-        vec![(funded_address, funded_balance)],
+        zebra_db.top_addresses_by_balance(2),
+        vec![
+            (richest_address, richest_balance),
+            (first_tied_address, tied_balance),
+        ],
     );
 }

@@ -3,7 +3,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use indexmap::IndexMap;
@@ -41,15 +41,55 @@ const PARENT_ERROR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 /// The maximum best-chain tip age that can trigger a realtime snapshot.
 const REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS: i64 = 3 * 60 * 60;
 
+/// The minimum number of finalized blocks between realtime snapshots.
+///
+/// The persistent accumulator is updated with every finalized block, but materializing and
+/// publishing a replaceable realtime row more often than this adds unnecessary database writes
+/// and RPC churn. Zcash targets 75-second blocks, making this interval approximately one hour.
+/// Daily snapshots are not throttled by this interval.
+const REALTIME_SNAPSHOT_INTERVAL_BLOCKS: u32 = 48;
+
+/// The wall-clock delay before retrying a failed daily snapshot.
+///
+/// This prevents a corrupt accumulator or another deterministic calculation error from being
+/// retried at every block during catch-up. A height-based delay is not sufficient here, because
+/// checkpoint blocks can be finalized much faster than their target spacing.
+const DAILY_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// Mutable snapshot scheduling state shared by both finalized block write paths.
+#[derive(Debug, Default)]
+struct SnapshotSchedule {
+    next_daily_timestamp: Option<i64>,
+    daily_retry_not_before: Option<Instant>,
+    last_realtime_height: Option<Height>,
+}
+
 /// Returns `true` when a finalized block should also update the realtime snapshot.
 fn should_create_realtime_snapshot(
     enable_realtime_check: bool,
     non_finalized_len: u32,
     tip_age_seconds: i64,
+    block_height: Height,
+    last_realtime_snapshot_height: Option<Height>,
 ) -> bool {
+    let interval_elapsed = last_realtime_snapshot_height.is_none_or(|last_height| {
+        block_height.0.saturating_sub(last_height.0) >= REALTIME_SNAPSHOT_INTERVAL_BLOCKS
+    });
+
     enable_realtime_check
         && (1..=MAX_BLOCK_REORG_HEIGHT).contains(&non_finalized_len)
         && tip_age_seconds < REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS
+        && interval_elapsed
+}
+
+/// Returns `true` when a due daily snapshot can be attempted at `now`.
+fn can_retry_daily_snapshot(now: Instant, retry_not_before: Option<Instant>) -> bool {
+    retry_not_before.is_none_or(|retry_not_before| now >= retry_not_before)
+}
+
+/// Returns `true` when realtime work can run without bypassing a due daily snapshot's backoff.
+fn can_attempt_realtime_snapshot(realtime_snapshot_due: bool, daily_snapshot_due: bool) -> bool {
+    realtime_snapshot_due && !daily_snapshot_due
 }
 
 /// Run contextual validation on the prepared block and add it to the
@@ -91,10 +131,11 @@ fn check_and_create_snapshot(
     non_finalized_state: &NonFinalizedState,
     block_height: Height,
     block_timestamp: i64,
-    next_snapshot_timestamp: &mut Option<i64>,
+    schedule: &mut SnapshotSchedule,
     enable_realtime_check: bool,
 ) {
     let non_finalized_len = non_finalized_state.best_chain_len().unwrap_or(0);
+    let snapshot_check_time = Instant::now();
     let current_time = chrono::Utc::now().timestamp();
     let finalized_block_age_seconds = current_time - block_timestamp;
     // The finalized block is one rollback window behind the tip, so its timestamp can be many
@@ -103,13 +144,18 @@ fn check_and_create_snapshot(
         .best_tip_block()
         .map(|tip| current_time - tip.block.header.time.timestamp())
         .unwrap_or(i64::MAX);
-    let should_realtime_snapshot =
-        should_create_realtime_snapshot(enable_realtime_check, non_finalized_len, tip_age_seconds);
+    let realtime_snapshot_due = should_create_realtime_snapshot(
+        enable_realtime_check,
+        non_finalized_len,
+        tip_age_seconds,
+        block_height,
+        schedule.last_realtime_height,
+    );
 
-    let should_daily_snapshot = if block_height.0 == 0 {
+    let daily_snapshot_due = if block_height.0 == 0 {
         true
     } else {
-        match *next_snapshot_timestamp {
+        match schedule.next_daily_timestamp {
             None => {
                 // First snapshot after restart (but not block 0) - calculate next snapshot timestamp
                 true
@@ -120,6 +166,21 @@ fn check_and_create_snapshot(
             }
         }
     };
+    let daily_retry_allowed =
+        can_retry_daily_snapshot(snapshot_check_time, schedule.daily_retry_not_before);
+    let should_daily_snapshot = daily_snapshot_due && daily_retry_allowed;
+    // Daily and realtime materialize the same accumulator. While a failed daily snapshot is still
+    // due, do not bypass its wall-clock backoff by attempting realtime on the next block.
+    let should_realtime_snapshot =
+        can_attempt_realtime_snapshot(realtime_snapshot_due, daily_snapshot_due);
+
+    if daily_snapshot_due && !daily_retry_allowed {
+        tracing::debug!(
+            ?block_height,
+            retry_not_before = ?schedule.daily_retry_not_before,
+            "daily snapshot remains due but is waiting for its retry time"
+        );
+    }
 
     let should_snapshot = should_daily_snapshot || should_realtime_snapshot;
 
@@ -140,10 +201,8 @@ fn check_and_create_snapshot(
 
     if should_snapshot {
         let network = non_finalized_state.network.clone();
-        // Prioritize daily snapshots: use block date for daily snapshots,
-        // current date only for real-time snapshots when it's NOT a daily snapshot time
-        // This ensures daily snapshots always use the correct date (block's date)
-        let use_current_date = should_realtime_snapshot && !should_daily_snapshot;
+        // Daily snapshots take priority when both conditions become true at the same height.
+        let store_as_realtime = should_realtime_snapshot && !should_daily_snapshot;
         let snapshot_type = if should_daily_snapshot {
             "daily"
         } else if should_realtime_snapshot {
@@ -157,73 +216,69 @@ fn check_and_create_snapshot(
             snapshot_type,
             should_daily_snapshot,
             should_realtime_snapshot,
-            use_current_date,
+            store_as_realtime,
             "creating snapshot"
         );
 
-        // Retry snapshot until it succeeds - snapshot is required
-        let mut retry_count = 0u32;
-        let mut delay_ms = 100u64; // Start with 100ms delay
-        const MAX_DELAY_MS: u64 = 10_000; // Cap at 10 seconds
+        match finalized_state
+            .db
+            .store_snapshot_data(block_height, &network, store_as_realtime)
+        {
+            Ok(()) => {
+                metrics::counter!("state.snapshot.created.count", "kind" => snapshot_type)
+                    .increment(1);
 
-        loop {
-            match finalized_state
-                .db
-                .store_snapshot_data(block_height, &network, use_current_date)
-            {
-                Ok(()) => {
-                    if retry_count > 0 {
-                        tracing::info!(
-                            ?block_height,
-                            snapshot_type,
-                            retry_count,
-                            "snapshot stored successfully after retries"
-                        );
-                    }
+                if should_daily_snapshot {
+                    // Calculate the start of the next UTC day (00:00:00 UTC)
+                    let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
+                        .unwrap_or_else(|| {
+                            // Fallback: if timestamp conversion fails, use epoch
+                            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                        });
 
-                    if should_daily_snapshot {
-                        // Calculate the start of the next UTC day (00:00:00 UTC)
-                        let current_datetime = chrono::DateTime::from_timestamp(block_timestamp, 0)
-                            .unwrap_or_else(|| {
-                                // Fallback: if timestamp conversion fails, use epoch
-                                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
-                            });
+                    // Get the start of the current UTC day (00:00:00 UTC)
+                    let current_date = current_datetime.date_naive();
 
-                        // Get the start of the current UTC day (00:00:00 UTC)
-                        let current_date = current_datetime.date_naive();
+                    // Get the start of the next day at 00:00:00 UTC
+                    let next_date = current_date + chrono::Duration::days(1);
+                    let next_datetime = next_date
+                        .and_hms_opt(0, 0, 0)
+                        .expect("00:00:00 should always be valid");
+                    let next_timestamp =
+                        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                            next_datetime,
+                            chrono::Utc,
+                        )
+                        .timestamp();
 
-                        // Get the start of the next day at 00:00:00 UTC
-                        let next_date = current_date + chrono::Duration::days(1);
-                        let next_datetime = next_date
-                            .and_hms_opt(0, 0, 0)
-                            .expect("00:00:00 should always be valid");
-                        let next_timestamp =
-                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                                next_datetime,
-                                chrono::Utc,
-                            )
-                            .timestamp();
-
-                        *next_snapshot_timestamp = Some(next_timestamp);
-                    }
-                    break; // Success, exit retry loop
+                    schedule.next_daily_timestamp = Some(next_timestamp);
+                    schedule.daily_retry_not_before = None;
                 }
-                Err(e) => {
-                    retry_count += 1;
-                    tracing::warn!(
-                        ?block_height,
-                        snapshot_type,
-                        retry_count,
-                        error = ?e,
-                        delay_ms,
-                        "failed to store snapshot data to RocksDB, retrying"
-                    );
 
-                    // Exponential backoff
-                    std::thread::sleep(Duration::from_millis(delay_ms));
+                // A daily snapshot also provides the newest data at this height, so it starts a
+                // new realtime interval when the full verifier is synced.
+                if enable_realtime_check {
+                    schedule.last_realtime_height = Some(block_height);
+                }
+            }
+            Err(error) => {
+                metrics::counter!("state.snapshot.error.count", "kind" => snapshot_type)
+                    .increment(1);
+                tracing::error!(
+                    ?block_height,
+                    snapshot_type,
+                    error = ?error,
+                    "failed to store snapshot data; continuing state writes"
+                );
 
-                    // Exponential backoff: double the delay, capped at MAX_DELAY_MS
-                    delay_ms = (delay_ms * 2).min(MAX_DELAY_MS);
+                // Snapshot calculation and persistence are one operation. A deterministic
+                // accumulator or disk error would repeat at every block without this backoff.
+                // Failed realtime snapshots wait for the normal cadence.
+                if should_daily_snapshot {
+                    schedule.daily_retry_not_before =
+                        Some(Instant::now() + DAILY_SNAPSHOT_RETRY_DELAY);
+                } else {
+                    schedule.last_realtime_height = Some(block_height);
                 }
             }
         }
@@ -240,23 +295,70 @@ mod tests {
             true,
             MAX_BLOCK_REORG_HEIGHT,
             0,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS),
+            Some(Height(0)),
         ));
         assert!(!should_create_realtime_snapshot(
             true,
             MAX_BLOCK_REORG_HEIGHT + 1,
             0,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS),
+            Some(Height(0)),
         ));
-        assert!(!should_create_realtime_snapshot(true, 0, 0));
+        assert!(!should_create_realtime_snapshot(
+            true,
+            0,
+            0,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS),
+            Some(Height(0)),
+        ));
         assert!(!should_create_realtime_snapshot(
             false,
             MAX_BLOCK_REORG_HEIGHT,
             0,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS),
+            Some(Height(0)),
         ));
         assert!(!should_create_realtime_snapshot(
             true,
             MAX_BLOCK_REORG_HEIGHT,
             REALTIME_SNAPSHOT_MAX_TIP_AGE_SECONDS,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS),
+            Some(Height(0)),
         ));
+        assert!(!should_create_realtime_snapshot(
+            true,
+            MAX_BLOCK_REORG_HEIGHT,
+            0,
+            Height(REALTIME_SNAPSHOT_INTERVAL_BLOCKS - 1),
+            Some(Height(0)),
+        ));
+        assert!(should_create_realtime_snapshot(
+            true,
+            MAX_BLOCK_REORG_HEIGHT,
+            0,
+            Height(1),
+            None,
+        ));
+    }
+
+    #[test]
+    fn daily_snapshot_retries_use_wall_clock_backoff() {
+        let failure_time = Instant::now();
+        let retry_not_before = failure_time + DAILY_SNAPSHOT_RETRY_DELAY;
+
+        assert!(!can_retry_daily_snapshot(
+            retry_not_before - Duration::from_secs(1),
+            Some(retry_not_before),
+        ));
+        assert!(can_retry_daily_snapshot(
+            retry_not_before,
+            Some(retry_not_before),
+        ));
+        assert!(can_retry_daily_snapshot(failure_time, None));
+
+        assert!(!can_attempt_realtime_snapshot(true, true));
+        assert!(can_attempt_realtime_snapshot(true, false));
     }
 }
 
@@ -465,13 +567,12 @@ impl WriteBlockWorkerTask {
 
         let mut prev_finalized_note_commitment_trees = None;
 
-        // Initialize next_snapshot_timestamp from the most recent daily snapshot in the database
-        // This handles the case where the node is restarted
-        // Use recent_daily_snapshot_data to exclude realtime snapshots
-        let mut next_snapshot_timestamp: Option<i64> = finalized_state
-            .db
-            .recent_daily_snapshot_data(1)
-            .first()
+        // Initialize the schedule from the highest daily snapshot height. Block timestamps are
+        // not monotonic, so the lexicographically latest date key is not necessarily the newest
+        // chain snapshot.
+        let latest_daily_snapshot = finalized_state.db.latest_daily_snapshot_by_height();
+        let next_daily_timestamp = latest_daily_snapshot
+            .as_ref()
             .and_then(|(_, snapshot_data)| {
                 let last_snapshot_timestamp = snapshot_data.block_timestamp();
                 // Calculate the start of the next UTC day after the last snapshot
@@ -486,6 +587,20 @@ impl WriteBlockWorkerTask {
                 .timestamp();
                 Some(next_timestamp)
             });
+
+        // Continue the persisted cadence after a restart. A daily snapshot also represents a
+        // refresh at its height, and a stale realtime entry is ignored by its lookup.
+        let last_realtime_height = finalized_state
+            .db
+            .latest_realtime_snapshot_height()
+            .or_else(|| {
+                latest_daily_snapshot.map(|(_, snapshot_data)| Height(snapshot_data.block_height()))
+            });
+        let mut snapshot_schedule = SnapshotSchedule {
+            next_daily_timestamp,
+            daily_retry_not_before: None,
+            last_realtime_height,
+        };
 
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
@@ -541,7 +656,7 @@ impl WriteBlockWorkerTask {
                         non_finalized_state,
                         block_height,
                         block_timestamp,
-                        &mut next_snapshot_timestamp,
+                        &mut snapshot_schedule,
                         false, // Daily snapshot during catch-up
                     );
 
@@ -721,7 +836,7 @@ impl WriteBlockWorkerTask {
                     non_finalized_state,
                     block_height,
                     block_timestamp,
-                    &mut next_snapshot_timestamp,
+                    &mut snapshot_schedule,
                     true, // Realtime snapshot when fully synced
                 );
             }

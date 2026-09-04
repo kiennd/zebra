@@ -34,7 +34,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 28;
+const DATABASE_FORMAT_VERSION: u64 = 29;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -45,16 +45,20 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 29.0.0: adds a mandatory, versioned incremental snapshot accumulator which is updated in the
+///   same atomic batch as every finalized block. Existing v28 databases do not contain the
+///   cumulative history needed to seed this value without a full rebuild, so this format requires
+///   a fresh sync (or a future dedicated rebuild tool) and is intentionally not restorable.
 /// - 28.0.0: the NU6.3 Ironwood shielded pool. Adds the `ironwood_*` column families (initially
 ///   empty) and widens the chain value pool `ValueBalance` serialization from 40 to 48 bytes for
 ///   the `ironwood` pool (read code accepts 32/40/48-byte records). Also widens the history-tree
 ///   `zcash_history::Entry` records from 253 to 326 bytes, because NU6.3 adds Ironwood fields to
 ///   `zcash_history::NodeData` (read code accepts the legacy 253-byte width and zero-pads it up to
 ///   the current width). Snapshot records now include the Ironwood value pool and metrics: read
-///   code accepts the legacy 184-byte and transitional 192-byte widths, while new records use 212
-///   bytes. New CFs are created and the wider records are read in place when the database is opened,
-///   so this is a major bump that is restorable from the previous major database format version (no
-///   resync or data migration).
+///   code accepts the legacy 184-byte, transitional 192-byte, and early-fork 208-byte widths, while
+///   new records use 212 bytes. New CFs are created and the wider records are read in place when the
+///   database is opened, so this is a major bump that is restorable from the previous major database
+///   format version (no resync or data migration).
 const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a

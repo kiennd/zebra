@@ -13,7 +13,8 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
     ops::RangeInclusive,
     sync::Arc,
 };
@@ -28,7 +29,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    request::FinalizedBlock,
+    request::{FinalizedBlock, ReadRequest},
     service::finalized_state::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
@@ -54,6 +55,39 @@ pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 
 /// The name of the [`BALANCE_BY_TRANSPARENT_ADDR`] column family's merge operator
 pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_received";
+
+/// A bounded-heap entry whose greatest value is the worst retained top-address candidate.
+#[derive(Clone, Copy, Debug)]
+struct TopAddressCandidate {
+    address: transparent::Address,
+    address_key: [u8; 21],
+    balance: Amount<NonNegative>,
+}
+
+impl PartialEq for TopAddressCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.address_key == other.address_key && self.balance == other.balance
+    }
+}
+
+impl Eq for TopAddressCandidate {}
+
+impl Ord for TopAddressCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Lower balances are worse. For equal balances, later database keys are worse, matching
+        // the deterministic order produced by the previous stable full sort.
+        other
+            .balance
+            .cmp(&self.balance)
+            .then_with(|| self.address_key.cmp(&other.address_key))
+    }
+}
+
+impl PartialOrd for TopAddressCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 // Snapshot data functionality has been moved to the `snapshot` module.
 // Use `zebra_db::snapshot::SnapshotData` and related functions instead.
@@ -429,33 +463,54 @@ impl ZebraDb {
         &self,
         limit: usize,
     ) -> Vec<(transparent::Address, Amount<NonNegative>)> {
-        let balance_by_transparent_addr = self.address_balance_cf();
+        let limit = limit.min(ReadRequest::MAX_TOP_ADDRESSES_RESULTS);
+        if limit == 0 {
+            return Vec::new();
+        }
 
-        let mut addresses_with_balances: Vec<(transparent::Address, Amount<NonNegative>)> = self
+        let balance_by_transparent_addr = self.address_balance_cf();
+        let mut top_addresses = BinaryHeap::with_capacity(limit);
+
+        for (address, balance_location) in self
             .db
             .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(
                 &balance_by_transparent_addr,
                 ..,
             )
-            .filter_map(
-                |(address, balance_location): (transparent::Address, AddressBalanceLocation)| {
-                    let balance = balance_location.balance();
-                    if balance > Amount::<NonNegative>::zero() {
-                        Some((address, balance))
-                    } else {
-                        None
-                    }
-                },
-            )
-            .collect();
+        {
+            let balance = balance_location.balance();
+            if balance == Amount::<NonNegative>::zero() {
+                continue;
+            }
 
-        // Sort by balance descending
-        addresses_with_balances.sort_by(|a, b| b.1.cmp(&a.1));
+            let candidate = TopAddressCandidate {
+                address,
+                address_key: address.as_bytes(),
+                balance,
+            };
 
-        // Take top N
-        addresses_with_balances.truncate(limit);
+            if top_addresses.len() < limit {
+                top_addresses.push(candidate);
+            } else if top_addresses
+                .peek()
+                .is_some_and(|worst_candidate| candidate < *worst_candidate)
+            {
+                top_addresses.pop();
+                top_addresses.push(candidate);
+            }
+        }
 
-        addresses_with_balances
+        let mut top_addresses = top_addresses.into_vec();
+        top_addresses.sort_by(|a, b| {
+            b.balance
+                .cmp(&a.balance)
+                .then_with(|| a.address_key.cmp(&b.address_key))
+        });
+
+        top_addresses
+            .into_iter()
+            .map(|candidate| (candidate.address, candidate.balance))
+            .collect()
     }
 
     /// Returns the transaction IDs that sent or received funds to `addresses`,

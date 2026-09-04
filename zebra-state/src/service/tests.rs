@@ -686,3 +686,21 @@ fn read_only_open_with_ephemeral_config_returns_error() {
         }
     }
 }
+
+#[test]
+fn expensive_read_limit_fails_fast_and_releases_with_the_work() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = super::try_acquire_expensive_read_permit(semaphore.clone())
+        .expect("the first expensive read should acquire the only permit");
+
+    assert!(
+        super::try_acquire_expensive_read_permit(semaphore.clone()).is_err(),
+        "an overloaded expensive read should fail without joining an unbounded wait queue"
+    );
+
+    drop(permit);
+    assert!(
+        super::try_acquire_expensive_read_permit(semaphore).is_ok(),
+        "finishing the guarded work should release its permit"
+    );
+}

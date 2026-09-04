@@ -113,6 +113,13 @@ pub enum CommitBlockError {
     #[error("could not contextually validate semantically verified block")]
     ValidateContextError(#[from] Box<ValidateContextError>),
 
+    /// Local analytics state could not be advanced atomically with the finalized block.
+    #[error("could not update the incremental snapshot accumulator: {reason}")]
+    SnapshotAccumulator {
+        /// The accumulator invariant or arithmetic error.
+        reason: String,
+    },
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zebra shutting down?")]
     #[non_exhaustive]

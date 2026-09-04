@@ -3,11 +3,13 @@ network = "Mainnet"
 listen_addr = "0.0.0.0:8233"
 
 [state]
-cache_dir = "/media/data-disk/zebrad-cache"
+cache_dir = "/data/zebrad-cache"
 
 [rpc]
-listen_addr = "0.0.0.0:8232"
-enable_cookie_auth = false
+# Keep administrative and state-scanning RPC methods local by default. Put an authenticated,
+# rate-limited reverse proxy in front of this port if remote access is required.
+listen_addr = "127.0.0.1:8232"
+enable_cookie_auth = true
 parallel_cpu_threads = 0
 
 [tracing]

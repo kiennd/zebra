@@ -32,13 +32,13 @@ use zebra_chain::{
 };
 
 use crate::{
-    error::CommitCheckpointVerifiedError,
+    error::{CommitBlockError, CommitCheckpointVerifiedError},
     request::FinalizedBlock,
     service::finalized_state::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             block::TransactionLocation,
-            transparent::{AddressBalanceLocationUpdates, OutputLocation},
+            transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
         FromDisk, RawBytes,
@@ -534,14 +534,34 @@ impl ZebraDb {
         // Get the current address balances, before the transactions in this block
 
         fn read_addr_locs<T, F: Fn(&transparent::Address) -> Option<T>>(
-            changed_addresses: HashSet<transparent::Address>,
+            changed_addresses: &HashSet<transparent::Address>,
             f: F,
         ) -> HashMap<transparent::Address, T> {
             changed_addresses
-                .into_iter()
-                .filter_map(|address| Some((address, f(&address)?)))
+                .iter()
+                .filter_map(|address| Some((*address, f(address)?)))
                 .collect()
         }
+
+        // Keep absolute pre-block balances even while a database upgrade requires merge
+        // operands. A merge operand only contains this block's signed change, so it cannot tell
+        // us whether a touched address crossed zero.
+        let pre_block_address_balances = read_addr_locs(&changed_addresses, |addr| {
+            self.address_balance_location(addr)
+        });
+
+        // Zebra deliberately does not index the genesis transparent output, so the accumulator
+        // must make the same exception even on a custom network with a non-zero genesis output.
+        let funded_transparent_address_count_delta = if finalized.height.is_min() {
+            0
+        } else {
+            funded_transparent_address_count_delta(
+                &pre_block_address_balances,
+                &new_outputs_by_out_loc,
+                &spent_utxos_by_out_loc,
+                network,
+            )
+        };
 
         // # Performance
         //
@@ -554,13 +574,14 @@ impl ZebraDb {
         // fully-merged value such that it's much faster to read entries that have been updated with insertions than it
         // is to read entries that have been updated with merge operations.
         let address_balances: AddressBalanceLocationUpdates = if self.finished_format_upgrades() {
-            AddressBalanceLocationUpdates::Insert(read_addr_locs(changed_addresses, |addr| {
-                self.address_balance_location(addr)
-            }))
+            AddressBalanceLocationUpdates::Insert(pre_block_address_balances)
         } else {
-            AddressBalanceLocationUpdates::Merge(read_addr_locs(changed_addresses, |addr| {
-                Some(self.address_balance_location(addr)?.into_new_change())
-            }))
+            AddressBalanceLocationUpdates::Merge(
+                pre_block_address_balances
+                    .into_iter()
+                    .map(|(address, balance)| (address, balance.into_new_change()))
+                    .collect(),
+            )
         };
 
         let mut batch = DiskWriteBatch::new();
@@ -576,6 +597,7 @@ impl ZebraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
+            funded_transparent_address_count_delta,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
         )?;
@@ -616,6 +638,177 @@ fn lookup_out_loc(
     OutputLocation::from_outpoint(tx_loc, outpoint)
 }
 
+/// Returns the change in indexed transparent addresses whose balance is positive.
+///
+/// This uses absolute pre-block balances and the UTXOs already resolved for this block. It stays
+/// correct while address updates use RocksDB merge operands, because those operands contain
+/// signed changes rather than absolute balances.
+fn funded_transparent_address_count_delta(
+    pre_block_balances: &HashMap<transparent::Address, AddressBalanceLocation>,
+    new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+    spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+    network: &Network,
+) -> i64 {
+    let mut post_block_balances = HashMap::<transparent::Address, i128>::new();
+
+    let starting_balance = |address: &transparent::Address| {
+        pre_block_balances
+            .get(address)
+            .map(|balance| i128::from(balance.balance().zatoshis()))
+            .unwrap_or(0)
+    };
+
+    // Mirror the address-index update order. Only the final zero/non-zero transition matters,
+    // including same-block create-and-spend and transparent self-transfer cases.
+    for spent_utxo in spent_utxos_by_out_loc.values() {
+        let Some(address) = spent_utxo.output.address(network) else {
+            continue;
+        };
+        let balance = post_block_balances
+            .entry(address)
+            .or_insert_with(|| starting_balance(&address));
+        *balance = balance
+            .checked_sub(i128::from(spent_utxo.output.value().zatoshis()))
+            .expect("verified transparent balances must not underflow");
+    }
+
+    for new_utxo in new_outputs_by_out_loc.values() {
+        let Some(address) = new_utxo.output.address(network) else {
+            continue;
+        };
+        let balance = post_block_balances
+            .entry(address)
+            .or_insert_with(|| starting_balance(&address));
+        *balance = balance
+            .checked_add(i128::from(new_utxo.output.value().zatoshis()))
+            .expect("verified transparent balances must not overflow");
+    }
+
+    post_block_balances
+        .into_iter()
+        .map(|(address, post_balance)| {
+            assert!(
+                post_balance >= 0,
+                "verified transparent balances must be non-negative"
+            );
+            let was_funded = starting_balance(&address) > 0;
+            let is_funded = post_balance > 0;
+            i64::from(is_funded) - i64::from(was_funded)
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod funded_address_count_tests {
+    use zebra_chain::{
+        amount::Amount,
+        parameters::NetworkKind,
+        transparent::{Address, Output},
+    };
+
+    use super::*;
+
+    fn address(tag: u8) -> Address {
+        Address::from_script_hash(NetworkKind::Mainnet, [tag; 20])
+    }
+
+    fn utxo(address: Address, value: u64, height: Height) -> transparent::Utxo {
+        transparent::Utxo::new(
+            Output::new(
+                Amount::<NonNegative>::try_from(value).expect("test value is valid"),
+                address.script(),
+            ),
+            height,
+            false,
+        )
+    }
+
+    fn pre_balance(location: OutputLocation, value: u64) -> AddressBalanceLocation {
+        let mut balance = AddressBalanceLocation::new(location);
+        *balance.balance_mut() =
+            Amount::<NonNegative>::try_from(value).expect("test value is valid");
+        balance
+    }
+
+    #[test]
+    fn funded_address_delta_tracks_only_zero_crossings() {
+        let network = Network::Mainnet;
+        let height = Height(1);
+        let became_funded = address(1);
+        let became_empty = address(2);
+        let remained_funded = address(3);
+        let created_and_spent = address(4);
+        let zero_value = address(5);
+
+        let old_empty_location = OutputLocation::from_usize(Height(0), 0, 0);
+        let old_funded_location = OutputLocation::from_usize(Height(0), 0, 1);
+        let old_remained_location = OutputLocation::from_usize(Height(0), 0, 2);
+        let created_and_spent_location = OutputLocation::from_usize(height, 0, 3);
+
+        let pre_block_balances = HashMap::from([
+            (became_empty, pre_balance(old_funded_location, 10)),
+            (remained_funded, pre_balance(old_remained_location, 10)),
+        ]);
+        let new_outputs = BTreeMap::from([
+            (
+                OutputLocation::from_usize(height, 0, 0),
+                utxo(became_funded, 10, height),
+            ),
+            (
+                OutputLocation::from_usize(height, 0, 1),
+                utxo(remained_funded, 4, height),
+            ),
+            (
+                created_and_spent_location,
+                utxo(created_and_spent, 7, height),
+            ),
+            (
+                OutputLocation::from_usize(height, 0, 4),
+                utxo(zero_value, 0, height),
+            ),
+        ]);
+        let spent_outputs = BTreeMap::from([
+            (old_funded_location, utxo(became_empty, 10, Height(0))),
+            (old_remained_location, utxo(remained_funded, 4, Height(0))),
+            (
+                created_and_spent_location,
+                utxo(created_and_spent, 7, height),
+            ),
+        ]);
+
+        // +1 for the new funded address, -1 for the emptied address, and zero for all other
+        // transitions (positive-to-positive, same-block create/spend, and zero-valued output).
+        assert_eq!(
+            funded_transparent_address_count_delta(
+                &pre_block_balances,
+                &new_outputs,
+                &spent_outputs,
+                &network,
+            ),
+            0
+        );
+
+        assert_eq!(
+            funded_transparent_address_count_delta(
+                &HashMap::new(),
+                &BTreeMap::from([(old_empty_location, utxo(became_funded, 10, height),)]),
+                &BTreeMap::new(),
+                &network,
+            ),
+            1
+        );
+        assert_eq!(
+            funded_transparent_address_count_delta(
+                &HashMap::from([(became_empty, pre_balance(old_funded_location, 10))]),
+                &BTreeMap::new(),
+                &BTreeMap::from([(old_funded_location, utxo(became_empty, 10, Height(0)),)]),
+                &network,
+            ),
+            -1
+        );
+    }
+}
+
 impl DiskWriteBatch {
     // Write block methods
 
@@ -643,6 +836,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         address_balances: AddressBalanceLocationUpdates,
+        funded_transparent_address_count_delta: i64,
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
     ) -> Result<(), CommitCheckpointVerifiedError> {
@@ -686,12 +880,30 @@ impl DiskWriteBatch {
         }
 
         // Commit UTXOs and value pools
-        self.prepare_chain_value_pools_batch(
+        let (new_value_pool, block_size) = self.prepare_chain_value_pools_batch(
             zebra_db,
             finalized,
-            spent_utxos_by_outpoint,
+            &spent_utxos_by_outpoint,
             value_pool,
         )?;
+
+        // Keep dashboard analytics exactly aligned with the finalized tip. The accumulator uses
+        // only this block and already-resolved data, and is committed atomically with all other
+        // state changes in this batch.
+        self.prepare_snapshot_accumulator_batch(
+            zebra_db,
+            network,
+            finalized,
+            &spent_utxos_by_outpoint,
+            funded_transparent_address_count_delta,
+            new_value_pool,
+            block_size,
+        )
+        .map_err(|error| {
+            CommitCheckpointVerifiedError::from(CommitBlockError::SnapshotAccumulator {
+                reason: error.to_string(),
+            })
+        })?;
 
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
