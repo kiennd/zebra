@@ -165,24 +165,49 @@ impl IntoDisk for BlockInfo {
     type Bytes = Vec<u8>;
 
     fn as_bytes(&self) -> Self::Bytes {
-        self.value_pools()
+        let mut bytes: Vec<_> = self
+            .value_pools()
             .as_bytes()
             .iter()
             .copied()
             .chain(self.size().to_le_bytes().iter().copied())
-            .collect()
+            .collect();
+
+        if let (Some(transaction_count), Some(total_fee)) =
+            (self.transaction_count(), self.total_fee())
+        {
+            bytes.extend_from_slice(&transaction_count.to_le_bytes());
+            bytes.extend_from_slice(&u64::from(total_fee).to_le_bytes());
+        }
+
+        bytes
     }
 }
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // Records are exactly 52 bytes from NU6.3 onward (48-byte value pool incl. the ironwood
-        // pool, plus the 4-byte block size) and exactly 44 bytes for records written by earlier
-        // Zebra versions (40-byte value pool plus 4-byte size). We discriminate the two layouts by
-        // length, and stay forward-compatible by reading the known prefix
-        // and ignoring any unexpected trailing bytes.
+        // Records are 64 bytes when block metrics are available (48-byte value pool, 4-byte block
+        // size, 4-byte transaction count, and 8-byte total fee), 52 bytes from NU6.3 onward before
+        // block metrics, and 44 bytes before NU6.3. We discriminate layouts by length and stay
+        // forward-compatible by ignoring unexpected trailing bytes.
         match bytes.as_ref().len() {
-            // NU6.3 onward (and any forward-compatible larger record): 48-byte pool + 4-byte size.
+            // Current format (and any forward-compatible larger record).
+            64.. => {
+                let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..48])
+                    .expect("must work for 48 bytes");
+                let size =
+                    u32::from_le_bytes(bytes.as_ref()[48..52].try_into().expect("must be 4 bytes"));
+                let transaction_count =
+                    u32::from_le_bytes(bytes.as_ref()[52..56].try_into().expect("must be 4 bytes"));
+                let total_fee_zat =
+                    u64::from_le_bytes(bytes.as_ref()[56..64].try_into().expect("must be 8 bytes"));
+                let total_fee = total_fee_zat
+                    .try_into()
+                    .expect("stored block fees must be a valid non-negative Zcash amount");
+
+                BlockInfo::with_metrics(value_pools, size, transaction_count, total_fee)
+            }
+            // NU6.3 onward before block metrics.
             52.. => {
                 let value_pools = ValueBalance::<NonNegative>::from_bytes(&bytes.as_ref()[0..48])
                     .expect("must work for 48 bytes");

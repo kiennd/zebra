@@ -1462,6 +1462,24 @@ impl Service<ReadRequest> for ReadStateService {
                 read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
             )),
 
+            // Used by the lightweight block-summary explorer RPC.
+            ReadRequest::BlockSummary(height) => Ok(ReadResponse::BlockSummary(
+                read::block_summary(state.latest_best_chain(), &state.db, height),
+            )),
+
+            // Used by the lightweight recent-block explorer RPC.
+            ReadRequest::RecentBlockSummaries { limit } => {
+                let limit = limit.min(ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS);
+                let (best_tip, finalized_tip, blocks) =
+                    read::recent_block_summaries(state.latest_best_chain(), &state.db, limit);
+
+                Ok(ReadResponse::RecentBlockSummaries {
+                    best_tip,
+                    finalized_tip,
+                    blocks,
+                })
+            }
+
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(
                 state.latest_best_chain(),

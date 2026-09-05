@@ -430,6 +430,18 @@ pub enum ValidateContextError {
     },
 
     #[error(
+        "semantic and contextual block fee calculations disagree at {height:?}, {block_hash:?}: \
+         semantic {semantic_fee:?}, contextual {contextual_fee:?}"
+    )]
+    #[non_exhaustive]
+    MismatchedBlockMinerFees {
+        semantic_fee: amount::Amount<NonNegative>,
+        contextual_fee: amount::Amount<NonNegative>,
+        height: block::Height,
+        block_hash: block::Hash,
+    },
+
+    #[error(
         "error calculating the block chain value pool change:\n\
          {value_balance_error:?},\n\
          {height:?}, {block_hash:?},\n\

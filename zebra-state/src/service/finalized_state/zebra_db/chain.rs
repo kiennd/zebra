@@ -289,11 +289,6 @@ impl DiskWriteBatch {
         // code to return the size of data written; but serialization should be cheap.
         let block_size = finalized.block.zcash_serialized_size();
 
-        let _ = db.block_info_cf().with_batch_for_writing(self).zs_insert(
-            &finalized.height,
-            &BlockInfo::new(new_value_pool, block_size as u32),
-        );
-
         Ok((new_value_pool, block_size as u32))
     }
 }

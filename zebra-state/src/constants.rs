@@ -45,6 +45,8 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 29.1.0: appends transaction count and total block fees to new `block_info` records. Existing
+///   44-byte and 52-byte records remain readable and expose those optional metrics as unavailable.
 /// - 29.0.0: adds a mandatory, versioned incremental snapshot accumulator which is updated in the
 ///   same atomic batch as every finalized block. Existing v28 databases do not contain the
 ///   cumulative history needed to seed this value without a full rebuild, so this format requires
@@ -59,7 +61,7 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 ///   new records use 212 bytes. New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major database
 ///   format version (no resync or data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

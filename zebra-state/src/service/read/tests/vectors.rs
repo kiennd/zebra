@@ -7,7 +7,7 @@ use zebra_chain::{
     block::{Block, Hash, Height, MAX_BLOCK_LOCATOR_LENGTH},
     orchard,
     parameters::Network::*,
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize as _},
     subtree::{NoteCommitmentSubtree, NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     transaction,
 };
@@ -39,6 +39,27 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
     let network = Mainnet;
     let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
         init_test_services(&network).await;
+
+    let block_summary_response = read_state
+        .clone()
+        .oneshot(ReadRequest::BlockSummary(Height::MIN))
+        .await
+        .expect("empty block summary request should succeed");
+    assert_eq!(block_summary_response, ReadResponse::BlockSummary(None));
+
+    let recent_response = read_state
+        .clone()
+        .oneshot(ReadRequest::RecentBlockSummaries { limit: 10 })
+        .await
+        .expect("empty recent block summaries request should succeed");
+    assert_eq!(
+        recent_response,
+        ReadResponse::RecentBlockSummaries {
+            best_tip: None,
+            finalized_tip: None,
+            blocks: Vec::new(),
+        }
+    );
 
     transcript.check(read_state).await?;
 
@@ -142,6 +163,115 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
             transaction_cases.check(read_state.clone()).await?;
         }
     }
+
+    Ok(())
+}
+
+/// Recent block summaries are a contiguous, newest-first view backed by lightweight indexes.
+#[tokio::test(flavor = "multi_thread")]
+async fn recent_block_summaries_are_ordered_and_indexed() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    let requested_count = 3.min(blocks.len());
+    let response = read_state
+        .oneshot(ReadRequest::RecentBlockSummaries {
+            limit: requested_count,
+        })
+        .await
+        .expect("recent block summaries request should succeed");
+    let ReadResponse::RecentBlockSummaries {
+        best_tip,
+        finalized_tip,
+        blocks: summaries,
+    } = response
+    else {
+        panic!("unexpected response to recent block summaries request")
+    };
+
+    let expected_tip = blocks.last().expect("test chain is not empty");
+    let expected_tip = (expected_tip.coinbase_height().unwrap(), expected_tip.hash());
+    assert_eq!(best_tip, Some(expected_tip));
+    assert_eq!(finalized_tip, Some(expected_tip));
+    assert_eq!(summaries.len(), requested_count);
+
+    for (summary, expected_block) in summaries.iter().zip(blocks.iter().rev()) {
+        assert_eq!(summary.height, expected_block.coinbase_height().unwrap());
+        assert_eq!(summary.hash, expected_block.hash());
+        assert_eq!(summary.time, expected_block.header.time);
+        assert_eq!(
+            summary.info.size(),
+            expected_block.zcash_serialized_size() as u32
+        );
+        assert_eq!(
+            summary.info.transaction_count(),
+            Some(expected_block.transactions.len() as u32)
+        );
+        assert!(summary.info.total_fee().is_some());
+        assert!(summary.finalized);
+    }
+
+    Ok(())
+}
+
+/// Arbitrary-height block summaries use the same lightweight indexes as recent summaries.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_summaries_are_available_by_height() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    for expected_block in &blocks {
+        let height = expected_block.coinbase_height().unwrap();
+        let response = read_state
+            .clone()
+            .oneshot(ReadRequest::BlockSummary(height))
+            .await
+            .expect("block summary request should succeed");
+        let ReadResponse::BlockSummary(Some(summary)) = response else {
+            panic!("expected a block summary at height {height:?}")
+        };
+
+        assert_eq!(summary.height, height);
+        assert_eq!(summary.hash, expected_block.hash());
+        assert_eq!(summary.time, expected_block.header.time);
+        assert_eq!(
+            summary.info.size(),
+            expected_block.zcash_serialized_size() as u32
+        );
+        assert_eq!(
+            summary.info.transaction_count(),
+            Some(expected_block.transactions.len() as u32)
+        );
+        assert!(summary.info.total_fee().is_some());
+        assert!(summary.finalized);
+    }
+
+    let missing_height = Height(
+        blocks
+            .last()
+            .expect("test chain is not empty")
+            .coinbase_height()
+            .unwrap()
+            .0
+            + 1,
+    );
+    let missing_response = read_state
+        .oneshot(ReadRequest::BlockSummary(missing_height))
+        .await
+        .expect("missing block summary request should succeed");
+    assert_eq!(missing_response, ReadResponse::BlockSummary(None));
 
     Ok(())
 }

@@ -1719,10 +1719,34 @@ impl DiskWriteBatch {
         funded_transparent_address_count_delta: i64,
         new_pool_values: ValueBalance<NonNegative>,
         block_size: u32,
-    ) -> Result<(), SnapshotAccumulatorError> {
+    ) -> Result<Amount<NonNegative>, SnapshotAccumulatorError> {
         let height = finalized.height;
         let timestamp = finalized.block.header.time.timestamp();
         let block_metrics = SnapshotMetricTotals::from_block(finalized, spent_utxos, block_size)?;
+        let block_total_fee_zat = u64::try_from(block_metrics.total_fees_zat).map_err(|_| {
+            SnapshotAccumulatorError::Arithmetic {
+                metric: "per-block fees",
+            }
+        })?;
+        let block_total_fee =
+            Amount::<NonNegative>::try_from(block_total_fee_zat).map_err(|error| {
+                SnapshotAccumulatorError::InvalidValue {
+                    metric: "per-block fees",
+                    reason: error.to_string(),
+                }
+            })?;
+        if let Some(verified_fee) = finalized.block_miner_fees {
+            if verified_fee != block_total_fee {
+                return Err(SnapshotAccumulatorError::InvalidValue {
+                    metric: "per-block fees",
+                    reason: format!(
+                        "semantic verifier calculated {} zatoshis, snapshot index calculated {} zatoshis",
+                        u64::from(verified_fee),
+                        block_total_fee_zat,
+                    ),
+                });
+            }
+        }
 
         let mut accumulator = match db.snapshot_accumulator() {
             Some(accumulator) => {
@@ -1775,7 +1799,7 @@ impl DiskWriteBatch {
             accumulator,
         );
 
-        Ok(())
+        Ok(block_total_fee)
     }
 }
 
@@ -3217,6 +3241,7 @@ mod tests {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees: None,
         };
         let finalized = FinalizedBlock::from_checkpoint_verified(
             CheckpointVerifiedBlock(semantically_verified),
@@ -3659,6 +3684,7 @@ mod tests {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees: None,
         };
         let finalized = FinalizedBlock::from_checkpoint_verified(
             CheckpointVerifiedBlock(verified),
@@ -3720,6 +3746,7 @@ mod tests {
             height,
             new_outputs: HashMap::new(),
             transaction_hashes,
+            block_miner_fees: None,
         };
         let finalized = FinalizedBlock::from_checkpoint_verified(
             CheckpointVerifiedBlock(verified),

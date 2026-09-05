@@ -25,7 +25,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    response::{AnyTx, MinedTx},
+    response::{AnyTx, MinedTx, RecentBlockSummary},
     service::{
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -369,4 +369,113 @@ where
         .as_ref()
         .and_then(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
+}
+
+/// Returns a lightweight summary for `height` in the best chain.
+///
+/// This query only reads the height/hash index, block header, and [`BlockInfo`]; it does not
+/// deserialize block transactions.
+pub fn block_summary<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    height: Height,
+) -> Option<RecentBlockSummary>
+where
+    C: AsRef<Chain> + Clone,
+{
+    let finalized_tip = db.tip();
+    let is_at_or_below_finalized_tip =
+        finalized_tip.is_some_and(|(finalized_height, _)| height <= finalized_height);
+
+    let (hash, header, info, finalized) = if is_at_or_below_finalized_tip {
+        // A cached non-finalized chain can briefly overlap a newly finalized fork. Read the
+        // sampled finalized prefix exclusively from the database to avoid returning a losing fork.
+        let hash = db.hash(height)?;
+        let header = db.block_header(height.into())?;
+        let info = db.block_info(height.into())?;
+        (hash, header, info, true)
+    } else {
+        let hash = crate::service::read::find::hash_by_height(chain.clone(), db, height)?;
+        let header = block_header(chain.clone(), db, hash.into())?;
+        let info = block_info(chain, db, hash.into())?;
+        (hash, header, info, false)
+    };
+
+    Some(RecentBlockSummary {
+        height,
+        hash,
+        time: header.time,
+        info,
+        finalized,
+    })
+}
+
+/// Returns lightweight summaries for up to `limit` recent blocks in the best chain.
+///
+/// The summaries are ordered from newest to oldest. This query only reads block headers,
+/// height/hash indexes, and [`BlockInfo`]; it does not deserialize block transactions.
+pub fn recent_block_summaries<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    limit: usize,
+) -> (
+    Option<(Height, block::Hash)>,
+    Option<(Height, block::Hash)>,
+    Vec<RecentBlockSummary>,
+)
+where
+    C: AsRef<Chain> + Clone,
+{
+    let finalized_tip = db.tip();
+    let non_finalized_tip = chain
+        .as_ref()
+        .map(|chain| chain.as_ref().non_finalized_tip());
+    let best_tip = match (non_finalized_tip, finalized_tip) {
+        (Some(non_finalized_tip), Some(finalized_tip))
+            if finalized_tip.0 >= non_finalized_tip.0 =>
+        {
+            Some(finalized_tip)
+        }
+        (Some(non_finalized_tip), _) => Some(non_finalized_tip),
+        (None, finalized_tip) => finalized_tip,
+    };
+
+    let Some((tip_height, _tip_hash)) = best_tip else {
+        return (best_tip, finalized_tip, Vec::new());
+    };
+
+    let blocks = (0..limit)
+        .map_while(|offset| {
+            let offset = u32::try_from(offset).ok()?;
+            tip_height.0.checked_sub(offset).map(Height)
+        })
+        .map_while(|height| {
+            let is_at_or_below_finalized_tip =
+                finalized_tip.is_some_and(|(finalized_height, _)| height <= finalized_height);
+            let (hash, header, info, finalized) = if is_at_or_below_finalized_tip {
+                // Read the sampled finalized prefix exclusively from the database. During a state
+                // update, a cached non-finalized chain can briefly overlap a newly finalized fork;
+                // mixing those sources here could return a losing-fork block as the best chain.
+                let hash = db.hash(height)?;
+                let header = db.block_header(hash.into())?;
+                let info = db.block_info(hash.into())?;
+                (hash, header, info, true)
+            } else {
+                let hash = crate::service::read::find::hash_by_height(chain.clone(), db, height)?;
+                let header = block_header(chain.clone(), db, hash.into())?;
+                let info = block_info(chain.clone(), db, hash.into())?;
+                (hash, header, info, false)
+            };
+
+            Some(RecentBlockSummary {
+                height,
+                hash,
+                time: header.time,
+                info,
+                finalized,
+            })
+        })
+        .collect();
+
+    (best_tip, finalized_tip, blocks)
 }

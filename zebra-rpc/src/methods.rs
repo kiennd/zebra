@@ -178,6 +178,7 @@ pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
 const DEFAULT_TOP_ADDRESSES_RESULTS: usize = 10;
 const DEFAULT_SNAPSHOT_DATA_RESULTS: usize = 100;
 const DEFAULT_DASHBOARD_DATA_RESULTS: usize = ReadRequest::MAX_SNAPSHOT_DATA_RESULTS;
+const DEFAULT_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 10;
 
 fn validated_rpc_limit(
     limit: Option<usize>,
@@ -510,6 +511,23 @@ pub trait Rpc {
         hash_or_height: String,
         verbosity: Option<u8>,
     ) -> Result<GetBlockResponse>;
+
+    /// Returns a lightweight summary for a best-chain block at `height`.
+    ///
+    /// This explorer-oriented RPC uses precomputed state indexes and does not deserialize block
+    /// transactions or look up spent outputs while serving the request.
+    #[method(name = "getblocksummary")]
+    async fn get_block_summary(&self, height: u32) -> Result<RecentBlockSummaryEntry>;
+
+    /// Returns lightweight summaries for recent best-chain blocks, newest first.
+    ///
+    /// This explorer-oriented RPC uses precomputed state indexes and does not deserialize block
+    /// transactions or look up spent outputs while serving the request.
+    #[method(name = "getrecentblocksummaries")]
+    async fn get_recent_block_summaries(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetRecentBlockSummariesResponse>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -2065,6 +2083,61 @@ where
         } else {
             Err("invalid verbosity value").map_error(server::error::LegacyCode::InvalidParameter)
         }
+    }
+
+    async fn get_block_summary(&self, height: u32) -> Result<RecentBlockSummaryEntry> {
+        let height = Height::try_from(height).map_err(invalid_params)?;
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::BlockSummary(height))
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::BlockSummary(summary) = response else {
+            unreachable!("unmatched response to a block summary request")
+        };
+
+        summary
+            .map(Into::into)
+            .ok_or_else(|| format!("Block at height {} not found", height.0))
+            .map_error(server::error::LegacyCode::InvalidParameter)
+    }
+
+    async fn get_recent_block_summaries(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<GetRecentBlockSummariesResponse> {
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_RECENT_BLOCK_SUMMARIES_RESULTS,
+            ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS,
+        )
+        .map_err(invalid_params)?;
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::RecentBlockSummaries { limit })
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::RecentBlockSummaries {
+            best_tip,
+            finalized_tip,
+            blocks,
+        } = response
+        else {
+            unreachable!("unmatched response to a recent block summaries request")
+        };
+        let (best_height, best_hash) = best_tip.ok_or_misc_error("No blocks in state")?;
+
+        Ok(GetRecentBlockSummariesResponse {
+            best_height: best_height.0,
+            best_hash: best_hash.to_string(),
+            finalized_height: finalized_tip.map(|(height, _hash)| height.0),
+            blocks: blocks.into_iter().map(Into::into).collect(),
+        })
     }
 
     async fn get_block_header(
@@ -4393,6 +4466,104 @@ pub struct TopAddress {
 pub struct GetTopAddressesResponse {
     /// List of top addresses with their balances, sorted by balance descending.
     pub addresses: Vec<TopAddress>,
+}
+
+/// A lightweight recent best-chain block summary.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct RecentBlockSummaryEntry {
+    /// The block height.
+    #[getter(copy)]
+    pub height: u32,
+    /// The display-order block hash.
+    pub hash: String,
+    /// The block timestamp as Unix seconds.
+    #[getter(copy)]
+    pub time: i64,
+    /// The serialized block size in bytes.
+    #[getter(copy)]
+    pub size: u32,
+    /// The number of transactions, or `None` for a legacy state record.
+    #[getter(copy)]
+    pub tx_count: Option<u32>,
+    /// The total block fee in zatoshis, encoded as a decimal string, or `None` for legacy data.
+    pub total_fee_zat: Option<String>,
+    /// Whether this block is already in finalized state.
+    #[getter(copy)]
+    pub finalized: bool,
+}
+
+impl From<zebra_state::RecentBlockSummary> for RecentBlockSummaryEntry {
+    fn from(summary: zebra_state::RecentBlockSummary) -> Self {
+        Self {
+            height: summary.height.0,
+            hash: summary.hash.to_string(),
+            time: summary.time.timestamp(),
+            size: summary.info.size(),
+            tx_count: summary.info.transaction_count(),
+            total_fee_zat: summary
+                .info
+                .total_fee()
+                .map(|fee| u64::from(fee).to_string()),
+            finalized: summary.finalized,
+        }
+    }
+}
+
+/// Response to [`RpcServer::get_recent_block_summaries`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetRecentBlockSummariesResponse {
+    /// The best-chain tip height sampled for this response.
+    #[getter(copy)]
+    pub best_height: u32,
+    /// The display-order best-chain tip hash.
+    pub best_hash: String,
+    /// The current finalized tip height, if finalized state is available.
+    #[getter(copy)]
+    pub finalized_height: Option<u32>,
+    /// Recent best-chain blocks, ordered newest first.
+    pub blocks: Vec<RecentBlockSummaryEntry>,
+}
+
+#[cfg(test)]
+mod recent_block_summary_tests {
+    use super::{GetRecentBlockSummariesResponse, RecentBlockSummaryEntry};
+    use serde_json::json;
+
+    #[test]
+    fn serializes_stable_wire_contract_and_legacy_nulls() {
+        let response = GetRecentBlockSummariesResponse {
+            best_height: 7,
+            best_hash: "11".repeat(32),
+            finalized_height: Some(6),
+            blocks: vec![RecentBlockSummaryEntry {
+                height: 7,
+                hash: "22".repeat(32),
+                time: 1_700_000_000,
+                size: 1_234,
+                tx_count: None,
+                total_fee_zat: None,
+                finalized: false,
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("response must serialize"),
+            json!({
+                "best_height": 7,
+                "best_hash": "11".repeat(32),
+                "finalized_height": 6,
+                "blocks": [{
+                    "height": 7,
+                    "hash": "22".repeat(32),
+                    "time": 1_700_000_000,
+                    "size": 1_234,
+                    "tx_count": null,
+                    "total_fee_zat": null,
+                    "finalized": false
+                }]
+            })
+        );
+    }
 }
 
 /// A single entry returned by the legacy holder-count endpoint.

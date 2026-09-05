@@ -9,7 +9,7 @@ use std::{
 
 use tower::{BoxError, Service, ServiceExt};
 use zebra_chain::{
-    amount::{DeferredPoolBalanceChange, NegativeAllowed},
+    amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed, NonNegative},
     block::{self, Block, HeightDiff},
     diagnostic::{task::WaitForPanics, CodeTimer},
     history_tree::HistoryTree,
@@ -269,6 +269,11 @@ pub struct SemanticallyVerifiedBlock {
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
     pub transaction_hashes: Arc<[transaction::Hash]>,
+    /// The total fees paid by non-coinbase transactions when semantic verification computed them.
+    ///
+    /// Checkpoint and externally synchronized blocks use `None`; finalized snapshot processing
+    /// calculates their fees from already-resolved spent outputs before writing them to disk.
+    pub block_miner_fees: Option<Amount<NonNegative>>,
 }
 
 /// A block ready to be committed directly to the finalized state with
@@ -326,6 +331,9 @@ pub struct ContextuallyVerifiedBlock {
     /// A precomputed list of the hashes of the transactions in this block,
     /// in the same order as `block.transactions`.
     pub(crate) transaction_hashes: Arc<[transaction::Hash]>,
+
+    /// The total fees paid by non-coinbase transactions, when semantic verification provided it.
+    pub(crate) block_miner_fees: Option<Amount<NonNegative>>,
 
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
@@ -387,6 +395,8 @@ pub struct FinalizedBlock {
     /// A precomputed list of the hashes of the transactions in this block, in the same order as
     /// `block.transactions`.
     pub(super) transaction_hashes: Arc<[transaction::Hash]>,
+    /// The total fees paid by non-coinbase transactions, when semantic verification provided it.
+    pub(super) block_miner_fees: Option<Amount<NonNegative>>,
     /// The tresstate associated with the block.
     pub(super) treestate: Treestate,
     /// This block's deferred pool value balance change.
@@ -432,6 +442,7 @@ impl FinalizedBlock {
             height: block.height,
             new_outputs: block.new_outputs,
             transaction_hashes: block.transaction_hashes,
+            block_miner_fees: block.block_miner_fees,
             treestate,
             deferred_pool_balance_change,
         }
@@ -507,6 +518,7 @@ impl ContextuallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees,
         } = semantically_verified;
 
         // This is redundant for the non-finalized state,
@@ -522,6 +534,7 @@ impl ContextuallyVerifiedBlock {
             new_outputs,
             spent_outputs: spent_outputs.clone(),
             transaction_hashes,
+            block_miner_fees,
             chain_value_pool_change: block.chain_value_pool_change(
                 &utxos_from_ordered_utxos(spent_outputs),
                 deferred_pool_balance_change,
@@ -561,6 +574,7 @@ impl SemanticallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees: None,
         }
     }
 }
@@ -586,6 +600,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees: None,
         }
     }
 }
@@ -598,6 +613,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
             height: valid.height,
             new_outputs: valid.new_outputs,
             transaction_hashes: valid.transaction_hashes,
+            block_miner_fees: valid.block_miner_fees,
         }
     }
 }
@@ -610,6 +626,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             height: finalized.height,
             new_outputs: finalized.new_outputs,
             transaction_hashes: finalized.transaction_hashes,
+            block_miner_fees: finalized.block_miner_fees,
         }
     }
 }
@@ -1129,6 +1146,22 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockInfo(None)`](ReadResponse::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
 
+    /// Returns a lightweight summary for a block height in the current best chain.
+    ///
+    /// * [`ReadResponse::BlockSummary(Some(summary))`](ReadResponse::BlockSummary) if the height
+    ///   is in the best chain;
+    /// * [`ReadResponse::BlockSummary(None)`](ReadResponse::BlockSummary) otherwise.
+    BlockSummary(block::Height),
+
+    /// Returns lightweight summaries for recent blocks in the current best chain.
+    ///
+    /// Results are ordered from newest to oldest and are bounded by
+    /// [`ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS`].
+    RecentBlockSummaries {
+        /// Maximum number of summaries to return.
+        limit: usize,
+    },
+
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
     /// Returns
@@ -1563,6 +1596,9 @@ impl ReadRequest {
     /// Maximum number of snapshot records returned by a public request.
     pub const MAX_SNAPSHOT_DATA_RESULTS: usize = 10_000;
 
+    /// Maximum number of recent block summaries returned by a public request.
+    pub const MAX_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 100;
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -1570,6 +1606,8 @@ impl ReadRequest {
             ReadRequest::Tip => "tip",
             ReadRequest::TipPoolValues => "tip_pool_values",
             ReadRequest::BlockInfo(_) => "block_info",
+            ReadRequest::BlockSummary(_) => "block_summary",
+            ReadRequest::RecentBlockSummaries { .. } => "recent_block_summaries",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

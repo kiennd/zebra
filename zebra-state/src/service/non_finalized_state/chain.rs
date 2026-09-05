@@ -1889,7 +1889,13 @@ impl Chain {
 
         // update the chain value pool balances
         let size = block.zcash_serialized_size();
-        self.update_chain_tip_with(&(*chain_value_pool_change, height, size))?;
+        let block_metrics = contextually_valid.block_miner_fees.map(|total_fee| {
+            let transaction_count = u32::try_from(block.transactions.len()).expect(
+                "transaction count fits in u32 because every transaction occupies block bytes",
+            );
+            (transaction_count, total_fee)
+        });
+        self.update_chain_tip_with(&(*chain_value_pool_change, height, size, block_metrics))?;
 
         Ok(())
     }
@@ -2050,7 +2056,7 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
 
         // revert the chain value pool balances, if needed
         // note that size is 0 because it isn't need for reverting
-        self.revert_chain_with(&(*chain_value_pool_change, height, 0), position);
+        self.revert_chain_with(&(*chain_value_pool_change, height, 0, None), position);
     }
 }
 
@@ -2275,11 +2281,23 @@ impl
     }
 }
 
-impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
+impl
+    UpdateWith<(
+        ValueBalance<NegativeAllowed>,
+        Height,
+        usize,
+        Option<(u32, Amount<NonNegative>)>,
+    )> for Chain
+{
     #[allow(clippy::unwrap_in_result)]
     fn update_chain_tip_with(
         &mut self,
-        (block_value_pool_change, height, size): &(ValueBalance<NegativeAllowed>, Height, usize),
+        (block_value_pool_change, height, size, block_metrics): &(
+            ValueBalance<NegativeAllowed>,
+            Height,
+            usize,
+            Option<(u32, Amount<NonNegative>)>,
+        ),
     ) -> Result<(), ValidateContextError> {
         match self
             .chain_value_pools
@@ -2287,8 +2305,16 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         {
             Ok(chain_value_pools) => {
                 self.chain_value_pools = chain_value_pools;
-                self.block_info_by_height
-                    .insert(*height, BlockInfo::new(chain_value_pools, *size as u32));
+                let block_info = match block_metrics {
+                    Some((transaction_count, total_fee)) => BlockInfo::with_metrics(
+                        chain_value_pools,
+                        *size as u32,
+                        *transaction_count,
+                        *total_fee,
+                    ),
+                    None => BlockInfo::new(chain_value_pools, *size as u32),
+                };
+                self.block_info_by_height.insert(*height, block_info);
             }
             Err(value_balance_error) => Err(ValidateContextError::AddValuePool {
                 value_balance_error,
@@ -2316,7 +2342,12 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
     /// change.
     fn revert_chain_with(
         &mut self,
-        (block_value_pool_change, height, _size): &(ValueBalance<NegativeAllowed>, Height, usize),
+        (block_value_pool_change, height, _size, _block_metrics): &(
+            ValueBalance<NegativeAllowed>,
+            Height,
+            usize,
+            Option<(u32, Amount<NonNegative>)>,
+        ),
         position: RevertPosition,
     ) {
         use std::ops::Neg;

@@ -562,7 +562,7 @@ impl NonFinalizedState {
     fn validate_and_commit(
         &self,
         new_chain: Arc<Chain>,
-        prepared: SemanticallyVerifiedBlock,
+        mut prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZebraDb,
     ) -> Result<Arc<Chain>, ValidateContextError> {
         if self
@@ -578,12 +578,26 @@ impl NonFinalizedState {
         // Reads from disk
         //
         // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
-        let spent_utxos = check::utxo::transparent_spend(
+        let (spent_utxos, contextual_block_miner_fees) = check::utxo::transparent_spend(
             &prepared,
             &new_chain.unspent_utxos(),
             &new_chain.spent_utxos,
             finalized_state,
         )?;
+        if let Some(semantic_block_miner_fees) = prepared.block_miner_fees {
+            if semantic_block_miner_fees != contextual_block_miner_fees {
+                return Err(ValidateContextError::MismatchedBlockMinerFees {
+                    semantic_fee: semantic_block_miner_fees,
+                    contextual_fee: contextual_block_miner_fees,
+                    height: prepared.height,
+                    block_hash: prepared.hash,
+                });
+            }
+        }
+        // Backup restore and other trusted replay paths do not retain semantic verifier metadata.
+        // Contextual validation already resolves every transparent spend, so preserve its exact
+        // fee calculation for the live-chain block index without any additional state reads.
+        prepared.block_miner_fees = Some(contextual_block_miner_fees);
 
         // Reads from disk
         check::anchors::block_sapling_orchard_anchors_refer_to_final_treestates(

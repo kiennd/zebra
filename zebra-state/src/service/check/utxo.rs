@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use zebra_chain::{
-    amount,
+    amount::{self, Amount, NonNegative},
     transparent::{self, utxos_from_ordered_utxos, CoinbaseSpendRestriction::*},
 };
 
@@ -19,7 +19,7 @@ use crate::{
 
 /// Lookup all the [`transparent::Utxo`]s spent by a [`SemanticallyVerifiedBlock`].
 /// If any of the spends are invalid, return an error.
-/// Otherwise, return the looked up UTXOs.
+/// Otherwise, return the looked up UTXOs and the total fees paid by non-coinbase transactions.
 ///
 /// Checks for the following kinds of invalid spends:
 ///
@@ -40,7 +40,13 @@ pub fn transparent_spend(
     non_finalized_chain_unspent_utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     non_finalized_chain_spent_utxos: &HashMap<transparent::OutPoint, SpendingTransactionId>,
     finalized_state: &ZebraDb,
-) -> Result<HashMap<transparent::OutPoint, transparent::OrderedUtxo>, ValidateContextError> {
+) -> Result<
+    (
+        HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+        Amount<NonNegative>,
+    ),
+    ValidateContextError,
+> {
     let mut block_spends = HashMap::new();
 
     for (spend_tx_index_in_block, transaction) in
@@ -89,9 +95,9 @@ pub fn transparent_spend(
         }
     }
 
-    remaining_transaction_value(semantically_verified, &block_spends)?;
+    let block_miner_fees = remaining_transaction_value(semantically_verified, &block_spends)?;
 
-    Ok(block_spends)
+    Ok((block_spends, block_miner_fees))
 }
 
 /// Check that transparent spends occur in chain order.
@@ -214,7 +220,7 @@ pub fn transparent_coinbase_spend(
     }
 }
 
-/// Reject negative remaining transaction value.
+/// Reject negative remaining transaction value and return the total non-coinbase transaction fees.
 ///
 /// "As in Bitcoin, the remaining value in the transparent transaction value pool
 /// of a non-coinbase transaction is available to miners as a fee.
@@ -229,8 +235,9 @@ pub fn transparent_coinbase_spend(
 pub fn remaining_transaction_value(
     semantically_verified: &SemanticallyVerifiedBlock,
     utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
-) -> Result<(), ValidateContextError> {
+) -> Result<Amount<NonNegative>, ValidateContextError> {
     let utxos = utxos_from_ordered_utxos(utxos.clone());
+    let mut block_miner_fees = Amount::<NonNegative>::zero();
 
     for (tx_index_in_block, transaction) in
         semantically_verified.block.transactions.iter().enumerate()
@@ -239,42 +246,49 @@ pub fn remaining_transaction_value(
             continue;
         }
 
-        // Check the remaining transparent value pool for this transaction
-        let value_balance = transaction.value_balance(&utxos);
-        match value_balance {
-            Ok(vb) => match vb.remaining_transaction_value() {
-                Ok(_) => Ok(()),
-                Err(amount_error @ amount::Error::Constraint { .. })
-                    if amount_error.invalid_value() < 0 =>
-                {
-                    Err(ValidateContextError::NegativeRemainingTransactionValue {
-                        amount_error,
-                        height: semantically_verified.height,
-                        tx_index_in_block,
-                        transaction_hash: semantically_verified.transaction_hashes
-                            [tx_index_in_block],
-                    })
-                }
-                Err(amount_error) => {
-                    Err(ValidateContextError::CalculateRemainingTransactionValue {
-                        amount_error,
-                        height: semantically_verified.height,
-                        tx_index_in_block,
-                        transaction_hash: semantically_verified.transaction_hashes
-                            [tx_index_in_block],
-                    })
-                }
-            },
-            Err(value_balance_error) => {
-                Err(ValidateContextError::CalculateTransactionValueBalances {
+        let transaction_hash = semantically_verified.transaction_hashes[tx_index_in_block];
+        let value_balance = transaction
+            .value_balance(&utxos)
+            .map_err(|value_balance_error| {
+                ValidateContextError::CalculateTransactionValueBalances {
                     value_balance_error,
                     height: semantically_verified.height,
                     tx_index_in_block,
-                    transaction_hash: semantically_verified.transaction_hashes[tx_index_in_block],
-                })
+                    transaction_hash,
+                }
+            })?;
+        let transaction_fee =
+            value_balance
+                .remaining_transaction_value()
+                .map_err(|amount_error| {
+                    if matches!(&amount_error, amount::Error::Constraint { .. })
+                        && amount_error.invalid_value() < 0
+                    {
+                        ValidateContextError::NegativeRemainingTransactionValue {
+                            amount_error,
+                            height: semantically_verified.height,
+                            tx_index_in_block,
+                            transaction_hash,
+                        }
+                    } else {
+                        ValidateContextError::CalculateRemainingTransactionValue {
+                            amount_error,
+                            height: semantically_verified.height,
+                            tx_index_in_block,
+                            transaction_hash,
+                        }
+                    }
+                })?;
+
+        block_miner_fees = (block_miner_fees + transaction_fee).map_err(|amount_error| {
+            ValidateContextError::CalculateRemainingTransactionValue {
+                amount_error,
+                height: semantically_verified.height,
+                tx_index_in_block,
+                transaction_hash,
             }
-        }?
+        })?;
     }
 
-    Ok(())
+    Ok(block_miner_fees)
 }

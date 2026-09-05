@@ -101,6 +101,7 @@ impl ContextuallyVerifiedBlock {
             height,
             new_outputs,
             transaction_hashes,
+            block_miner_fees,
         } = block.into();
 
         Self {
@@ -113,6 +114,7 @@ impl ContextuallyVerifiedBlock {
             // TODO: fix the tests, and stop adding unrelated inputs and outputs.
             spent_outputs: new_outputs,
             transaction_hashes,
+            block_miner_fees,
             chain_value_pool_change: ValueBalance::zero(),
         }
     }

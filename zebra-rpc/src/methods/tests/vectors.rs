@@ -1019,6 +1019,98 @@ async fn rpc_getblock_missing_error() {
     assert!(rpc_tx_queue_task_result.is_none());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getblocksummary_uses_indexed_state_and_validates_height() {
+    let _init_guard = zebra_test::init();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let height = Height(7);
+    let hash = Hash([0x22; 32]);
+    let time =
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp must be valid");
+    let info = BlockInfo::with_metrics(
+        Default::default(),
+        1_234,
+        3,
+        Amount::<NonNegative>::try_from(567u64).expect("test fee must be valid"),
+    );
+    let expected_summary = zebra_state::RecentBlockSummary {
+        height,
+        hash,
+        time,
+        info,
+        finalized: false,
+    };
+
+    let rpc_clone = rpc.clone();
+    let found_future = tokio::spawn(async move { rpc_clone.get_block_summary(height.0).await });
+    read_state
+        .expect_request(ReadRequest::BlockSummary(height))
+        .await
+        .respond(ReadResponse::BlockSummary(Some(expected_summary)));
+
+    assert_eq!(
+        found_future
+            .await
+            .expect("block summary future should not panic")
+            .expect("indexed block summary should exist"),
+        RecentBlockSummaryEntry {
+            height: height.0,
+            hash: hash.to_string(),
+            time: time.timestamp(),
+            size: 1_234,
+            tx_count: Some(3),
+            total_fee_zat: Some("567".to_string()),
+            finalized: false,
+        }
+    );
+
+    let missing_height = Height(8);
+    let rpc_clone = rpc.clone();
+    let missing_future =
+        tokio::spawn(async move { rpc_clone.get_block_summary(missing_height.0).await });
+    read_state
+        .expect_request(ReadRequest::BlockSummary(missing_height))
+        .await
+        .respond(ReadResponse::BlockSummary(None));
+    let missing_error = missing_future
+        .await
+        .expect("missing summary future should not panic")
+        .expect_err("missing block summary should fail");
+    assert_eq!(missing_error.code(), ErrorCode::ServerError(-8).code());
+
+    let invalid_height = Height::MAX.0 + 1;
+    let invalid_error = rpc
+        .get_block_summary(invalid_height)
+        .await
+        .expect_err("height above the supported range should fail");
+    assert_eq!(invalid_error.code(), ErrorCode::InvalidParams.code());
+
+    mempool.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+}
+
 /// Regression test for GHSA-x6v8-c2xp-928m — panics (aborts) before the fix.
 ///
 /// When `Depth` returns `None` (side-chain block), `get_block_header` sets

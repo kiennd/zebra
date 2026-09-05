@@ -1,6 +1,7 @@
 [network]
 network = "Mainnet"
 listen_addr = "0.0.0.0:8233"
+peerset_initial_target_size = 50
 
 [state]
 cache_dir = "/data/zebrad-cache"

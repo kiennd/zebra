@@ -366,6 +366,7 @@ where
                 height,
                 new_outputs,
                 transaction_hashes,
+                block_miner_fees: Some(block_miner_fees),
             };
 
             // Return early for proposal requests.

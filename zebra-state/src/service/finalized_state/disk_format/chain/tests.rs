@@ -1,6 +1,46 @@
 //! Chain-format serialization tests.
 
 use super::*;
+use zebra_chain::amount::{Amount, MAX_MONEY};
+
+#[test]
+fn block_info_round_trips_current_metrics() {
+    for fee_zat in [0, MAX_MONEY] {
+        let fee = Amount::<NonNegative>::try_from(fee_zat)
+            .expect("test fee must be a valid non-negative amount");
+        let block_info = BlockInfo::with_metrics(ValueBalance::zero(), 1_234, 56, fee);
+        let bytes = block_info.as_bytes();
+
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(BlockInfo::from_bytes(&bytes), block_info);
+
+        let mut bytes_with_future_extension = bytes;
+        bytes_with_future_extension.extend_from_slice(&[0xAB; 8]);
+        assert_eq!(
+            BlockInfo::from_bytes(bytes_with_future_extension),
+            block_info,
+            "future trailing fields must not change the known prefix"
+        );
+    }
+}
+
+#[test]
+fn block_info_reads_legacy_records_without_metrics() {
+    let legacy_nu_6_3 = BlockInfo::new(ValueBalance::zero(), 1_234).as_bytes();
+    assert_eq!(legacy_nu_6_3.len(), 52);
+    let decoded_nu_6_3 = BlockInfo::from_bytes(legacy_nu_6_3);
+    assert_eq!(decoded_nu_6_3.size(), 1_234);
+    assert_eq!(decoded_nu_6_3.transaction_count(), None);
+    assert_eq!(decoded_nu_6_3.total_fee(), None);
+
+    let mut legacy_pre_nu_6_3 = vec![0; 40];
+    legacy_pre_nu_6_3.extend_from_slice(&1_234u32.to_le_bytes());
+    assert_eq!(legacy_pre_nu_6_3.len(), 44);
+    let decoded_pre_nu_6_3 = BlockInfo::from_bytes(legacy_pre_nu_6_3);
+    assert_eq!(decoded_pre_nu_6_3.size(), 1_234);
+    assert_eq!(decoded_pre_nu_6_3.transaction_count(), None);
+    assert_eq!(decoded_pre_nu_6_3.total_fee(), None);
+}
 
 /// A history tree written by a pre-NU6.3 database format (253-byte entries) must be read in
 /// place, zero-padding each entry up to the current width.

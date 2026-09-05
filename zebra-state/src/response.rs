@@ -34,6 +34,21 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// A lightweight summary of a block in the current best chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecentBlockSummary {
+    /// The block height.
+    pub height: block::Height,
+    /// The block hash.
+    pub hash: block::Hash,
+    /// The timestamp declared in the block header.
+    pub time: DateTime<Utc>,
+    /// Extra indexed block information.
+    pub info: BlockInfo,
+    /// Whether this block is in the finalized state.
+    pub finalized: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
@@ -396,6 +411,19 @@ pub enum ReadResponse {
     /// the block info after the specified block.
     BlockInfo(Option<BlockInfo>),
 
+    /// Response to [`ReadRequest::BlockSummary`] with a best-chain block summary.
+    BlockSummary(Option<RecentBlockSummary>),
+
+    /// Response to [`ReadRequest::RecentBlockSummaries`] with newest-first best-chain blocks.
+    RecentBlockSummaries {
+        /// The current best-chain tip.
+        best_tip: Option<(block::Height, block::Hash)>,
+        /// The current finalized tip.
+        finalized_tip: Option<(block::Height, block::Hash)>,
+        /// Recent blocks, ordered from newest to oldest.
+        blocks: Vec<RecentBlockSummary>,
+    },
+
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
     Depth(Option<u32>),
 
@@ -650,6 +678,8 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::UsageInfo(_)
             | ReadResponse::TipPoolValues { .. }
             | ReadResponse::BlockInfo(_)
+            | ReadResponse::BlockSummary(_)
+            | ReadResponse::RecentBlockSummaries { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

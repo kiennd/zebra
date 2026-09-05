@@ -21,6 +21,7 @@ use itertools::Itertools;
 use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
+    block_info::BlockInfo,
     orchard,
     parallel::tree::NoteCommitmentTrees,
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
@@ -890,20 +891,36 @@ impl DiskWriteBatch {
         // Keep dashboard analytics exactly aligned with the finalized tip. The accumulator uses
         // only this block and already-resolved data, and is committed atomically with all other
         // state changes in this batch.
-        self.prepare_snapshot_accumulator_batch(
-            zebra_db,
-            network,
-            finalized,
-            &spent_utxos_by_outpoint,
-            funded_transparent_address_count_delta,
-            new_value_pool,
-            block_size,
-        )
-        .map_err(|error| {
-            CommitCheckpointVerifiedError::from(CommitBlockError::SnapshotAccumulator {
-                reason: error.to_string(),
-            })
-        })?;
+        let block_total_fee = self
+            .prepare_snapshot_accumulator_batch(
+                zebra_db,
+                network,
+                finalized,
+                &spent_utxos_by_outpoint,
+                funded_transparent_address_count_delta,
+                new_value_pool,
+                block_size,
+            )
+            .map_err(|error| {
+                CommitCheckpointVerifiedError::from(CommitBlockError::SnapshotAccumulator {
+                    reason: error.to_string(),
+                })
+            })?;
+
+        let transaction_count = u32::try_from(finalized.block.transactions.len())
+            .expect("transaction count fits in u32 because every transaction occupies block bytes");
+        let _ = zebra_db
+            .block_info_cf()
+            .with_batch_for_writing(self)
+            .zs_insert(
+                &finalized.height,
+                &BlockInfo::with_metrics(
+                    new_value_pool,
+                    block_size,
+                    transaction_count,
+                    block_total_fee,
+                ),
+            );
 
         // The block has passed contextual validation, so update the metrics
         block_precommit_metrics(&finalized.block, finalized.hash, finalized.height);
