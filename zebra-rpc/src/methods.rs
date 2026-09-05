@@ -112,6 +112,7 @@ pub(crate) mod types;
 use hex_data::HexData;
 use trees::{GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData};
 use types::{
+    analyze_raw_transaction::{AnalyzeRawTransactionResponse, Zip317FeeAnalysis},
     get_block_template::{
         constants::{
             DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
@@ -126,6 +127,7 @@ use types::{
     get_mining_info::GetMiningInfoResponse,
     get_raw_mempool::{self, GetRawMempoolResponse},
     get_standard_fee::GetStandardFeeResponse,
+    get_zip317_fee_parameters::GetZip317FeeParametersResponse,
     long_poll::LongPollInput,
     network_info::{GetNetworkInfoResponse, NetworkInfo},
     peer_info::PeerInfo,
@@ -148,6 +150,10 @@ pub(super) const PARAM_POOL_DESC: &str =
 pub(super) const PARAM_START_INDEX_DESC: &str =
     "The index of the first 2^16-leaf subtree to return.";
 pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of items to return.";
+pub(super) const PARAM_BEFORE_HEIGHT_DESC: &str =
+    "Only return blocks strictly below this exclusive height cursor.";
+pub(super) const PARAM_CURSOR_DESC: &str =
+    "An opaque exclusive cursor returned by the previous page.";
 pub(super) const PARAM_START_DATE_DESC: &str =
     "The first snapshot date to return, in YY:MM:DD format.";
 pub(super) const PARAM_END_DATE_DESC: &str =
@@ -179,6 +185,10 @@ const DEFAULT_TOP_ADDRESSES_RESULTS: usize = 10;
 const DEFAULT_SNAPSHOT_DATA_RESULTS: usize = 100;
 const DEFAULT_DASHBOARD_DATA_RESULTS: usize = ReadRequest::MAX_SNAPSHOT_DATA_RESULTS;
 const DEFAULT_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 10;
+const DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS: usize = 25;
+const STALE_EXPLORER_CURSOR_CODE: i32 = -32010;
+const STALE_EXPLORER_CURSOR_MESSAGE: &str =
+    "stale explorer cursor: canonical boundary no longer matches";
 
 fn validated_rpc_limit(
     limit: Option<usize>,
@@ -204,6 +214,296 @@ fn validated_paginated_rpc_limit(
     }
 
     Ok(limit)
+}
+
+fn parse_cursor_height(height: &str) -> std::result::Result<Height, String> {
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| "cursor height must be an unsigned decimal integer".to_string())?;
+    Height::try_from(height).map_err(|error| format!("invalid cursor height: {error}"))
+}
+
+fn parse_cursor_hash(hash: &str) -> std::result::Result<block::Hash, String> {
+    hash.parse::<block::Hash>()
+        .map_err(|_| "cursor block hash must be 64 hexadecimal characters".to_string())
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct BlockSummaryCursor {
+    session_anchor: (Height, block::Hash),
+    boundary: (Height, block::Hash),
+}
+
+fn parse_block_summary_cursor(cursor: &str) -> std::result::Result<BlockSummaryCursor, String> {
+    let mut parts = cursor.split(':');
+    let (
+        Some("v1"),
+        Some("b"),
+        Some(session_height),
+        Some(session_hash),
+        Some(boundary_height),
+        Some(boundary_hash),
+        None,
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
+    else {
+        return Err(
+            "block cursor must have the format v1:b:session_height:session_hash:boundary_height:boundary_hash"
+                .to_string(),
+        );
+    };
+
+    Ok(BlockSummaryCursor {
+        session_anchor: (
+            parse_cursor_height(session_height)?,
+            parse_cursor_hash(session_hash)?,
+        ),
+        boundary: (
+            parse_cursor_height(boundary_height)?,
+            parse_cursor_hash(boundary_hash)?,
+        ),
+    })
+}
+
+fn block_summary_cursor(
+    session_anchor: (Height, block::Hash),
+    boundary: (Height, block::Hash),
+) -> String {
+    format!(
+        "v1:b:{}:{}:{}:{}",
+        session_anchor.0 .0, session_anchor.1, boundary.0 .0, boundary.1,
+    )
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct TransactionSummaryCursor {
+    session_anchor: (Height, block::Hash),
+    before: TransactionLocation,
+    boundary_hash: block::Hash,
+}
+
+fn parse_transaction_summary_cursor(
+    cursor: &str,
+) -> std::result::Result<TransactionSummaryCursor, String> {
+    let mut parts = cursor.split(':');
+    let (
+        Some("v1"),
+        Some("t"),
+        Some(session_height),
+        Some(session_hash),
+        Some(boundary_height),
+        Some(boundary_hash),
+        Some(index),
+        None,
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
+    else {
+        return Err(
+            "transaction cursor must have the format v1:t:session_height:session_hash:boundary_height:boundary_hash:transaction_index"
+                .to_string(),
+        );
+    };
+
+    let index = index
+        .parse::<u16>()
+        .map_err(|_| "cursor transaction index must be an unsigned 16-bit integer".to_string())?;
+
+    Ok(TransactionSummaryCursor {
+        session_anchor: (
+            parse_cursor_height(session_height)?,
+            parse_cursor_hash(session_hash)?,
+        ),
+        before: TransactionLocation::from_index(parse_cursor_height(boundary_height)?, index),
+        boundary_hash: parse_cursor_hash(boundary_hash)?,
+    })
+}
+
+fn transaction_summary_cursor(
+    session_anchor: (Height, block::Hash),
+    location: TransactionLocation,
+    block_hash: block::Hash,
+) -> String {
+    format!(
+        "v1:t:{}:{}:{}:{}:{}",
+        session_anchor.0 .0,
+        session_anchor.1,
+        location.height.0,
+        block_hash,
+        location.index.index()
+    )
+}
+
+fn parse_address_transaction_summary_cursor(
+    cursor: &str,
+    expected_address: transparent::Address,
+) -> std::result::Result<TransactionSummaryCursor, String> {
+    let mut parts = cursor.split(':');
+    let (
+        Some("v1"),
+        Some("a"),
+        Some(cursor_address),
+        Some(session_height),
+        Some(session_hash),
+        Some(boundary_height),
+        Some(boundary_hash),
+        Some(index),
+        None,
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
+    else {
+        return Err(
+            "address transaction cursor must have the format v1:a:address:session_height:session_hash:boundary_height:boundary_hash:transaction_index"
+                .to_string(),
+        );
+    };
+    let cursor_address = cursor_address
+        .parse::<Address>()
+        .map_err(|_| "cursor contains an invalid transparent address".to_string())?;
+    if cursor_address != expected_address {
+        return Err("cursor address does not match request address".to_string());
+    }
+    let index = index
+        .parse::<u16>()
+        .map_err(|_| "cursor transaction index must be an unsigned 16-bit integer".to_string())?;
+
+    Ok(TransactionSummaryCursor {
+        session_anchor: (
+            parse_cursor_height(session_height)?,
+            parse_cursor_hash(session_hash)?,
+        ),
+        before: TransactionLocation::from_index(parse_cursor_height(boundary_height)?, index),
+        boundary_hash: parse_cursor_hash(boundary_hash)?,
+    })
+}
+
+fn address_transaction_summary_cursor(
+    address: transparent::Address,
+    session_anchor: (Height, block::Hash),
+    location: TransactionLocation,
+    block_hash: block::Hash,
+) -> String {
+    format!(
+        "v1:a:{}:{}:{}:{}:{}:{}",
+        address,
+        session_anchor.0 .0,
+        session_anchor.1,
+        location.height.0,
+        block_hash,
+        location.index.index(),
+    )
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct AddressUtxoCursor {
+    anchor: (Height, block::Hash),
+    before: OutputLocation,
+}
+
+fn parse_address_utxo_cursor(
+    cursor: &str,
+    expected_address: transparent::Address,
+) -> std::result::Result<AddressUtxoCursor, String> {
+    let mut parts = cursor.split(':');
+    let (
+        Some("v1"),
+        Some("u"),
+        Some(cursor_address),
+        Some(anchor_height),
+        Some(anchor_hash),
+        Some(output_height),
+        Some(transaction_index),
+        Some(output_index),
+        None,
+    ) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    )
+    else {
+        return Err(
+            "address UTXO cursor must have the format v1:u:address:anchor_height:anchor_hash:height:transaction_index:output_index"
+                .to_string(),
+        );
+    };
+
+    let cursor_address = cursor_address
+        .parse::<Address>()
+        .map_err(|_| "cursor contains an invalid transparent address".to_string())?;
+    if cursor_address != expected_address {
+        return Err("cursor address does not match request address".to_string());
+    }
+
+    let anchor = (
+        parse_cursor_height(anchor_height)?,
+        parse_cursor_hash(anchor_hash)?,
+    );
+    let output_height = parse_cursor_height(output_height)?;
+    let transaction_index = transaction_index
+        .parse::<u16>()
+        .map_err(|_| "cursor transaction index must be an unsigned 16-bit integer".to_string())?;
+    let output_index = output_index
+        .parse::<u32>()
+        .map_err(|_| "cursor output index must be an unsigned 32-bit integer".to_string())?;
+    let before = OutputLocation::from_output_index(
+        TransactionLocation::from_index(output_height, transaction_index),
+        output_index,
+    );
+
+    Ok(AddressUtxoCursor { anchor, before })
+}
+
+fn address_utxo_cursor(
+    address: transparent::Address,
+    anchor: (Height, block::Hash),
+    before: OutputLocation,
+) -> String {
+    format!(
+        "v1:u:{}:{}:{}:{}:{}:{}",
+        address,
+        anchor.0 .0,
+        anchor.1,
+        before.height().0,
+        before.transaction_index().index(),
+        before.output_index().index(),
+    )
+}
+
+fn stale_explorer_cursor() -> ErrorObject<'static> {
+    ErrorObject::owned(
+        STALE_EXPLORER_CURSOR_CODE,
+        STALE_EXPLORER_CURSOR_MESSAGE,
+        None::<()>,
+    )
 }
 
 fn parse_snapshot_date(date: &str) -> std::result::Result<(u8, u8, u8), String> {
@@ -251,6 +551,40 @@ fn validate_snapshot_date_range(
 
 fn invalid_params(message: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(ErrorCode::InvalidParams.code(), message.into(), None::<()>)
+}
+
+/// Strictly decodes and deserializes a raw transaction.
+///
+/// Consensus serialization must consume the entire byte string and round-trip to the same
+/// canonical encoding. Keeping this check shared prevents analysis and submission from accepting
+/// different wire representations of the same transaction.
+fn deserialize_raw_transaction_strict(raw_transaction_hex: &str) -> Result<Transaction> {
+    let raw_transaction_bytes =
+        Vec::from_hex(raw_transaction_hex).map_error(server::error::LegacyCode::Deserialization)?;
+    let mut remaining_bytes = raw_transaction_bytes.as_slice();
+    let raw_transaction = Transaction::zcash_deserialize(&mut remaining_bytes)
+        .map_error(server::error::LegacyCode::Deserialization)?;
+
+    if !remaining_bytes.is_empty() {
+        return Err(ErrorObject::owned(
+            i32::from(server::error::LegacyCode::Deserialization),
+            "serialized transaction has trailing bytes",
+            None::<()>,
+        ));
+    }
+
+    let canonical_bytes = raw_transaction
+        .zcash_serialize_to_vec()
+        .map_error(server::error::LegacyCode::Deserialization)?;
+    if canonical_bytes != raw_transaction_bytes {
+        return Err(ErrorObject::owned(
+            i32::from(server::error::LegacyCode::Deserialization),
+            "serialized transaction is not canonically encoded",
+            None::<()>,
+        ));
+    }
+
+    Ok(raw_transaction)
 }
 
 #[cfg(test)]
@@ -371,9 +705,8 @@ pub trait Rpc {
     ///
     /// - `limit`: (number, optional, default=10, maximum=1000) Maximum number of addresses to return
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
+    /// Uses the mandatory v30 balance-ordered index, so query work is O(`limit`). The response's
+    /// `as_of_height` and `as_of_hash` are sampled atomically with the balances.
     #[method(name = "gettopaddresses")]
     async fn get_top_addresses(&self, limit: Option<usize>) -> Result<GetTopAddressesResponse>;
 
@@ -463,6 +796,19 @@ pub trait Rpc {
         limit: Option<usize>,
     ) -> Result<GetDashboardDataResponse>;
 
+    /// Decodes a serialized transaction and returns its public structure and ZIP-317 fee analysis.
+    ///
+    /// This method is stateless: it does not validate signatures, proofs, inputs, expiry, or
+    /// consensus context, and it does not submit the transaction to the mempool.
+    ///
+    /// method: post
+    /// tags: transaction
+    #[method(name = "analyzerawtransaction")]
+    async fn analyze_raw_transaction(
+        &self,
+        raw_transaction_hex: String,
+    ) -> Result<AnalyzeRawTransactionResponse>;
+
     /// Sends the raw bytes of a signed transaction to the local node's mempool, if the transaction is valid.
     /// Returns the [`SentTransactionHash`] for the transaction, as a JSON string.
     ///
@@ -527,7 +873,50 @@ pub trait Rpc {
     async fn get_recent_block_summaries(
         &self,
         limit: Option<usize>,
+        before_height: Option<u32>,
+        cursor: Option<String>,
     ) -> Result<GetRecentBlockSummariesResponse>;
+
+    /// Returns lightweight summaries for best-chain transactions, newest first.
+    ///
+    /// The cursor is exclusive and opaque to clients. The response intentionally omits fees,
+    /// because Zebra does not persist enough per-transaction metadata to serve them cheaply.
+    #[method(name = "gettransactionsummarypage")]
+    async fn get_transaction_summary_page(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetTransactionSummaryPageResponse>;
+
+    /// Returns newest-first transaction summaries involving one transparent address.
+    ///
+    /// This explorer RPC uses a bounded reverse address-index scan. It does not load the
+    /// address's complete history or require one RPC request per transaction.
+    #[method(name = "getaddresstransactionsummarypage")]
+    async fn get_address_transaction_summary_page(
+        &self,
+        address: String,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetAddressTransactionSummaryPageResponse>;
+
+    /// Returns a newest-first page of current UTXOs for one transparent address.
+    ///
+    /// The opaque cursor is bound to the exact sampled best tip. Any tip change makes the cursor
+    /// stale, because a later block can spend an older UTXO and otherwise cause pagination gaps.
+    #[method(name = "getaddressutxosummarypage")]
+    async fn get_address_utxo_summary_page(
+        &self,
+        address: String,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetAddressUtxoSummaryPageResponse>;
+
+    /// Returns the active tip and every contextually valid fork currently retained by Zebra.
+    ///
+    /// This is bounded, in-memory fork coverage, not persistent reorganization history.
+    #[method(name = "getexplorerchaintips")]
+    async fn get_explorer_chain_tips(&self) -> Result<GetExplorerChainTipsResponse>;
 
     /// Returns the requested block header by hash or height, as a [`GetBlockHeader`] JSON string.
     /// If the block is not in Zebra's state,
@@ -904,11 +1293,19 @@ pub trait Rpc {
     ///
     /// Currently returns a static fee with `version` 0; this will be replaced by
     /// a dynamic estimate without changing the parameters or result shape.
+    /// This estimator response version is unrelated to the ZIP-317 specification revision.
     ///
     /// method: post
     /// tags: wallet
     #[method(name = "getstandardfee")]
     async fn get_standard_fee(&self) -> Result<GetStandardFeeResponse>;
+
+    /// Returns the authoritative parameters used by Zebra's ZIP-317 fee calculator.
+    ///
+    /// method: post
+    /// tags: wallet
+    #[method(name = "getzip317feeparameters")]
+    async fn get_zip317_fee_parameters(&self) -> Result<GetZip317FeeParametersResponse>;
 
     /// Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.
     /// Returns an error if `height` is less than the height of the first halving for the current network.
@@ -1544,8 +1941,15 @@ where
             .map_misc_error()?;
 
         match response {
-            zebra_state::ReadResponse::TopAddressesByBalance { addresses } => {
+            zebra_state::ReadResponse::TopAddressesByBalance {
+                finalized_tip,
+                addresses,
+            } => {
+                let (as_of_height, as_of_hash) =
+                    finalized_tip.ok_or_misc_error("No finalized blocks in state")?;
                 Ok(GetTopAddressesResponse {
+                    as_of_height: as_of_height.0,
+                    as_of_hash: as_of_hash.to_string(),
                     addresses: addresses
                         .into_iter()
                         .map(|(address, balance)| TopAddress {
@@ -1775,6 +2179,42 @@ where
         }
     }
 
+    async fn analyze_raw_transaction(
+        &self,
+        raw_transaction_hex: String,
+    ) -> Result<AnalyzeRawTransactionResponse> {
+        use zebra_chain::transaction::zip317::{
+            conventional_actions, conventional_fee, GRACE_ACTIONS, MARGINAL_FEE, ZIP317_REVISION,
+        };
+
+        let raw_transaction = deserialize_raw_transaction_strict(&raw_transaction_hex)?;
+
+        let conventional_actions = conventional_actions(&raw_transaction);
+        let conventional_fee_zat = conventional_fee(&raw_transaction).into();
+        let transaction_hash = raw_transaction.hash();
+        let transaction = TransactionObject::from_transaction(
+            Arc::new(raw_transaction),
+            None,
+            None,
+            &self.network,
+            None,
+            None,
+            None,
+            transaction_hash,
+        );
+
+        Ok(AnalyzeRawTransactionResponse::new(
+            Box::new(transaction),
+            Zip317FeeAnalysis::new(
+                ZIP317_REVISION,
+                conventional_actions,
+                conventional_fee_zat,
+                MARGINAL_FEE,
+                GRACE_ACTIONS,
+            ),
+        ))
+    }
+
     // TODO: use HexData or GetRawTransaction::Bytes to handle the transaction data argument
     async fn send_raw_transaction(
         &self,
@@ -1786,10 +2226,7 @@ where
 
         // Reference for the legacy error code:
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
-        let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex)
-            .map_error(server::error::LegacyCode::Deserialization)?;
-        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
-            .map_error(server::error::LegacyCode::Deserialization)?;
+        let raw_transaction = deserialize_raw_transaction_strict(&raw_transaction_hex)?;
 
         let transaction_hash = raw_transaction.hash();
 
@@ -2107,6 +2544,8 @@ where
     async fn get_recent_block_summaries(
         &self,
         limit: Option<usize>,
+        before_height: Option<u32>,
+        cursor: Option<String>,
     ) -> Result<GetRecentBlockSummariesResponse> {
         let limit = validated_paginated_rpc_limit(
             limit,
@@ -2114,29 +2553,338 @@ where
             ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS,
         )
         .map_err(invalid_params)?;
+        let state_limit = limit.saturating_add(1);
+        if before_height.is_some() && cursor.is_some() {
+            return Err(invalid_params(
+                "before_height and cursor are mutually exclusive",
+            ));
+        }
+        let legacy_before_height = before_height
+            .map(Height::try_from)
+            .transpose()
+            .map_err(invalid_params)?;
+        let parsed_cursor = cursor
+            .as_deref()
+            .map(parse_block_summary_cursor)
+            .transpose()
+            .map_err(invalid_params)?;
+        let before_height = parsed_cursor
+            .map(|cursor| cursor.boundary.0)
+            .or(legacy_before_height);
+        let session_anchor = parsed_cursor.map(|cursor| cursor.session_anchor);
+        let cursor_anchor = parsed_cursor.map(|cursor| cursor.boundary);
 
         let response = self
             .read_state
             .clone()
-            .oneshot(ReadRequest::RecentBlockSummaries { limit })
+            .oneshot(ReadRequest::RecentBlockSummaries {
+                limit: state_limit,
+                before_height,
+                session_anchor,
+                cursor_anchor,
+            })
             .await
             .map_misc_error()?;
 
         let ReadResponse::RecentBlockSummaries {
             best_tip,
             finalized_tip,
-            blocks,
+            mut blocks,
+            cursor_valid,
         } = response
         else {
             unreachable!("unmatched response to a recent block summaries request")
         };
+        if !cursor_valid {
+            return Err(stale_explorer_cursor());
+        }
         let (best_height, best_hash) = best_tip.ok_or_misc_error("No blocks in state")?;
+        let session_anchor = session_anchor.unwrap_or((best_height, best_hash));
+        let request_cursor_finalized = parsed_cursor.is_some_and(|cursor| {
+            finalized_tip.is_some_and(|(height, _hash)| {
+                cursor.session_anchor.0 <= height && cursor.boundary.0 <= height
+            })
+        });
+        let has_more = blocks.len() > limit;
+        blocks.truncate(limit);
+        let next_boundary = has_more
+            .then(|| blocks.last().map(|block| (block.height, block.hash)))
+            .flatten()
+            .filter(|(height, _hash)| *height > Height::MIN);
+        let next_before_height = next_boundary.map(|(height, _hash)| height.0);
+        let next_cursor =
+            next_boundary.map(|boundary| block_summary_cursor(session_anchor, boundary));
 
         Ok(GetRecentBlockSummariesResponse {
             best_height: best_height.0,
             best_hash: best_hash.to_string(),
             finalized_height: finalized_tip.map(|(height, _hash)| height.0),
             blocks: blocks.into_iter().map(Into::into).collect(),
+            next_before_height,
+            next_cursor,
+            request_cursor_finalized,
+        })
+    }
+
+    async fn get_transaction_summary_page(
+        &self,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetTransactionSummaryPageResponse> {
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS,
+            ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS,
+        )
+        .map_err(invalid_params)?;
+        let state_limit = limit.saturating_add(1);
+        let parsed_cursor = cursor
+            .as_deref()
+            .map(parse_transaction_summary_cursor)
+            .transpose()
+            .map_err(invalid_params)?;
+        let before = parsed_cursor.map(|cursor| cursor.before);
+        let session_anchor = parsed_cursor.map(|cursor| cursor.session_anchor);
+        let cursor_anchor =
+            parsed_cursor.map(|cursor| (cursor.before.height, cursor.boundary_hash));
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::TransactionSummaryPage {
+                limit: state_limit,
+                before,
+                session_anchor,
+                cursor_anchor,
+            })
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::TransactionSummaryPage {
+            best_tip,
+            finalized_tip,
+            mut transactions,
+            cursor_valid,
+        } = response
+        else {
+            unreachable!("unmatched response to a transaction summary page request")
+        };
+        if !cursor_valid {
+            return Err(stale_explorer_cursor());
+        }
+        let (best_height, best_hash) = best_tip.ok_or_misc_error("No blocks in state")?;
+        let next_session_anchor = session_anchor.unwrap_or((best_height, best_hash));
+        let request_cursor_finalized = parsed_cursor.is_some_and(|cursor| {
+            finalized_tip.is_some_and(|(height, _hash)| {
+                cursor.session_anchor.0 <= height && cursor.before.height <= height
+            })
+        });
+        let has_more = transactions.len() > limit;
+        transactions.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                transactions
+                    .last()
+                    .map(|summary| (summary.location, summary.block_hash))
+            })
+            .flatten()
+            .filter(|(location, _hash)| *location != TransactionLocation::MIN)
+            .map(|(location, hash)| {
+                transaction_summary_cursor(next_session_anchor, location, hash)
+            });
+
+        Ok(GetTransactionSummaryPageResponse {
+            best_height: best_height.0,
+            best_hash: best_hash.to_string(),
+            finalized_height: finalized_tip.map(|(height, _hash)| height.0),
+            transactions: transactions.into_iter().map(Into::into).collect(),
+            next_cursor,
+            request_cursor_finalized,
+        })
+    }
+
+    async fn get_address_transaction_summary_page(
+        &self,
+        address: String,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetAddressTransactionSummaryPageResponse> {
+        let address = address
+            .parse::<Address>()
+            .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS,
+            ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS,
+        )
+        .map_err(invalid_params)?;
+        let state_limit = limit.saturating_add(1);
+        let parsed_cursor = cursor
+            .as_deref()
+            .map(|cursor| parse_address_transaction_summary_cursor(cursor, address))
+            .transpose()
+            .map_err(invalid_params)?;
+        let before = parsed_cursor.map(|cursor| cursor.before);
+        let session_anchor = parsed_cursor.map(|cursor| cursor.session_anchor);
+        let cursor_anchor =
+            parsed_cursor.map(|cursor| (cursor.before.height, cursor.boundary_hash));
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::AddressTransactionSummaryPage {
+                address,
+                limit: state_limit,
+                before,
+                session_anchor,
+                cursor_anchor,
+            })
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::AddressTransactionSummaryPage {
+            best_tip,
+            finalized_tip,
+            mut transactions,
+            cursor_valid,
+        } = response
+        else {
+            unreachable!("unmatched response to an address transaction summary page request")
+        };
+        if !cursor_valid {
+            return Err(stale_explorer_cursor());
+        }
+        let (best_height, best_hash) = best_tip.ok_or_misc_error("No blocks in state")?;
+        let next_session_anchor = session_anchor.unwrap_or((best_height, best_hash));
+        let request_cursor_finalized = parsed_cursor.is_some_and(|cursor| {
+            finalized_tip.is_some_and(|(height, _hash)| {
+                cursor.session_anchor.0 <= height && cursor.before.height <= height
+            })
+        });
+        let has_more = transactions.len() > limit;
+        transactions.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                transactions
+                    .last()
+                    .map(|summary| (summary.location, summary.block_hash))
+            })
+            .flatten()
+            .filter(|(location, _hash)| *location != TransactionLocation::MIN)
+            .map(|(location, hash)| {
+                address_transaction_summary_cursor(address, next_session_anchor, location, hash)
+            });
+
+        Ok(GetAddressTransactionSummaryPageResponse {
+            address: address.to_string(),
+            best_height: best_height.0,
+            best_hash: best_hash.to_string(),
+            finalized_height: finalized_tip.map(|(height, _hash)| height.0),
+            transactions: transactions.into_iter().map(Into::into).collect(),
+            next_cursor,
+            request_cursor_finalized,
+        })
+    }
+
+    async fn get_address_utxo_summary_page(
+        &self,
+        address: String,
+        limit: Option<usize>,
+        cursor: Option<String>,
+    ) -> Result<GetAddressUtxoSummaryPageResponse> {
+        let address = address
+            .parse::<Address>()
+            .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS,
+            ReadRequest::MAX_ADDRESS_UTXO_SUMMARY_PAGE_RESULTS,
+        )
+        .map_err(invalid_params)?;
+        let state_limit = limit.saturating_add(1);
+        let cursor = cursor
+            .as_deref()
+            .map(|cursor| parse_address_utxo_cursor(cursor, address))
+            .transpose()
+            .map_err(invalid_params)?;
+
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::AddressUtxoSummaryPage {
+                address,
+                limit: state_limit,
+                before: cursor.map(|cursor| cursor.before),
+                cursor_anchor: cursor.map(|cursor| cursor.anchor),
+            })
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::AddressUtxoSummaryPage {
+            best_tip,
+            finalized_tip,
+            cursor_valid,
+            mut utxos,
+        } = response
+        else {
+            unreachable!("unmatched response to an address UTXO summary page request")
+        };
+        if !cursor_valid {
+            return Err(stale_explorer_cursor());
+        }
+
+        let anchor = best_tip.ok_or_misc_error("No blocks in state")?;
+        let request_cursor_finalized = cursor.is_some_and(|cursor| {
+            finalized_tip.is_some_and(|(height, _hash)| cursor.anchor.0 <= height)
+        });
+        let has_more = utxos.len() > limit;
+        utxos.truncate(limit);
+        let next_cursor = has_more
+            .then(|| utxos.last().map(|summary| summary.location))
+            .flatten()
+            .map(|location| address_utxo_cursor(address, anchor, location));
+
+        Ok(GetAddressUtxoSummaryPageResponse {
+            address: address.to_string(),
+            best_height: anchor.0 .0,
+            best_hash: anchor.1.to_string(),
+            finalized_height: finalized_tip.map(|(height, _hash)| height.0),
+            utxos: utxos.into_iter().map(Into::into).collect(),
+            next_cursor,
+            request_cursor_finalized,
+        })
+    }
+
+    async fn get_explorer_chain_tips(&self) -> Result<GetExplorerChainTipsResponse> {
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::ExplorerChainTips)
+            .await
+            .map_misc_error()?;
+
+        let ReadResponse::ExplorerChainTips {
+            best_tip,
+            finalized_tip,
+            tips,
+        } = response
+        else {
+            unreachable!("unmatched response to an explorer chain tips request")
+        };
+        let (best_height, best_hash) = best_tip.ok_or_misc_error("No blocks in state")?;
+
+        Ok(GetExplorerChainTipsResponse {
+            best_height: best_height.0,
+            best_hash: best_hash.to_string(),
+            finalized_height: finalized_tip.map(|(height, _hash)| height.0),
+            tips: tips.into_iter().map(Into::into).collect(),
+            coverage: ExplorerChainTipsCoverage {
+                current_non_finalized_only: true,
+                persistent_history: false,
+                max_tracked_tips: u32::try_from(zebra_state::MAX_NON_FINALIZED_CHAIN_FORKS)
+                    .expect("the configured chain-tip limit fits in u32"),
+                max_reorg_depth: zebra_state::MAX_BLOCK_REORG_HEIGHT,
+            },
         })
     }
 
@@ -3571,6 +4319,21 @@ where
         Ok(GetStandardFeeResponse::new(MARGINAL_FEE, VERSION))
     }
 
+    async fn get_zip317_fee_parameters(&self) -> Result<GetZip317FeeParametersResponse> {
+        use zebra_chain::transaction::zip317::{
+            GRACE_ACTIONS, MARGINAL_FEE, P2PKH_STANDARD_INPUT_SIZE, P2PKH_STANDARD_OUTPUT_SIZE,
+            ZIP317_REVISION,
+        };
+
+        Ok(GetZip317FeeParametersResponse::new(
+            ZIP317_REVISION,
+            MARGINAL_FEE,
+            GRACE_ACTIONS,
+            P2PKH_STANDARD_INPUT_SIZE,
+            P2PKH_STANDARD_OUTPUT_SIZE,
+        ))
+    }
+
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse> {
         let net = self.network.clone();
 
@@ -4464,6 +5227,11 @@ pub struct TopAddress {
 /// Response to [`RpcServer::get_top_addresses`] RPC method.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
 pub struct GetTopAddressesResponse {
+    /// The exact finalized height of the atomic balance-index snapshot.
+    #[getter(copy)]
+    pub as_of_height: u32,
+    /// The exact finalized hash of the atomic balance-index snapshot.
+    pub as_of_hash: String,
     /// List of top addresses with their balances, sorted by balance descending.
     pub addresses: Vec<TopAddress>,
 }
@@ -4522,6 +5290,298 @@ pub struct GetRecentBlockSummariesResponse {
     pub finalized_height: Option<u32>,
     /// Recent best-chain blocks, ordered newest first.
     pub blocks: Vec<RecentBlockSummaryEntry>,
+    /// Exclusive height cursor for the next page, or `None` when this page is exhausted.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub next_before_height: Option<u32>,
+    /// Opaque canonical-boundary cursor for the next page.
+    #[serde(default)]
+    #[new(default)]
+    pub next_cursor: Option<String>,
+    /// Whether every anchor in the inbound opaque cursor was finalized for this request.
+    /// False for page one and legacy numeric cursors.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub request_cursor_finalized: bool,
+}
+
+/// A lightweight best-chain transaction summary for explorer list pages.
+#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct ExplorerTransactionSummaryEntry {
+    /// The display-order transaction ID.
+    pub txid: String,
+    /// The containing best-chain block height.
+    #[getter(copy)]
+    pub block_height: u32,
+    /// The display-order containing block hash.
+    pub block_hash: String,
+    /// The containing block timestamp as Unix seconds.
+    #[getter(copy)]
+    pub block_time: i64,
+    /// The transaction index within its block.
+    #[getter(copy)]
+    pub tx_index: u16,
+    /// The serialized transaction size in bytes.
+    #[getter(copy)]
+    pub size: u32,
+    /// The numeric transaction version.
+    #[getter(copy)]
+    pub version: u32,
+    /// Whether the transaction is a coinbase transaction.
+    #[getter(copy)]
+    pub coinbase: bool,
+    /// The number of transparent inputs.
+    #[getter(copy)]
+    pub transparent_input_count: u32,
+    /// The number of transparent outputs.
+    #[getter(copy)]
+    pub transparent_output_count: u32,
+    /// The number of Sprout JoinSplit descriptions.
+    #[getter(copy)]
+    pub sprout_joinsplit_count: u32,
+    /// The number of Sapling spends.
+    #[getter(copy)]
+    pub sapling_spend_count: u32,
+    /// The number of Sapling outputs.
+    #[getter(copy)]
+    pub sapling_output_count: u32,
+    /// The number of Orchard actions.
+    #[getter(copy)]
+    pub orchard_action_count: u32,
+    /// The number of Ironwood actions.
+    #[getter(copy)]
+    pub ironwood_action_count: u32,
+    /// Whether the containing block is finalized.
+    #[getter(copy)]
+    pub finalized: bool,
+}
+
+impl From<zebra_state::ExplorerTransactionSummary> for ExplorerTransactionSummaryEntry {
+    fn from(summary: zebra_state::ExplorerTransactionSummary) -> Self {
+        Self {
+            txid: summary.hash.to_string(),
+            block_height: summary.location.height.0,
+            block_hash: summary.block_hash.to_string(),
+            block_time: summary.block_time.timestamp(),
+            tx_index: summary.location.index.index(),
+            size: summary.size,
+            version: summary.version,
+            coinbase: summary.coinbase,
+            transparent_input_count: summary.transparent_input_count,
+            transparent_output_count: summary.transparent_output_count,
+            sprout_joinsplit_count: summary.sprout_joinsplit_count,
+            sapling_spend_count: summary.sapling_spend_count,
+            sapling_output_count: summary.sapling_output_count,
+            orchard_action_count: summary.orchard_action_count,
+            ironwood_action_count: summary.ironwood_action_count,
+            finalized: summary.finalized,
+        }
+    }
+}
+
+/// Response to [`RpcServer::get_transaction_summary_page`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetTransactionSummaryPageResponse {
+    /// The best-chain tip height sampled for this response.
+    #[getter(copy)]
+    pub best_height: u32,
+    /// The display-order best-chain tip hash.
+    pub best_hash: String,
+    /// The current finalized tip height, if finalized state is available.
+    #[getter(copy)]
+    pub finalized_height: Option<u32>,
+    /// Best-chain transactions ordered newest first by chain location.
+    pub transactions: Vec<ExplorerTransactionSummaryEntry>,
+    /// Opaque exclusive cursor for the next page, or `None` when exhausted.
+    pub next_cursor: Option<String>,
+    /// Whether every anchor in the inbound opaque cursor was finalized for this request.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub request_cursor_finalized: bool,
+}
+
+/// Response to [`RpcServer::get_address_transaction_summary_page`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetAddressTransactionSummaryPageResponse {
+    /// The canonical transparent address queried by this response.
+    pub address: String,
+    /// The best-chain tip height sampled for this response.
+    #[getter(copy)]
+    pub best_height: u32,
+    /// The display-order best-chain tip hash.
+    pub best_hash: String,
+    /// The current finalized tip height, if finalized state is available.
+    #[getter(copy)]
+    pub finalized_height: Option<u32>,
+    /// Address transactions ordered newest first by chain location.
+    pub transactions: Vec<ExplorerTransactionSummaryEntry>,
+    /// Opaque exclusive cursor for the next page, or `None` when exhausted.
+    pub next_cursor: Option<String>,
+    /// Whether every anchor in the inbound opaque cursor was finalized for this request.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub request_cursor_finalized: bool,
+}
+
+/// A current unspent transparent output for an explorer address page.
+#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct ExplorerAddressUtxoEntry {
+    /// The transaction that created this output.
+    pub txid: String,
+    /// The output index in its transaction.
+    #[getter(copy)]
+    pub output_index: u32,
+    /// The containing block height.
+    #[getter(copy)]
+    pub block_height: u32,
+    /// The transaction index in its block.
+    #[getter(copy)]
+    pub tx_index: u16,
+    /// The unspent value in zatoshis.
+    #[getter(copy)]
+    pub value_zat: u64,
+    /// Raw transparent locking script in hexadecimal.
+    pub script_hex: String,
+    /// Whether the output was created by a coinbase transaction.
+    #[getter(copy)]
+    pub coinbase: bool,
+    /// The containing canonical block hash.
+    pub block_hash: String,
+    /// The containing block timestamp as Unix seconds.
+    #[getter(copy)]
+    pub block_time: i64,
+    /// Whether the containing block is finalized.
+    #[getter(copy)]
+    pub finalized: bool,
+}
+
+impl From<zebra_state::ExplorerAddressUtxoSummary> for ExplorerAddressUtxoEntry {
+    fn from(summary: zebra_state::ExplorerAddressUtxoSummary) -> Self {
+        Self {
+            txid: summary.transaction_hash.to_string(),
+            output_index: summary.location.output_index().index(),
+            block_height: summary.location.height().0,
+            tx_index: summary.location.transaction_index().index(),
+            value_zat: u64::from(summary.output.value()),
+            script_hex: summary.output.lock_script.to_string(),
+            coinbase: summary.location.transaction_index() == zebra_state::TransactionIndex::MIN,
+            block_hash: summary.block_hash.to_string(),
+            block_time: summary.block_time.timestamp(),
+            finalized: summary.finalized,
+        }
+    }
+}
+
+/// Response to [`RpcServer::get_address_utxo_summary_page`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetAddressUtxoSummaryPageResponse {
+    /// The canonical transparent address queried by this response.
+    pub address: String,
+    /// The exact best-chain tip height anchoring this current-UTXO snapshot.
+    #[getter(copy)]
+    pub best_height: u32,
+    /// The exact best-chain tip hash anchoring this current-UTXO snapshot.
+    pub best_hash: String,
+    /// The finalized height sampled for this response.
+    #[getter(copy)]
+    pub finalized_height: Option<u32>,
+    /// Current unspent outputs ordered newest first.
+    pub utxos: Vec<ExplorerAddressUtxoEntry>,
+    /// Opaque exact-tip-bound exclusive cursor for the next page.
+    pub next_cursor: Option<String>,
+    /// Whether the inbound exact-tip cursor anchor was finalized for this request.
+    #[serde(default)]
+    #[new(default)]
+    #[getter(copy)]
+    pub request_cursor_finalized: bool,
+}
+
+/// The status of a currently tracked explorer chain tip.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExplorerChainTipStatus {
+    /// The current best chain.
+    Active,
+    /// A contextually valid side chain retained in non-finalized state.
+    ValidFork,
+}
+
+/// A currently tracked chain tip.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct ExplorerChainTipEntry {
+    /// The tip height.
+    #[getter(copy)]
+    pub height: u32,
+    /// The display-order tip hash.
+    pub hash: String,
+    /// Blocks in this branch after its common ancestor with the active chain.
+    #[getter(copy)]
+    pub branch_length: u32,
+    /// Common ancestor height, omitted for the active chain.
+    #[getter(copy)]
+    pub fork_height: Option<u32>,
+    /// Common ancestor hash, omitted for the active chain.
+    pub fork_hash: Option<String>,
+    /// Whether this is the active chain or a valid fork.
+    #[getter(copy)]
+    pub status: ExplorerChainTipStatus,
+}
+
+impl From<zebra_state::ExplorerChainTip> for ExplorerChainTipEntry {
+    fn from(tip: zebra_state::ExplorerChainTip) -> Self {
+        Self {
+            height: tip.height.0,
+            hash: tip.hash.to_string(),
+            branch_length: tip.branch_length,
+            fork_height: tip.fork_height.map(|height| height.0),
+            fork_hash: tip.fork_hash.map(|hash| hash.to_string()),
+            status: if tip.active {
+                ExplorerChainTipStatus::Active
+            } else {
+                ExplorerChainTipStatus::ValidFork
+            },
+        }
+    }
+}
+
+/// Response to [`RpcServer::get_explorer_chain_tips`] RPC method.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct GetExplorerChainTipsResponse {
+    /// The best-chain tip height sampled for this response.
+    #[getter(copy)]
+    pub best_height: u32,
+    /// The display-order best-chain tip hash.
+    pub best_hash: String,
+    /// The current finalized tip height, if finalized state is available.
+    #[getter(copy)]
+    pub finalized_height: Option<u32>,
+    /// The active chain first, followed by current valid forks.
+    pub tips: Vec<ExplorerChainTipEntry>,
+    /// Explicit limits of Zebra's fork coverage.
+    pub coverage: ExplorerChainTipsCoverage,
+}
+
+/// Limits of the fork information returned by [`GetExplorerChainTipsResponse`].
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct ExplorerChainTipsCoverage {
+    /// Whether results only cover chains retained in the current non-finalized state.
+    #[getter(copy)]
+    pub current_non_finalized_only: bool,
+    /// Whether Zebra persists historical reorganizations and orphan blocks for this RPC.
+    #[getter(copy)]
+    pub persistent_history: bool,
+    /// Maximum number of current chain tips Zebra retains, including the active chain.
+    #[getter(copy)]
+    pub max_tracked_tips: u32,
+    /// Maximum depth of Zebra's non-finalized rollback window.
+    #[getter(copy)]
+    pub max_reorg_depth: u32,
 }
 
 #[cfg(test)]
@@ -4544,6 +5604,9 @@ mod recent_block_summary_tests {
                 total_fee_zat: None,
                 finalized: false,
             }],
+            next_before_height: Some(7),
+            next_cursor: Some(format!("v1:b:7:{}:7:{}", "11".repeat(32), "22".repeat(32))),
+            request_cursor_finalized: false,
         };
 
         assert_eq!(
@@ -4560,7 +5623,14 @@ mod recent_block_summary_tests {
                     "tx_count": null,
                     "total_fee_zat": null,
                     "finalized": false
-                }]
+                }],
+                "next_before_height": 7,
+                "next_cursor": format!(
+                    "v1:b:7:{}:7:{}",
+                    "11".repeat(32),
+                    "22".repeat(32)
+                ),
+                "request_cursor_finalized": false
             })
         );
     }
@@ -4863,9 +5933,19 @@ mod snapshot_data_entry_ironwood_tests {
 #[cfg(test)]
 mod custom_rpc_validation_tests {
     use super::{
-        parse_snapshot_date, validate_snapshot_date_range, validated_paginated_rpc_limit,
-        validated_rpc_limit,
+        address_transaction_summary_cursor, address_utxo_cursor, block_summary_cursor,
+        parse_address_transaction_summary_cursor, parse_address_utxo_cursor,
+        parse_block_summary_cursor, parse_snapshot_date, parse_transaction_summary_cursor,
+        stale_explorer_cursor, transaction_summary_cursor, validate_snapshot_date_range,
+        validated_paginated_rpc_limit, validated_rpc_limit, BlockSummaryCursor,
+        TransactionSummaryCursor, STALE_EXPLORER_CURSOR_CODE, STALE_EXPLORER_CURSOR_MESSAGE,
     };
+    use zebra_chain::{
+        block::{Hash, Height},
+        parameters::NetworkKind,
+        transparent::Address,
+    };
+    use zebra_state::{OutputLocation, TransactionLocation};
 
     #[test]
     fn limits_are_defaulted_and_bounded() {
@@ -4875,6 +5955,78 @@ mod custom_rpc_validation_tests {
         assert!(validated_rpc_limit(Some(101), 10, 100).is_err());
         assert_eq!(validated_paginated_rpc_limit(None, 10, 100), Ok(10));
         assert!(validated_paginated_rpc_limit(Some(0), 10, 100).is_err());
+    }
+
+    #[test]
+    fn stale_cursor_error_has_a_stable_wire_contract() {
+        let error = stale_explorer_cursor();
+        assert_eq!(error.code(), STALE_EXPLORER_CURSOR_CODE);
+        assert_eq!(error.message(), STALE_EXPLORER_CURSOR_MESSAGE);
+    }
+
+    #[test]
+    fn transaction_summary_cursors_are_strict_and_round_trip() {
+        let location = TransactionLocation::from_index(Height(123), 45);
+        let boundary_hash = Hash([0x42; 32]);
+        let session_anchor = (Height(200), Hash([0x24; 32]));
+        let cursor = transaction_summary_cursor(session_anchor, location, boundary_hash);
+        assert_eq!(
+            cursor,
+            format!("v1:t:200:{}:123:{boundary_hash}:45", session_anchor.1)
+        );
+        assert_eq!(
+            parse_transaction_summary_cursor(&cursor),
+            Ok(TransactionSummaryCursor {
+                session_anchor,
+                before: location,
+                boundary_hash,
+            })
+        );
+
+        let block_cursor = block_summary_cursor(session_anchor, (Height(123), boundary_hash));
+        assert_eq!(
+            parse_block_summary_cursor(&block_cursor),
+            Ok(BlockSummaryCursor {
+                session_anchor,
+                boundary: (Height(123), boundary_hash),
+            })
+        );
+
+        let address = Address::from_script_hash(NetworkKind::Mainnet, [0x01; 20]);
+        let other_address = Address::from_script_hash(NetworkKind::Mainnet, [0x02; 20]);
+        let address_cursor =
+            address_transaction_summary_cursor(address, session_anchor, location, boundary_hash);
+        assert_eq!(
+            parse_address_transaction_summary_cursor(&address_cursor, address),
+            Ok(TransactionSummaryCursor {
+                session_anchor,
+                before: location,
+                boundary_hash,
+            })
+        );
+        assert!(parse_address_transaction_summary_cursor(&address_cursor, other_address).is_err());
+        assert!(parse_transaction_summary_cursor(&address_cursor).is_err());
+
+        let output_location = OutputLocation::from_output_index(location, 67);
+        let utxo_cursor = address_utxo_cursor(address, session_anchor, output_location);
+        let parsed_utxo = parse_address_utxo_cursor(&utxo_cursor, address).unwrap();
+        assert_eq!(parsed_utxo.anchor, session_anchor);
+        assert_eq!(parsed_utxo.before, output_location);
+        assert!(parse_address_utxo_cursor(&utxo_cursor, other_address).is_err());
+
+        assert!(parse_transaction_summary_cursor("").is_err());
+        assert!(parse_transaction_summary_cursor("123").is_err());
+        assert!(parse_transaction_summary_cursor("123:45:6").is_err());
+        assert!(parse_transaction_summary_cursor(&format!(
+            "v1:t:200:{}:123:{boundary_hash}:65536",
+            session_anchor.1
+        ))
+        .is_err());
+        assert!(parse_transaction_summary_cursor(&format!(
+            "v1:t:200:{}:2147483648:{boundary_hash}:0",
+            session_anchor.1
+        ))
+        .is_err());
     }
 
     #[test]

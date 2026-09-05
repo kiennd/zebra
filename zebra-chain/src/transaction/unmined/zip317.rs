@@ -22,14 +22,20 @@ mod tests;
 // TODO: allow Amount<NonNegative> in constants
 pub const MARGINAL_FEE: u64 = 5_000;
 
+/// The implemented revision of the ZIP-317 fee policy.
+///
+/// Revision 1 adds Ironwood actions to the logical action count.
+/// This is unrelated to the estimator response version returned by `getstandardfee`.
+pub const ZIP317_REVISION: u32 = 1;
+
 /// The number of grace logical actions allowed by the ZIP-317 fee calculation.
-const GRACE_ACTIONS: u32 = 2;
+pub const GRACE_ACTIONS: u32 = 2;
 
 /// The standard size of p2pkh inputs for the ZIP-317 fee calculation, in bytes.
-const P2PKH_STANDARD_INPUT_SIZE: usize = 150;
+pub const P2PKH_STANDARD_INPUT_SIZE: usize = 150;
 
 /// The standard size of p2pkh outputs for the ZIP-317 fee calculation, in bytes.
-const P2PKH_STANDARD_OUTPUT_SIZE: usize = 34;
+pub const P2PKH_STANDARD_OUTPUT_SIZE: usize = 34;
 
 /// The recommended weight ratio cap for ZIP-317 block production.
 /// `weight_ratio_cap` in ZIP-317.

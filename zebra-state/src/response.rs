@@ -27,8 +27,8 @@ use zebra_chain::work::difficulty::CompactDifficulty;
 use crate::{ReadRequest, Request};
 
 use crate::{
-    service::read::AddressUtxos, ContextuallyVerifiedBlock, NonFinalizedState, TransactionLocation,
-    WatchReceiver, MAX_BLOCK_REORG_HEIGHT,
+    service::read::AddressUtxos, ContextuallyVerifiedBlock, NonFinalizedState, OutputLocation,
+    TransactionLocation, WatchReceiver, MAX_BLOCK_REORG_HEIGHT,
 };
 
 #[cfg(test)]
@@ -47,6 +47,79 @@ pub struct RecentBlockSummary {
     pub info: BlockInfo,
     /// Whether this block is in the finalized state.
     pub finalized: bool,
+}
+
+/// A lightweight summary of a transaction in the current best chain.
+///
+/// These fields can be derived from the transaction and its containing block without looking up
+/// any of the transaction's spent outputs. In particular, this type intentionally does not expose
+/// a per-transaction fee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerTransactionSummary {
+    /// The transaction's location in the current best chain.
+    pub location: TransactionLocation,
+    /// The transaction hash.
+    pub hash: transaction::Hash,
+    /// The hash of the block containing the transaction.
+    pub block_hash: block::Hash,
+    /// The timestamp declared by the containing block.
+    pub block_time: DateTime<Utc>,
+    /// The serialized transaction size in bytes.
+    pub size: u32,
+    /// The numeric transaction version.
+    pub version: u32,
+    /// Whether this is a coinbase transaction.
+    pub coinbase: bool,
+    /// The number of transparent inputs, including a coinbase input when present.
+    pub transparent_input_count: u32,
+    /// The number of transparent outputs.
+    pub transparent_output_count: u32,
+    /// The number of Sprout JoinSplit descriptions.
+    pub sprout_joinsplit_count: u32,
+    /// The number of Sapling spends.
+    pub sapling_spend_count: u32,
+    /// The number of Sapling outputs.
+    pub sapling_output_count: u32,
+    /// The number of Orchard actions.
+    pub orchard_action_count: u32,
+    /// The number of Ironwood actions.
+    pub ironwood_action_count: u32,
+    /// Whether this transaction is already in finalized state.
+    pub finalized: bool,
+}
+
+/// A lightweight unspent transparent output summary for explorer address pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerAddressUtxoSummary {
+    /// The output's canonical chain location.
+    pub location: OutputLocation,
+    /// The transaction that created this output.
+    pub transaction_hash: transaction::Hash,
+    /// The containing canonical block hash.
+    pub block_hash: block::Hash,
+    /// The containing block timestamp.
+    pub block_time: DateTime<Utc>,
+    /// The unspent output itself.
+    pub output: transparent::Output,
+    /// Whether the output's containing block is finalized.
+    pub finalized: bool,
+}
+
+/// A currently tracked, contextually valid non-finalized chain tip.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerChainTip {
+    /// The chain tip height.
+    pub height: block::Height,
+    /// The chain tip hash.
+    pub hash: block::Hash,
+    /// The number of blocks in this branch after its common ancestor with the active chain.
+    pub branch_length: u32,
+    /// The common ancestor height, omitted for the active chain.
+    pub fork_height: Option<block::Height>,
+    /// The common ancestor hash, omitted for the active chain.
+    pub fork_hash: Option<block::Hash>,
+    /// Whether this is the current active chain.
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,6 +495,58 @@ pub enum ReadResponse {
         finalized_tip: Option<(block::Height, block::Hash)>,
         /// Recent blocks, ordered from newest to oldest.
         blocks: Vec<RecentBlockSummary>,
+        /// Whether the supplied pagination boundary is still canonical.
+        cursor_valid: bool,
+    },
+
+    /// Response to [`ReadRequest::TransactionSummaryPage`] with newest-first best-chain
+    /// transactions.
+    TransactionSummaryPage {
+        /// The current best-chain tip.
+        best_tip: Option<(block::Height, block::Hash)>,
+        /// The current finalized tip.
+        finalized_tip: Option<(block::Height, block::Hash)>,
+        /// Transactions ordered newest-first by chain location.
+        transactions: Vec<ExplorerTransactionSummary>,
+        /// Whether the supplied pagination boundary is still canonical.
+        cursor_valid: bool,
+    },
+
+    /// Response to [`ReadRequest::AddressTransactionSummaryPage`] with newest-first best-chain
+    /// transactions involving a transparent address.
+    AddressTransactionSummaryPage {
+        /// The current best-chain tip.
+        best_tip: Option<(block::Height, block::Hash)>,
+        /// The current finalized tip.
+        finalized_tip: Option<(block::Height, block::Hash)>,
+        /// Address transactions ordered newest-first by chain location.
+        transactions: Vec<ExplorerTransactionSummary>,
+        /// Whether the supplied pagination boundary is still canonical.
+        cursor_valid: bool,
+    },
+
+    /// Response to [`ReadRequest::AddressUtxoSummaryPage`] with a newest-first snapshot of one
+    /// transparent address's unspent outputs.
+    AddressUtxoSummaryPage {
+        /// The current best-chain tip.
+        best_tip: Option<(block::Height, block::Hash)>,
+        /// The current finalized tip.
+        finalized_tip: Option<(block::Height, block::Hash)>,
+        /// Whether the supplied exact-tip cursor anchor still matches.
+        cursor_valid: bool,
+        /// Current unspent outputs, ordered newest first.
+        utxos: Vec<ExplorerAddressUtxoSummary>,
+    },
+
+    /// Response to [`ReadRequest::ExplorerChainTips`] with every currently tracked valid chain
+    /// tip.
+    ExplorerChainTips {
+        /// The current best-chain tip.
+        best_tip: Option<(block::Height, block::Hash)>,
+        /// The current finalized tip.
+        finalized_tip: Option<(block::Height, block::Hash)>,
+        /// Current active and side-chain tips, ordered active first then by descending work.
+        tips: Vec<ExplorerChainTip>,
     },
 
     /// Response to [`ReadRequest::Depth`] with the depth of the specified block.
@@ -537,6 +662,8 @@ pub enum ReadResponse {
 
     /// Response to [`ReadRequest::TopAddressesByBalance`] with the top addresses by balance.
     TopAddressesByBalance {
+        /// The finalized tip sampled atomically with the ordered address index.
+        finalized_tip: Option<(block::Height, block::Hash)>,
         /// List of addresses with their balances, sorted by balance descending.
         addresses: Vec<(transparent::Address, Amount<NonNegative>)>,
     },
@@ -680,6 +807,10 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::BlockInfo(_)
             | ReadResponse::BlockSummary(_)
             | ReadResponse::RecentBlockSummaries { .. }
+            | ReadResponse::TransactionSummaryPage { .. }
+            | ReadResponse::AddressTransactionSummaryPage { .. }
+            | ReadResponse::AddressUtxoSummaryPage { .. }
+            | ReadResponse::ExplorerChainTips { .. }
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

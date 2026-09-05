@@ -34,7 +34,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 29;
+const DATABASE_FORMAT_VERSION: u64 = 30;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -45,6 +45,11 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 30.0.0: adds a mandatory balance-ordered transparent-address index used to serve top-address
+///   queries in O(K), with every delete/insert committed atomically with the finalized block. The
+///   exact historical balance transitions needed to build this index safely are not available as
+///   a bounded migration while blocks continue to finalize, so v29 databases require a fresh sync
+///   and are intentionally not restorable.
 /// - 29.1.0: appends transaction count and total block fees to new `block_info` records. Existing
 ///   44-byte and 52-byte records remain readable and expose those optional metrics as unavailable.
 /// - 29.0.0: adds a mandatory, versioned incremental snapshot accumulator which is updated in the
@@ -61,7 +66,7 @@ const DATABASE_FORMAT_VERSION: u64 = 29;
 ///   new records use 212 bytes. New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major database
 ///   format version (no resync or data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

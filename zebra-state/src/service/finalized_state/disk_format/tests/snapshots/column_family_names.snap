@@ -29,6 +29,7 @@ expression: cf_names
   "sprout_note_commitment_tree",
   "sprout_nullifiers",
   "tip_chain_value_pool",
+  "transparent_addr_by_balance",
   "tx_by_loc",
   "tx_loc_by_hash",
   "tx_loc_by_spent_out_loc",

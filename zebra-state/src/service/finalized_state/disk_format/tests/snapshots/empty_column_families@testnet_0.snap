@@ -13,6 +13,7 @@ expression: empty_column_families
   "sapling_nullifiers: no entries",
   "snapshot_data_by_date: no entries",
   "sprout_nullifiers: no entries",
+  "transparent_addr_by_balance: no entries",
   "tx_loc_by_spent_out_loc: no entries",
   "tx_loc_by_transparent_addr_loc: no entries",
   "utxo_by_out_loc: no entries",

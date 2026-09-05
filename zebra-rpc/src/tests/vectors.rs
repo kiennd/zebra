@@ -2,7 +2,10 @@
 
 use zebra_chain::transaction;
 
-use crate::client::{GetBlockResponse, GetRawTransactionResponse, TransactionObject};
+use crate::client::{
+    AnalyzeRawTransactionResponse, GetBlockResponse, GetRawTransactionResponse,
+    GetZip317FeeParametersResponse, TransactionObject, Zip317FeeAnalysis,
+};
 
 #[test]
 pub fn test_transaction_serialization() {
@@ -80,6 +83,51 @@ pub fn test_transaction_serialization() {
     assert_eq!(
         serde_json::to_string(&tx).unwrap(),
         r#"{"hex":"42","vin":[],"vout":[],"vShieldedSpend":[],"vShieldedOutput":[],"vjoinsplit":[],"txid":"0000000000000000000000000000000000000000000000000000000000000000","overwintered":false,"version":4,"locktime":0}"#
+    );
+}
+
+#[test]
+pub fn test_analyze_raw_transaction_serialization() {
+    let response = AnalyzeRawTransactionResponse::new(
+        Box::default(),
+        Zip317FeeAnalysis::new(1, 2, 10_000, 5_000, 2),
+    );
+
+    let json = serde_json::to_value(response).expect("response must serialize");
+
+    assert_eq!(
+        json["zip317"],
+        serde_json::json!({
+            "zip317_revision": 1,
+            "conventional_actions": 2,
+            "conventional_fee_zat": 10_000,
+            "marginal_fee_zat": 5_000,
+            "grace_actions": 2,
+        })
+    );
+    assert_eq!(json["transaction"]["size"], serde_json::Value::Null);
+    assert_eq!(
+        json["transaction"]["txid"],
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    assert!(json["transaction"].get("height").is_none());
+    assert!(json["transaction"].get("confirmations").is_none());
+    assert!(json["transaction"].get("blockhash").is_none());
+}
+
+#[test]
+pub fn test_zip317_fee_parameters_serialization() {
+    let response = GetZip317FeeParametersResponse::new(1, 5_000, 2, 150, 34);
+
+    assert_eq!(
+        serde_json::to_value(response).expect("response must serialize"),
+        serde_json::json!({
+            "zip317_revision": 1,
+            "marginal_fee_zat": 5_000,
+            "grace_actions": 2,
+            "standard_transparent_input_size_bytes": 150,
+            "standard_transparent_output_size_bytes": 34,
+        })
     );
 }
 

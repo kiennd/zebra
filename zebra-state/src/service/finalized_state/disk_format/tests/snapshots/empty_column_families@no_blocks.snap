@@ -28,6 +28,7 @@ expression: empty_column_families
   "sprout_note_commitment_tree: no entries",
   "sprout_nullifiers: no entries",
   "tip_chain_value_pool: no entries",
+  "transparent_addr_by_balance: no entries",
   "tx_by_loc: no entries",
   "tx_loc_by_hash: no entries",
   "tx_loc_by_spent_out_loc: no entries",

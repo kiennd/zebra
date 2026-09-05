@@ -26,12 +26,13 @@ mod tests;
 pub use address::{
     balance::transparent_balance,
     tx_id::transparent_tx_ids,
-    utxo::{address_utxos, AddressUtxos},
+    utxo::{address_utxo_summary_page, address_utxos, AddressUtxos},
 };
 pub use block::{
-    any_block, any_transaction, any_utxo, block, block_and_size, block_header, block_info,
-    block_summary, mined_transaction, recent_block_summaries, transaction_hashes_for_any_block,
-    transaction_hashes_for_block, unspent_utxo,
+    address_transaction_summary_page, any_block, any_transaction, any_utxo, block, block_and_size,
+    block_header, block_info, block_summary, canonical_boundary_matches, explorer_chain_tips,
+    mined_transaction, recent_block_summaries, transaction_hashes_for_any_block,
+    transaction_hashes_for_block, transaction_summary_page, unspent_utxo,
 };
 
 #[cfg(feature = "indexer")]

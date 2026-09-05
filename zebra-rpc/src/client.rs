@@ -16,6 +16,7 @@ pub use crate::methods::{
         Commitments, GetSubtreesByIndexResponse, GetTreestateResponse, SubtreeRpcData, Treestate,
     },
     types::{
+        analyze_raw_transaction::{AnalyzeRawTransactionResponse, Zip317FeeAnalysis},
         default_roots::DefaultRoots,
         get_block_template::{
             BlockProposalResponse, BlockTemplateResponse, BlockTemplateTimeSource,
@@ -25,6 +26,7 @@ pub use crate::methods::{
         get_blockchain_info::GetBlockchainInfoBalance,
         get_mining_info::GetMiningInfoResponse,
         get_raw_mempool::{GetRawMempoolResponse, MempoolObject},
+        get_zip317_fee_parameters::GetZip317FeeParametersResponse,
         network_info::GetNetworkInfoResponse,
         peer_info::{GetPeerInfoResponse, PeerInfo},
         submit_block::{SubmitBlockErrorResponse, SubmitBlockResponse},

@@ -12,7 +12,10 @@
 //! - the cached [`Chain`] or [`NonFinalizedState`], and
 //! - the shared finalized [`ZebraDb`] reference.
 
-use std::sync::Arc;
+use std::{
+    ops::Bound::{Excluded, Included, Unbounded},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -25,7 +28,7 @@ use zebra_chain::{
 };
 
 use crate::{
-    response::{AnyTx, MinedTx, RecentBlockSummary},
+    response::{AnyTx, ExplorerChainTip, ExplorerTransactionSummary, MinedTx, RecentBlockSummary},
     service::{
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -410,6 +413,36 @@ where
     })
 }
 
+/// Returns `true` when an optional explorer pagination boundary is still canonical.
+///
+/// Boundary-anchored cursors remain valid while new tip blocks are appended. They become stale
+/// only when a reorganization replaces the block that separated two pages.
+pub fn canonical_boundary_matches<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    cursor_anchor: Option<(Height, block::Hash)>,
+) -> bool
+where
+    C: AsRef<Chain>,
+{
+    let Some((height, expected_hash)) = cursor_anchor else {
+        return true;
+    };
+
+    let finalized_hash = db
+        .tip()
+        .filter(|(finalized_height, _)| height <= *finalized_height)
+        .and_then(|_| db.hash(height));
+    let canonical_hash = finalized_hash.or_else(|| {
+        chain
+            .as_ref()
+            .and_then(|chain| chain.as_ref().hash_by_height(height))
+            .or_else(|| db.hash(height))
+    });
+
+    canonical_hash == Some(expected_hash)
+}
+
 /// Returns lightweight summaries for up to `limit` recent blocks in the best chain.
 ///
 /// The summaries are ordered from newest to oldest. This query only reads block headers,
@@ -418,6 +451,7 @@ pub fn recent_block_summaries<C>(
     chain: Option<C>,
     db: &ZebraDb,
     limit: usize,
+    before_height: Option<Height>,
 ) -> (
     Option<(Height, block::Hash)>,
     Option<(Height, block::Hash)>,
@@ -444,10 +478,18 @@ where
         return (best_tip, finalized_tip, Vec::new());
     };
 
-    let blocks = (0..limit)
+    let first_height = before_height
+        .map(|before_height| before_height.previous().ok())
+        .unwrap_or(Some(tip_height))
+        .map(|height| height.min(tip_height));
+
+    let blocks = first_height
+        .into_iter()
+        .flat_map(|first_height| (0..limit).map(move |offset| (first_height, offset)))
         .map_while(|offset| {
+            let (first_height, offset) = offset;
             let offset = u32::try_from(offset).ok()?;
-            tip_height.0.checked_sub(offset).map(Height)
+            first_height.0.checked_sub(offset).map(Height)
         })
         .map_while(|height| {
             let is_at_or_below_finalized_tip =
@@ -478,4 +520,453 @@ where
         .collect();
 
     (best_tip, finalized_tip, blocks)
+}
+
+/// Returns lightweight summaries for up to `limit` transactions in the current best chain.
+///
+/// Results are ordered newest-first by chain location. `before`, when supplied, is an exclusive
+/// cursor. Finalized transactions are read with one reverse range scan over the transaction column
+/// family; non-finalized transactions are read directly from the in-memory best chain.
+pub fn transaction_summary_page<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    limit: usize,
+    before: Option<crate::TransactionLocation>,
+) -> (
+    Option<(Height, block::Hash)>,
+    Option<(Height, block::Hash)>,
+    Vec<ExplorerTransactionSummary>,
+)
+where
+    C: AsRef<Chain> + Clone,
+{
+    let finalized_tip = db.tip();
+    let non_finalized_tip = chain
+        .as_ref()
+        .map(|chain| chain.as_ref().non_finalized_tip());
+    let best_tip = match (non_finalized_tip, finalized_tip) {
+        (Some(non_finalized_tip), Some(finalized_tip))
+            if finalized_tip.0 >= non_finalized_tip.0 =>
+        {
+            Some(finalized_tip)
+        }
+        (Some(non_finalized_tip), _) => Some(non_finalized_tip),
+        (None, finalized_tip) => finalized_tip,
+    };
+
+    let Some((best_height, _best_hash)) = best_tip else {
+        return (best_tip, finalized_tip, Vec::new());
+    };
+    if limit == 0 {
+        return (best_tip, finalized_tip, Vec::new());
+    }
+
+    let mut summaries = Vec::with_capacity(limit);
+    let finalized_height = finalized_tip.map(|(height, _hash)| height);
+
+    // The cached non-finalized chain can briefly overlap a newly advanced finalized tip. Only use
+    // its strict suffix so a transaction is never returned twice.
+    if let Some(chain) = chain.as_ref().map(AsRef::as_ref) {
+        let chain_tip_height = chain.non_finalized_tip_height();
+        if finalized_height.is_none_or(|height| chain_tip_height > height) {
+            let mut height = before
+                .map(|location| location.height.min(chain_tip_height))
+                .unwrap_or(chain_tip_height)
+                .min(best_height);
+
+            loop {
+                if finalized_height.is_some_and(|finalized| height <= finalized) {
+                    break;
+                }
+
+                if let Some(contextual) = chain.block(height.into()) {
+                    for (index, tx) in contextual.block.transactions.iter().enumerate().rev() {
+                        let location = crate::TransactionLocation::from_usize(height, index);
+                        if before.is_some_and(|before| location >= before) {
+                            continue;
+                        }
+
+                        summaries.push(explorer_transaction_summary(
+                            location,
+                            tx,
+                            contextual.hash,
+                            contextual.block.header.time,
+                            false,
+                        ));
+                        if summaries.len() == limit {
+                            return (best_tip, finalized_tip, summaries);
+                        }
+                    }
+                }
+
+                let Ok(previous_height) = height.previous() else {
+                    break;
+                };
+                height = previous_height;
+            }
+        }
+    }
+
+    let Some((finalized_height, _finalized_hash)) = finalized_tip else {
+        return (best_tip, finalized_tip, summaries);
+    };
+    if summaries.len() == limit {
+        return (best_tip, finalized_tip, summaries);
+    }
+
+    let finalized_max = crate::TransactionLocation::max_for_height(finalized_height);
+    let upper_bound = match before {
+        Some(before) if before <= finalized_max => Excluded(before),
+        _ => Included(finalized_max),
+    };
+    let mut cached_block = None;
+
+    for (location, tx) in db.transactions_by_location_range_reverse((Unbounded, upper_bound)) {
+        let (block_hash, block_time) = match cached_block {
+            Some((height, hash, time)) if height == location.height => (hash, time),
+            _ => {
+                let Some(hash) = db.hash(location.height) else {
+                    continue;
+                };
+                let Some(header) = db.block_header(hash.into()) else {
+                    continue;
+                };
+                let time = header.time;
+                cached_block = Some((location.height, hash, time));
+                (hash, time)
+            }
+        };
+
+        summaries.push(explorer_transaction_summary(
+            location, &tx, block_hash, block_time, true,
+        ));
+        if summaries.len() == limit {
+            break;
+        }
+    }
+
+    (best_tip, finalized_tip, summaries)
+}
+
+/// Returns newest-first summaries for transactions involving `address` in the best chain.
+///
+/// The finalized prefix is read using a bounded reverse scan of the transparent address index.
+/// Only the bounded non-finalized window is materialized, so this query never scans the address's
+/// history from genesis. `before`, when supplied, is an exclusive chain-location cursor.
+pub fn address_transaction_summary_page<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    address: transparent::Address,
+    limit: usize,
+    before: Option<crate::TransactionLocation>,
+) -> (
+    Option<(Height, block::Hash)>,
+    Option<(Height, block::Hash)>,
+    Vec<ExplorerTransactionSummary>,
+)
+where
+    C: AsRef<Chain> + Clone,
+{
+    let finalized_tip = db.tip();
+    let non_finalized_tip = chain
+        .as_ref()
+        .map(|chain| chain.as_ref().non_finalized_tip());
+    let best_tip = match (non_finalized_tip, finalized_tip) {
+        (Some(non_finalized_tip), Some(finalized_tip))
+            if finalized_tip.0 >= non_finalized_tip.0 =>
+        {
+            Some(finalized_tip)
+        }
+        (Some(non_finalized_tip), _) => Some(non_finalized_tip),
+        (None, finalized_tip) => finalized_tip,
+    };
+
+    let Some((best_height, _best_hash)) = best_tip else {
+        return (best_tip, finalized_tip, Vec::new());
+    };
+    if limit == 0 {
+        return (best_tip, finalized_tip, Vec::new());
+    }
+
+    let mut summaries = Vec::with_capacity(limit);
+    let finalized_height = finalized_tip.map(|(height, _hash)| height);
+
+    // Only query the strict non-finalized suffix. A cached chain can briefly overlap newly
+    // finalized blocks, and including that overlap would duplicate address transactions.
+    if let Some(chain) = chain.as_ref().map(AsRef::as_ref) {
+        let chain_tip_height = chain.non_finalized_tip_height().min(best_height);
+        if finalized_height.is_none_or(|height| chain_tip_height > height) {
+            let start_height = finalized_height
+                .and_then(|height| height.next().ok())
+                .unwrap_or_else(|| chain.non_finalized_root_height());
+            let end_height = before
+                .map(|location| location.height.min(chain_tip_height))
+                .unwrap_or(chain_tip_height);
+
+            if start_height <= end_height {
+                let addresses = std::iter::once(address).collect();
+                let tx_ids =
+                    chain.partial_transparent_tx_ids(&addresses, start_height..=end_height);
+
+                for (location, expected_hash) in tx_ids.into_iter().rev() {
+                    if before.is_some_and(|before| location >= before) {
+                        continue;
+                    }
+
+                    let Some(contextual) = chain.block(location.height.into()) else {
+                        continue;
+                    };
+                    let Some(tx) = contextual.block.transactions.get(location.index.as_usize())
+                    else {
+                        continue;
+                    };
+                    debug_assert_eq!(tx.hash(), expected_hash);
+
+                    summaries.push(explorer_transaction_summary(
+                        location,
+                        tx,
+                        contextual.hash,
+                        contextual.block.header.time,
+                        false,
+                    ));
+                    if summaries.len() == limit {
+                        return (best_tip, finalized_tip, summaries);
+                    }
+                }
+            }
+        }
+    }
+
+    let Some((finalized_height, _finalized_hash)) = finalized_tip else {
+        return (best_tip, finalized_tip, summaries);
+    };
+    let remaining = limit - summaries.len();
+    let locations =
+        db.address_transaction_locations_reverse(&address, finalized_height, before, remaining);
+    let mut cached_block = None;
+
+    for location in locations {
+        let Some(tx) = db.transaction_by_location(location) else {
+            continue;
+        };
+        let (block_hash, block_time) = match cached_block {
+            Some((height, hash, time)) if height == location.height => (hash, time),
+            _ => {
+                let Some(hash) = db.hash(location.height) else {
+                    continue;
+                };
+                let Some(header) = db.block_header(hash.into()) else {
+                    continue;
+                };
+                let time = header.time;
+                cached_block = Some((location.height, hash, time));
+                (hash, time)
+            }
+        };
+
+        summaries.push(explorer_transaction_summary(
+            location, &tx, block_hash, block_time, true,
+        ));
+    }
+
+    (best_tip, finalized_tip, summaries)
+}
+
+/// Returns the active chain and every currently tracked, contextually valid side-chain tip.
+///
+/// This is a snapshot of Zebra's bounded non-finalized state, not persistent reorganization or
+/// orphan history. Zebra retains at most `MAX_NON_FINALIZED_CHAIN_FORKS` chains within its rollback
+/// window.
+pub fn explorer_chain_tips(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZebraDb,
+) -> (
+    Option<(Height, block::Hash)>,
+    Option<(Height, block::Hash)>,
+    Vec<ExplorerChainTip>,
+) {
+    let finalized_tip = db.tip();
+    let Some(best_chain) = non_finalized_state.best_chain() else {
+        let tips = finalized_tip
+            .map(|(height, hash)| ExplorerChainTip {
+                height,
+                hash,
+                branch_length: 0,
+                fork_height: None,
+                fork_hash: None,
+                active: true,
+            })
+            .into_iter()
+            .collect();
+        return (finalized_tip, finalized_tip, tips);
+    };
+
+    let non_finalized_best_tip = best_chain.non_finalized_tip();
+    if finalized_tip.is_some_and(|(height, _hash)| height >= non_finalized_best_tip.0) {
+        let tips = finalized_tip
+            .map(|(height, hash)| ExplorerChainTip {
+                height,
+                hash,
+                branch_length: 0,
+                fork_height: None,
+                fork_hash: None,
+                active: true,
+            })
+            .into_iter()
+            .collect();
+        return (finalized_tip, finalized_tip, tips);
+    }
+
+    let mut tips = Vec::with_capacity(non_finalized_state.chain_count());
+    for (index, chain) in non_finalized_state.chain_iter().enumerate() {
+        let (height, hash) = chain.non_finalized_tip();
+        if finalized_tip.is_some_and(|(finalized_height, _hash)| height <= finalized_height) {
+            continue;
+        }
+
+        if index == 0 {
+            tips.push(ExplorerChainTip {
+                height,
+                hash,
+                branch_length: 0,
+                fork_height: None,
+                fork_hash: None,
+                active: true,
+            });
+            continue;
+        }
+
+        let common_ancestor = common_non_finalized_ancestor(best_chain, chain).or(finalized_tip);
+        let (fork_height, fork_hash) = common_ancestor.unzip();
+        let branch_length = fork_height
+            .and_then(|fork_height| height.0.checked_sub(fork_height.0))
+            .unwrap_or(0);
+
+        tips.push(ExplorerChainTip {
+            height,
+            hash,
+            branch_length,
+            fork_height,
+            fork_hash,
+            active: false,
+        });
+    }
+
+    (Some(non_finalized_best_tip), finalized_tip, tips)
+}
+
+fn common_non_finalized_ancestor(active: &Chain, side: &Chain) -> Option<(Height, block::Hash)> {
+    common_ancestor_in_non_finalized_overlap(
+        active
+            .non_finalized_tip_height()
+            .min(side.non_finalized_tip_height()),
+        active.non_finalized_root_height(),
+        side.non_finalized_root_height(),
+        |height| (active.hash_by_height(height), side.hash_by_height(height)),
+    )
+}
+
+/// Finds a common ancestor without searching below either non-finalized chain root.
+///
+/// Blocks below that overlap are finalized, so callers must use the finalized tip as the
+/// fallback. Bounding this search is important because two chains can have distinct roots that
+/// both descend from a finalized tip at a very large absolute height.
+fn common_ancestor_in_non_finalized_overlap(
+    mut height: Height,
+    active_root: Height,
+    side_root: Height,
+    mut hashes_at: impl FnMut(Height) -> (Option<block::Hash>, Option<block::Hash>),
+) -> Option<(Height, block::Hash)> {
+    let overlap_root = active_root.max(side_root);
+
+    if height < overlap_root {
+        return None;
+    }
+
+    loop {
+        if let (Some(active_hash), Some(side_hash)) = hashes_at(height) {
+            if active_hash == side_hash {
+                return Some((height, active_hash));
+            }
+        }
+
+        if height == overlap_root {
+            return None;
+        }
+
+        height = height
+            .previous()
+            .expect("the height above a non-finalized root always has a predecessor");
+    }
+}
+
+fn explorer_transaction_summary(
+    location: crate::TransactionLocation,
+    tx: &Transaction,
+    block_hash: block::Hash,
+    block_time: DateTime<Utc>,
+    finalized: bool,
+) -> ExplorerTransactionSummary {
+    let count = |value: usize, field: &'static str| {
+        u32::try_from(value).unwrap_or_else(|_| {
+            panic!("{field} fits in u32 because it is bounded by transaction bytes")
+        })
+    };
+
+    ExplorerTransactionSummary {
+        location,
+        hash: tx.hash(),
+        block_hash,
+        block_time,
+        size: count(tx.zcash_serialized_size(), "serialized transaction size"),
+        version: tx.version(),
+        coinbase: tx.is_coinbase(),
+        transparent_input_count: count(tx.inputs().len(), "transparent input count"),
+        transparent_output_count: count(tx.outputs().len(), "transparent output count"),
+        sprout_joinsplit_count: count(tx.joinsplit_count(), "Sprout JoinSplit count"),
+        sapling_spend_count: count(tx.sapling_spends_count(), "Sapling spend count"),
+        sapling_output_count: count(tx.sapling_outputs().count(), "Sapling output count"),
+        orchard_action_count: count(tx.orchard_actions().count(), "Orchard action count"),
+        ironwood_action_count: count(tx.ironwood_actions().count(), "Ironwood action count"),
+        finalized,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::common_ancestor_in_non_finalized_overlap;
+    use zebra_chain::block::{Hash, Height};
+
+    #[test]
+    fn disjoint_non_finalized_roots_do_not_scan_below_the_rollback_window() {
+        // The absolute chain height is deliberately large, while the tracked non-finalized
+        // overlap is small. A search that accidentally continues toward genesis would make this
+        // regression test perform about two million probes.
+        let active_root = Height(1_999_900);
+        let side_root = Height(1_999_925);
+        let common_tip_height = Height(2_000_000);
+        let probes = Cell::new(0usize);
+
+        let ancestor = common_ancestor_in_non_finalized_overlap(
+            common_tip_height,
+            active_root,
+            side_root,
+            |_height| {
+                probes.set(probes.get() + 1);
+                (Some(Hash([1; 32])), Some(Hash([2; 32])))
+            },
+        );
+
+        assert_eq!(
+            ancestor, None,
+            "disjoint roots have no non-finalized ancestor"
+        );
+        assert_eq!(
+            probes.get(),
+            (common_tip_height.0 - side_root.0 + 1) as usize,
+            "the search must stop at the highest non-finalized root"
+        );
+    }
 }

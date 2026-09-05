@@ -184,6 +184,7 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         #[cfg(feature = "indexer")]
         &HashMap::new(),
         address_balances,
+        vec![(address, value, value)],
     );
 
     // Write the batch and confirm the final on-disk balance matches the consensus value
@@ -245,18 +246,48 @@ fn address_counts_exclude_zero_balances() {
             (second_tied_address, second_tied_balance_location),
         ])),
     );
+    batch.prepare_transparent_balance_index_batch(
+        zebra_db.db(),
+        vec![
+            (funded_address, Amount::zero(), funded_balance),
+            (richest_address, Amount::zero(), richest_balance),
+            (first_tied_address, Amount::zero(), tied_balance),
+            (second_tied_address, Amount::zero(), tied_balance),
+        ],
+    );
     zebra_db
         .write_batch(batch)
         .expect("ephemeral db accepts address balances");
 
     assert_eq!(zebra_db.holder_count(), 4);
     assert_eq!(zebra_db.address_count(), 4);
-    assert!(zebra_db.top_addresses_by_balance(0).is_empty());
+    assert!(zebra_db.top_addresses_by_balance(0).1.is_empty());
     assert_eq!(
         zebra_db.top_addresses_by_balance(2),
+        (
+            None,
+            vec![
+                (richest_address, richest_balance),
+                (first_tied_address, tied_balance),
+            ],
+        ),
+    );
+
+    // Changing a balance must remove the old ordered key, rather than leaving a duplicate that
+    // would make a future top-K query return stale data.
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_transparent_balance_index_batch(
+        zebra_db.db(),
+        vec![(richest_address, richest_balance, funded_balance)],
+    );
+    zebra_db
+        .write_batch(batch)
+        .expect("ephemeral db accepts an ordered balance update");
+    assert_eq!(
+        zebra_db.top_addresses_by_balance(2).1,
         vec![
-            (richest_address, richest_balance),
             (first_tied_address, tied_balance),
+            (second_tied_address, tied_balance),
         ],
     );
 }

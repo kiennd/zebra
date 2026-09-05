@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 
 use zebra_chain::{
-    amount::NonNegative,
+    amount::{Amount, NonNegative},
     block::{self, Block, Height},
     block_info::BlockInfo,
     orchard,
@@ -41,7 +41,9 @@ use crate::{
             block::TransactionLocation,
             transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates, OutputLocation},
         },
-        zebra_db::{metrics::block_precommit_metrics, ZebraDb},
+        zebra_db::{
+            metrics::block_precommit_metrics, transparent::AddressBalanceIndexUpdates, ZebraDb,
+        },
         FromDisk, RawBytes,
     },
     HashOrHeight,
@@ -310,6 +312,16 @@ impl ZebraDb {
             .and_then(|tx| block_time.map(|time| (tx, transaction_location.height, time)))
     }
 
+    /// Returns the [`Transaction`] at `location`, if it exists in finalized state.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn transaction_by_location(
+        &self,
+        location: TransactionLocation,
+    ) -> Option<Arc<Transaction>> {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        self.db.zs_get(&tx_by_loc, &location)
+    }
+
     /// Returns an iterator of all [`Transaction`]s for a provided block height in finalized state.
     #[allow(clippy::unwrap_in_result)]
     pub fn transactions_by_height(
@@ -347,6 +359,20 @@ impl ZebraDb {
     {
         let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
         self.db.zs_forward_range_iter(tx_by_loc, range)
+    }
+
+    /// Returns a reverse iterator of all [`Transaction`]s in the provided range
+    /// of [`TransactionLocation`]s in finalized state.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn transactions_by_location_range_reverse<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = (TransactionLocation, Transaction)> + '_
+    where
+        R: RangeBounds<TransactionLocation>,
+    {
+        let tx_by_loc = self.db.cf_handle("tx_by_loc").unwrap();
+        self.db.zs_reverse_range_iter(tx_by_loc, range)
     }
 
     /// Returns an iterator of all raw [`Transaction`]s in the provided range
@@ -553,16 +579,17 @@ impl ZebraDb {
 
         // Zebra deliberately does not index the genesis transparent output, so the accumulator
         // must make the same exception even on a custom network with a non-zero genesis output.
-        let funded_transparent_address_count_delta = if finalized.height.is_min() {
-            0
-        } else {
-            funded_transparent_address_count_delta(
-                &pre_block_address_balances,
-                &new_outputs_by_out_loc,
-                &spent_utxos_by_out_loc,
-                network,
-            )
-        };
+        let (funded_transparent_address_count_delta, address_balance_index_updates) =
+            if finalized.height.is_min() {
+                (0, Vec::new())
+            } else {
+                transparent_address_balance_updates(
+                    &pre_block_address_balances,
+                    &new_outputs_by_out_loc,
+                    &spent_utxos_by_out_loc,
+                    network,
+                )
+            };
 
         // # Performance
         //
@@ -598,6 +625,7 @@ impl ZebraDb {
             #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
+            address_balance_index_updates,
             funded_transparent_address_count_delta,
             self.finalized_value_pool(),
             prev_note_commitment_trees,
@@ -644,12 +672,12 @@ fn lookup_out_loc(
 /// This uses absolute pre-block balances and the UTXOs already resolved for this block. It stays
 /// correct while address updates use RocksDB merge operands, because those operands contain
 /// signed changes rather than absolute balances.
-fn funded_transparent_address_count_delta(
+fn transparent_address_balance_updates(
     pre_block_balances: &HashMap<transparent::Address, AddressBalanceLocation>,
     new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
     spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
     network: &Network,
-) -> i64 {
+) -> (i64, AddressBalanceIndexUpdates) {
     let mut post_block_balances = HashMap::<transparent::Address, i128>::new();
 
     let starting_balance = |address: &transparent::Address| {
@@ -685,21 +713,56 @@ fn funded_transparent_address_count_delta(
             .expect("verified transparent balances must not overflow");
     }
 
-    post_block_balances
+    let updates: AddressBalanceIndexUpdates = post_block_balances
         .into_iter()
         .map(|(address, post_balance)| {
             assert!(
                 post_balance >= 0,
                 "verified transparent balances must be non-negative"
             );
-            let was_funded = starting_balance(&address) > 0;
-            let is_funded = post_balance > 0;
-            i64::from(is_funded) - i64::from(was_funded)
+            let previous_balance = Amount::<NonNegative>::try_from(
+                u64::try_from(starting_balance(&address))
+                    .expect("stored transparent balances are non-negative"),
+            )
+            .expect("stored transparent balances satisfy the NonNegative constraint");
+            let current_balance = Amount::<NonNegative>::try_from(
+                u64::try_from(post_balance)
+                    .expect("verified transparent balances are non-negative"),
+            )
+            .expect("verified transparent balances satisfy the NonNegative constraint");
+
+            (address, previous_balance, current_balance)
         })
-        .sum()
+        .collect();
+    let funded_count_delta = updates
+        .iter()
+        .map(|(_address, previous_balance, current_balance)| {
+            i64::from(*current_balance > Amount::<NonNegative>::zero())
+                - i64::from(*previous_balance > Amount::<NonNegative>::zero())
+        })
+        .sum();
+
+    (funded_count_delta, updates)
 }
 
 #[cfg(test)]
+fn funded_transparent_address_count_delta(
+    pre_block_balances: &HashMap<transparent::Address, AddressBalanceLocation>,
+    new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+    spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+    network: &Network,
+) -> i64 {
+    transparent_address_balance_updates(
+        pre_block_balances,
+        new_outputs_by_out_loc,
+        spent_utxos_by_out_loc,
+        network,
+    )
+    .0
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod funded_address_count_tests {
     use zebra_chain::{
         amount::Amount,
@@ -823,7 +886,7 @@ impl DiskWriteBatch {
     ///
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub fn prepare_block_batch(
         &mut self,
         zebra_db: &ZebraDb,
@@ -837,6 +900,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         address_balances: AddressBalanceLocationUpdates,
+        address_balance_index_updates: AddressBalanceIndexUpdates,
         funded_transparent_address_count_delta: i64,
         value_pool: ValueBalance<NonNegative>,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
@@ -877,6 +941,7 @@ impl DiskWriteBatch {
                 #[cfg(feature = "indexer")]
                 &out_loc_by_outpoint,
                 address_balances,
+                address_balance_index_updates,
             );
         }
 

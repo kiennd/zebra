@@ -1411,11 +1411,10 @@ impl Service<ReadRequest> for ReadStateService {
         let timed_span = TimedSpan::new(timer, span);
         let state = self.clone();
 
-        let is_expensive_read = match &req {
-            ReadRequest::AddressCount => true,
-            ReadRequest::TopAddressesByBalance { limit } => *limit > 0,
-            _ => false,
-        };
+        // AddressCount normally reads the funded-count singleton in O(1), but retains a full-CF
+        // fallback for legacy/partial databases, so guard that fallback defensively. The mandatory
+        // v30 TopAddressesByBalance index is always O(limit) and needs no permit.
+        let is_expensive_read = matches!(&req, ReadRequest::AddressCount);
         let expensive_read_semaphore = self.expensive_read_semaphore.clone();
 
         if let ReadRequest::NonFinalizedBlocksListener { known_chain_tips } = req {
@@ -1468,15 +1467,135 @@ impl Service<ReadRequest> for ReadStateService {
             )),
 
             // Used by the lightweight recent-block explorer RPC.
-            ReadRequest::RecentBlockSummaries { limit } => {
-                let limit = limit.min(ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS);
-                let (best_tip, finalized_tip, blocks) =
-                    read::recent_block_summaries(state.latest_best_chain(), &state.db, limit);
+            ReadRequest::RecentBlockSummaries {
+                limit,
+                before_height,
+                session_anchor,
+                cursor_anchor,
+            } => {
+                let limit =
+                    limit.min(ReadRequest::MAX_RECENT_BLOCK_SUMMARIES_RESULTS.saturating_add(1));
+                let chain = state.latest_best_chain();
+                let cursor_valid =
+                    read::canonical_boundary_matches(chain.clone(), &state.db, session_anchor)
+                        && read::canonical_boundary_matches(
+                            chain.clone(),
+                            &state.db,
+                            cursor_anchor,
+                        );
+                let (best_tip, finalized_tip, blocks) = if cursor_valid {
+                    read::recent_block_summaries(chain, &state.db, limit, before_height)
+                } else {
+                    (read::tip(chain, &state.db), state.db.tip(), Vec::new())
+                };
 
                 Ok(ReadResponse::RecentBlockSummaries {
                     best_tip,
                     finalized_tip,
                     blocks,
+                    cursor_valid,
+                })
+            }
+
+            // Used by the lightweight transaction-summary explorer RPC.
+            ReadRequest::TransactionSummaryPage {
+                limit,
+                before,
+                session_anchor,
+                cursor_anchor,
+            } => {
+                let limit =
+                    limit.min(ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS.saturating_add(1));
+                let chain = state.latest_best_chain();
+                let cursor_valid =
+                    read::canonical_boundary_matches(chain.clone(), &state.db, session_anchor)
+                        && read::canonical_boundary_matches(
+                            chain.clone(),
+                            &state.db,
+                            cursor_anchor,
+                        );
+                let (best_tip, finalized_tip, transactions) = if cursor_valid {
+                    read::transaction_summary_page(chain, &state.db, limit, before)
+                } else {
+                    (read::tip(chain, &state.db), state.db.tip(), Vec::new())
+                };
+
+                Ok(ReadResponse::TransactionSummaryPage {
+                    best_tip,
+                    finalized_tip,
+                    transactions,
+                    cursor_valid,
+                })
+            }
+
+            // Used by the bounded transparent-address transaction explorer RPC.
+            ReadRequest::AddressTransactionSummaryPage {
+                address,
+                limit,
+                before,
+                session_anchor,
+                cursor_anchor,
+            } => {
+                let limit =
+                    limit.min(ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS.saturating_add(1));
+                let chain = state.latest_best_chain();
+                let cursor_valid =
+                    read::canonical_boundary_matches(chain.clone(), &state.db, session_anchor)
+                        && read::canonical_boundary_matches(
+                            chain.clone(),
+                            &state.db,
+                            cursor_anchor,
+                        );
+                let (best_tip, finalized_tip, transactions) = if cursor_valid {
+                    read::address_transaction_summary_page(chain, &state.db, address, limit, before)
+                } else {
+                    (read::tip(chain, &state.db), state.db.tip(), Vec::new())
+                };
+
+                Ok(ReadResponse::AddressTransactionSummaryPage {
+                    best_tip,
+                    finalized_tip,
+                    transactions,
+                    cursor_valid,
+                })
+            }
+
+            // Used by the bounded transparent-address UTXO explorer RPC.
+            ReadRequest::AddressUtxoSummaryPage {
+                address,
+                limit,
+                before,
+                cursor_anchor,
+            } => {
+                let limit =
+                    limit.min(ReadRequest::MAX_ADDRESS_UTXO_SUMMARY_PAGE_RESULTS.saturating_add(1));
+                let (best_tip, finalized_tip, cursor_valid, utxos) =
+                    read::address_utxo_summary_page(
+                        state.latest_best_chain(),
+                        &state.db,
+                        address,
+                        limit,
+                        before,
+                        cursor_anchor,
+                    )?;
+
+                Ok(ReadResponse::AddressUtxoSummaryPage {
+                    best_tip,
+                    finalized_tip,
+                    cursor_valid,
+                    utxos,
+                })
+            }
+
+            // Used by the current-fork explorer RPC.
+            ReadRequest::ExplorerChainTips => {
+                let (best_tip, finalized_tip, tips) =
+                    read::explorer_chain_tips(&state.latest_non_finalized_state(), &state.db);
+
+                Ok(ReadResponse::ExplorerChainTips {
+                    best_tip,
+                    finalized_tip,
+                    tips,
                 })
             }
 
@@ -1773,11 +1892,14 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::SnapshotData { snapshots })
             }
             ReadRequest::TopAddressesByBalance { limit } => {
-                let addresses = state
+                let (finalized_tip, addresses) = state
                     .db
                     .top_addresses_by_balance(limit.min(ReadRequest::MAX_TOP_ADDRESSES_RESULTS));
 
-                Ok(ReadResponse::TopAddressesByBalance { addresses })
+                Ok(ReadResponse::TopAddressesByBalance {
+                    finalized_tip,
+                    addresses,
+                })
             }
 
             // For the get_address_tx_ids RPC.

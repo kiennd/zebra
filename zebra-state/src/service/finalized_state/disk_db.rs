@@ -25,7 +25,7 @@ use std::{
 use itertools::Itertools;
 use rlimit::increase_nofile_limit;
 
-use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
+use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions, SnapshotWithThreadMode};
 use semver::Version;
 use zebra_chain::{parameters::Network, primitives::byte_array::increment_big_endian};
 
@@ -110,6 +110,26 @@ pub struct DiskDb {
     /// In [`MultiThreaded`](rocksdb::MultiThreaded) mode,
     /// only [`Drop`] requires exclusive access.
     db: Arc<DB>,
+}
+
+/// A consistent point-in-time view of every RocksDB column family in a [`DiskDb`].
+pub struct DiskDbSnapshot<'a> {
+    snapshot: SnapshotWithThreadMode<'a, DB>,
+}
+
+impl DiskDbSnapshot<'_> {
+    /// Returns all entries in `cf` in reverse key order from this snapshot.
+    pub fn zs_reverse_iter<'a, C, K, V>(&'a self, cf: &'a C) -> impl Iterator<Item = (K, V)> + 'a
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: FromDisk,
+        V: FromDisk,
+    {
+        self.snapshot
+            .iterator_cf(cf, rocksdb::IteratorMode::End)
+            .map(|result| result.expect("unexpected database failure"))
+            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+    }
 }
 
 /// Wrapper struct to ensure low-level database writes go through the correct API.
@@ -585,6 +605,13 @@ impl DiskWriteBatch {
 }
 
 impl DiskDb {
+    /// Creates a consistent point-in-time view shared by reads from multiple column families.
+    pub fn snapshot(&self) -> DiskDbSnapshot<'_> {
+        DiskDbSnapshot {
+            snapshot: self.db.snapshot(),
+        }
+    }
+
     /// Prints rocksdb metrics for each column family along with total database disk size, live data disk size and database memory size.
     pub fn print_db_metrics(&self) {
         let mut total_size_on_disk = 0;

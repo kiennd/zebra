@@ -26,6 +26,13 @@ use proptest_derive::Arbitrary;
 /// Transparent balances are stored as an 8 byte integer on disk.
 pub const BALANCE_DISK_BYTES: usize = 8;
 
+/// Transparent addresses are stored as a one-byte network/type tag and a 20-byte hash.
+pub const TRANSPARENT_ADDRESS_DISK_BYTES: usize = 21;
+
+/// Balance-ordered address keys contain a balance followed by an inverted address.
+pub const ADDRESS_BALANCE_INDEX_DISK_BYTES: usize =
+    BALANCE_DISK_BYTES + TRANSPARENT_ADDRESS_DISK_BYTES;
+
 /// [`OutputIndex`]es are stored as 3 bytes on disk.
 ///
 /// This reduces database size and increases lookup performance.
@@ -149,6 +156,34 @@ impl OutputLocation {
 /// TODO: make this a different type to OutputLocation?
 ///       derive IntoDisk and FromDisk?
 pub type AddressLocation = OutputLocation;
+
+/// A funded transparent address ordered by balance descending and address ascending on disk.
+///
+/// The balance is stored big-endian, followed by bitwise-inverted address bytes. Iterating this
+/// key in reverse byte order therefore yields the largest balance first, with deterministic
+/// ascending addresses for equal balances.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AddressBalanceIndex {
+    balance: Amount<NonNegative>,
+    address: transparent::Address,
+}
+
+impl AddressBalanceIndex {
+    /// Creates a balance-ordered address index key.
+    pub fn new(balance: Amount<NonNegative>, address: transparent::Address) -> AddressBalanceIndex {
+        AddressBalanceIndex { balance, address }
+    }
+
+    /// Returns the indexed transparent balance.
+    pub fn balance(&self) -> Amount<NonNegative> {
+        self.balance
+    }
+
+    /// Returns the indexed transparent address.
+    pub fn address(&self) -> transparent::Address {
+        self.address
+    }
+}
 
 /// The inner type of [`AddressBalanceLocation`] and [`AddressBalanceLocationChange`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -635,6 +670,46 @@ impl IntoDisk for transparent::Address {
     }
 }
 
+impl IntoDisk for AddressBalanceIndex {
+    type Bytes = [u8; ADDRESS_BALANCE_INDEX_DISK_BYTES];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let balance_bytes = u64::from(self.balance).to_be_bytes();
+        let inverted_address_bytes = self.address.as_bytes().map(|byte| !byte);
+
+        balance_bytes
+            .into_iter()
+            .chain(inverted_address_bytes)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("balance and transparent address keys have fixed encoded lengths")
+    }
+}
+
+impl FromDisk for AddressBalanceIndex {
+    fn from_bytes(disk_bytes: impl AsRef<[u8]>) -> Self {
+        let (balance_bytes, inverted_address_bytes) =
+            disk_bytes.as_ref().split_at(BALANCE_DISK_BYTES);
+        let balance = u64::from_be_bytes(
+            balance_bytes
+                .try_into()
+                .expect("balance index keys contain an eight-byte balance"),
+        );
+        let address_bytes: [u8; TRANSPARENT_ADDRESS_DISK_BYTES] = inverted_address_bytes
+            .iter()
+            .map(|byte| !byte)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("balance index keys contain a 21-byte transparent address");
+
+        AddressBalanceIndex {
+            balance: Amount::try_from(balance)
+                .expect("stored transparent balances satisfy the NonNegative constraint"),
+            address: transparent::Address::from_bytes(address_bytes),
+        }
+    }
+}
+
 impl FromDisk for transparent::Address {
     fn from_bytes(disk_bytes: impl AsRef<[u8]>) -> Self {
         let (address_variant, hash_bytes) = disk_bytes.as_ref().split_at(1);
@@ -882,5 +957,33 @@ impl FromDisk for AddressTransaction {
         let transaction_location = TransactionLocation::from_bytes(transaction_location_bytes);
 
         AddressTransaction::new(address_location, transaction_location)
+    }
+}
+
+#[cfg(test)]
+mod address_balance_index_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_balance_keys_round_trip_and_sort_for_reverse_iteration() {
+        let first_address =
+            transparent::Address::from_script_hash(NetworkKind::Mainnet, [0x01; 20]);
+        let second_address =
+            transparent::Address::from_script_hash(NetworkKind::Mainnet, [0x02; 20]);
+        let low_balance = Amount::<NonNegative>::try_from(1u64).unwrap();
+        let high_balance = Amount::<NonNegative>::try_from(2u64).unwrap();
+
+        let low_key = AddressBalanceIndex::new(low_balance, first_address);
+        let high_key = AddressBalanceIndex::new(high_balance, first_address);
+        let tied_first_key = AddressBalanceIndex::new(high_balance, first_address);
+        let tied_second_key = AddressBalanceIndex::new(high_balance, second_address);
+
+        assert!(high_key.as_bytes() > low_key.as_bytes());
+        assert!(first_address.as_bytes() < second_address.as_bytes());
+        assert!(tied_first_key.as_bytes() > tied_second_key.as_bytes());
+        assert_eq!(
+            AddressBalanceIndex::from_bytes(high_key.as_bytes()),
+            high_key
+        );
     }
 }

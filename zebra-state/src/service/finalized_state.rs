@@ -28,7 +28,9 @@ use zebra_chain::{
 };
 use zebra_db::{
     chain::BLOCK_INFO,
-    transparent::{BALANCE_BY_TRANSPARENT_ADDR, TX_LOC_BY_SPENT_OUT_LOC},
+    transparent::{
+        BALANCE_BY_TRANSPARENT_ADDR, TRANSPARENT_ADDR_BY_BALANCE, TX_LOC_BY_SPENT_OUT_LOC,
+    },
 };
 
 use crate::{
@@ -82,6 +84,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "tx_loc_by_hash",
     // Transparent
     BALANCE_BY_TRANSPARENT_ADDR,
+    TRANSPARENT_ADDR_BY_BALANCE,
     "tx_loc_by_transparent_addr_loc",
     "utxo_by_out_loc",
     "utxo_loc_by_transparent_addr_loc",

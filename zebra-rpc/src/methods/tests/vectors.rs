@@ -1111,6 +1111,305 @@ async fn rpc_getblocksummary_uses_indexed_state_and_validates_height() {
     read_state.expect_no_requests().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn explorer_list_rpcs_forward_cursors_and_map_current_forks() {
+    let _init_guard = zebra_test::init();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block_time =
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("test timestamp must be valid");
+    let block_info = BlockInfo::with_metrics(
+        Default::default(),
+        1_234,
+        3,
+        Amount::<NonNegative>::try_from(567u64).expect("test fee must be valid"),
+    );
+    let block_hash_6 = Hash([0x16; 32]);
+    let block_hash_5 = Hash([0x15; 32]);
+    let block_hash_4 = Hash([0x14; 32]);
+    let rpc_clone = rpc.clone();
+    let blocks_future = tokio::spawn(async move {
+        rpc_clone
+            .get_recent_block_summaries(Some(2), Some(7), None)
+            .await
+    });
+    read_state
+        .expect_request(ReadRequest::RecentBlockSummaries {
+            limit: 3,
+            before_height: Some(Height(7)),
+            session_anchor: None,
+            cursor_anchor: None,
+        })
+        .await
+        .respond(ReadResponse::RecentBlockSummaries {
+            best_tip: Some((Height(9), Hash([0x19; 32]))),
+            finalized_tip: Some((Height(8), Hash([0x18; 32]))),
+            blocks: vec![
+                zebra_state::RecentBlockSummary {
+                    height: Height(6),
+                    hash: block_hash_6,
+                    time: block_time,
+                    info: block_info.clone(),
+                    finalized: true,
+                },
+                zebra_state::RecentBlockSummary {
+                    height: Height(5),
+                    hash: block_hash_5,
+                    time: block_time,
+                    info: block_info.clone(),
+                    finalized: true,
+                },
+                zebra_state::RecentBlockSummary {
+                    height: Height(4),
+                    hash: block_hash_4,
+                    time: block_time,
+                    info: block_info,
+                    finalized: true,
+                },
+            ],
+            cursor_valid: true,
+        });
+    let blocks = blocks_future
+        .await
+        .expect("recent block future should not panic")
+        .expect("recent block request should succeed");
+    assert_eq!(blocks.next_before_height, Some(5));
+    assert_eq!(
+        blocks.next_cursor.as_deref(),
+        Some(format!("v1:b:9:{}:5:{block_hash_5}", Hash([0x19; 32])).as_str())
+    );
+    assert!(!blocks.request_cursor_finalized);
+    assert_eq!(blocks.blocks[0].height, 6);
+    assert_eq!(blocks.blocks[1].height, 5);
+
+    let transaction_hash = zebra_chain::transaction::Hash([0x31; 32]);
+    let transaction_location = zebra_state::TransactionLocation::from_index(Height(7), 2);
+    let cursor_block_hash = Hash([0x18; 32]);
+    let session_hash = Hash([0x19; 32]);
+    let transaction_cursor = format!("v1:t:9:{session_hash}:8:{cursor_block_hash}:0");
+    let transaction_summary = zebra_state::ExplorerTransactionSummary {
+        location: transaction_location,
+        hash: transaction_hash,
+        block_hash: Hash([0x17; 32]),
+        block_time,
+        size: 321,
+        version: 5,
+        coinbase: false,
+        transparent_input_count: 1,
+        transparent_output_count: 2,
+        sprout_joinsplit_count: 0,
+        sapling_spend_count: 3,
+        sapling_output_count: 4,
+        orchard_action_count: 5,
+        ironwood_action_count: 0,
+        finalized: true,
+    };
+    let rpc_clone = rpc.clone();
+    let transactions_future = tokio::spawn(async move {
+        rpc_clone
+            .get_transaction_summary_page(Some(1), Some(transaction_cursor))
+            .await
+    });
+    read_state
+        .expect_request(ReadRequest::TransactionSummaryPage {
+            limit: 2,
+            before: Some(zebra_state::TransactionLocation::from_index(Height(8), 0)),
+            session_anchor: Some((Height(9), session_hash)),
+            cursor_anchor: Some((Height(8), cursor_block_hash)),
+        })
+        .await
+        .respond(ReadResponse::TransactionSummaryPage {
+            best_tip: Some((Height(9), Hash([0x19; 32]))),
+            finalized_tip: Some((Height(9), Hash([0x19; 32]))),
+            transactions: vec![transaction_summary.clone(), transaction_summary.clone()],
+            cursor_valid: true,
+        });
+    let transactions = transactions_future
+        .await
+        .expect("transaction page future should not panic")
+        .expect("transaction page request should succeed");
+    assert_eq!(
+        transactions.next_cursor.as_deref(),
+        Some(format!("v1:t:9:{session_hash}:7:{}:2", Hash([0x17; 32])).as_str())
+    );
+    assert!(transactions.request_cursor_finalized);
+    assert_eq!(
+        transactions.transactions[0].txid,
+        transaction_hash.to_string()
+    );
+    assert_eq!(transactions.transactions[0].tx_index, 2);
+    assert_eq!(transactions.transactions[0].sapling_output_count, 4);
+
+    let address =
+        zebra_chain::transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x42; 20]);
+    let address_string = address.to_string();
+    let address_cursor = format!("v1:a:{address}:9:{session_hash}:8:{cursor_block_hash}:0");
+    let mut address_transaction_summary = transaction_summary.clone();
+    address_transaction_summary.finalized = false;
+    let rpc_clone = rpc.clone();
+    let address_string_for_request = address_string.clone();
+    let address_transactions_future = tokio::spawn(async move {
+        rpc_clone
+            .get_address_transaction_summary_page(
+                address_string_for_request,
+                Some(1),
+                Some(address_cursor),
+            )
+            .await
+    });
+    read_state
+        .expect_request(ReadRequest::AddressTransactionSummaryPage {
+            address,
+            limit: 2,
+            before: Some(zebra_state::TransactionLocation::from_index(Height(8), 0)),
+            session_anchor: Some((Height(9), session_hash)),
+            cursor_anchor: Some((Height(8), cursor_block_hash)),
+        })
+        .await
+        .respond(ReadResponse::AddressTransactionSummaryPage {
+            best_tip: Some((Height(9), Hash([0x19; 32]))),
+            finalized_tip: Some((Height(6), Hash([0x16; 32]))),
+            transactions: vec![
+                address_transaction_summary.clone(),
+                address_transaction_summary,
+            ],
+            cursor_valid: true,
+        });
+    let address_transactions = address_transactions_future
+        .await
+        .expect("address transaction page future should not panic")
+        .expect("address transaction page request should succeed");
+    assert_eq!(address_transactions.address, address_string);
+    assert_eq!(
+        address_transactions.next_cursor.as_deref(),
+        Some(format!("v1:a:{address}:9:{session_hash}:7:{}:2", Hash([0x17; 32])).as_str())
+    );
+    assert!(!address_transactions.request_cursor_finalized);
+    assert_eq!(
+        address_transactions.transactions[0].txid,
+        transaction_hash.to_string()
+    );
+
+    let utxo_location = zebra_state::OutputLocation::from_output_index(transaction_location, 3);
+    let utxo_summary = zebra_state::ExplorerAddressUtxoSummary {
+        location: utxo_location,
+        transaction_hash,
+        block_hash: Hash([0x17; 32]),
+        block_time,
+        output: zebra_chain::transparent::Output::new(
+            Amount::<NonNegative>::try_from(123u64).expect("test amount must be valid"),
+            address.script(),
+        ),
+        finalized: false,
+    };
+    let rpc_clone = rpc.clone();
+    let address_string_for_request = address_string.clone();
+    let address_utxos_future = tokio::spawn(async move {
+        rpc_clone
+            .get_address_utxo_summary_page(address_string_for_request, Some(1), None)
+            .await
+    });
+    read_state
+        .expect_request(ReadRequest::AddressUtxoSummaryPage {
+            address,
+            limit: 2,
+            before: None,
+            cursor_anchor: None,
+        })
+        .await
+        .respond(ReadResponse::AddressUtxoSummaryPage {
+            best_tip: Some((Height(9), Hash([0x19; 32]))),
+            finalized_tip: Some((Height(6), Hash([0x16; 32]))),
+            cursor_valid: true,
+            utxos: vec![utxo_summary],
+        });
+    let address_utxos = address_utxos_future
+        .await
+        .expect("address UTXO page future should not panic")
+        .expect("address UTXO page request should succeed");
+    assert_eq!(address_utxos.address, address_string);
+    assert_eq!(address_utxos.utxos[0].value_zat, 123);
+    assert_eq!(address_utxos.utxos[0].output_index, 3);
+    assert_eq!(
+        address_utxos.next_cursor, None,
+        "an exactly full final page must not advertise an empty follow-up page"
+    );
+    assert!(!address_utxos.request_cursor_finalized);
+
+    let active_hash = Hash([0x29; 32]);
+    let fork_hash = Hash([0x28; 32]);
+    let ancestor_hash = Hash([0x26; 32]);
+    let rpc_clone = rpc.clone();
+    let tips_future = tokio::spawn(async move { rpc_clone.get_explorer_chain_tips().await });
+    read_state
+        .expect_request(ReadRequest::ExplorerChainTips)
+        .await
+        .respond(ReadResponse::ExplorerChainTips {
+            best_tip: Some((Height(9), active_hash)),
+            finalized_tip: Some((Height(5), Hash([0x25; 32]))),
+            tips: vec![
+                zebra_state::ExplorerChainTip {
+                    height: Height(9),
+                    hash: active_hash,
+                    branch_length: 0,
+                    fork_height: None,
+                    fork_hash: None,
+                    active: true,
+                },
+                zebra_state::ExplorerChainTip {
+                    height: Height(8),
+                    hash: fork_hash,
+                    branch_length: 2,
+                    fork_height: Some(Height(6)),
+                    fork_hash: Some(ancestor_hash),
+                    active: false,
+                },
+            ],
+        });
+    let tips = tips_future
+        .await
+        .expect("chain tips future should not panic")
+        .expect("chain tips request should succeed");
+    assert_eq!(tips.tips.len(), 2);
+    assert_eq!(tips.tips[0].status, ExplorerChainTipStatus::Active);
+    assert_eq!(tips.tips[1].status, ExplorerChainTipStatus::ValidFork);
+    assert_eq!(tips.tips[1].fork_height, Some(6));
+    assert!(tips.coverage.current_non_finalized_only);
+    assert!(!tips.coverage.persistent_history);
+    assert_eq!(tips.coverage.max_tracked_tips, 10);
+    assert_eq!(tips.coverage.max_reorg_depth, 1_000);
+
+    let invalid_cursor_error = rpc
+        .get_transaction_summary_page(Some(1), Some("not-a-cursor".to_string()))
+        .await
+        .expect_err("an invalid transaction cursor should fail");
+    assert_eq!(invalid_cursor_error.code(), ErrorCode::InvalidParams.code());
+
+    mempool.expect_no_requests().await;
+    read_state.expect_no_requests().await;
+}
+
 /// Regression test for GHSA-x6v8-c2xp-928m — panics (aborts) before the fix.
 ///
 /// When `Depth` returns `None` (side-chain block), `get_block_header` sets
@@ -3714,6 +4013,188 @@ async fn rpc_get_standard_fee() {
     // Static v0 placeholder: the ZIP-317 marginal fee and version 0.
     assert_eq!(response.standard_fee(), 5000);
     assert_eq!(response.version(), 0);
+
+    let parameters = rpc
+        .get_zip317_fee_parameters()
+        .await
+        .expect("get_zip317_fee_parameters should succeed");
+    assert_eq!(parameters.zip317_revision(), zip317::ZIP317_REVISION);
+    assert_eq!(parameters.marginal_fee_zat(), zip317::MARGINAL_FEE);
+    assert_eq!(parameters.grace_actions(), zip317::GRACE_ACTIONS);
+    assert_eq!(
+        parameters.standard_transparent_input_size_bytes(),
+        zip317::P2PKH_STANDARD_INPUT_SIZE
+    );
+    assert_eq!(
+        parameters.standard_transparent_output_size_bytes(),
+        zip317::P2PKH_STANDARD_OUTPUT_SIZE
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_analyze_raw_transaction_is_stateless_and_strict() {
+    let _init_guard = zebra_test::init();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+
+    let (tip, _tip_sender) = MockChainTip::new();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state.clone(), 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let block: Block = zebra_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .expect("hard-coded block must deserialize");
+    let transaction = block
+        .transactions
+        .iter()
+        .find(|transaction| transaction.sprout_joinsplit_descriptions().next().is_some())
+        .expect("block 419,201 contains a Sprout transaction");
+    let transaction_bytes = transaction
+        .zcash_serialize_to_vec()
+        .expect("serializing a transaction to memory cannot fail");
+
+    let response = rpc
+        .analyze_raw_transaction(hex::encode(&transaction_bytes))
+        .await
+        .expect("a canonical transaction must be analyzed");
+
+    assert_eq!(response.transaction().hex().as_ref(), transaction_bytes);
+    assert_eq!(response.transaction().txid, transaction.hash());
+    assert_eq!(
+        response.zip317().conventional_actions(),
+        zip317::conventional_actions(transaction)
+    );
+    assert_eq!(
+        response.zip317().conventional_fee_zat(),
+        u64::from(zip317::conventional_fee(transaction))
+    );
+    assert_eq!(response.zip317().marginal_fee_zat(), zip317::MARGINAL_FEE);
+    assert_eq!(response.zip317().grace_actions(), zip317::GRACE_ACTIONS);
+    assert_eq!(response.zip317().zip317_revision(), zip317::ZIP317_REVISION);
+    assert!(response.transaction().height().is_none());
+    assert!(response.transaction().confirmations().is_none());
+    assert!(response.transaction().block_hash().is_none());
+    assert!(response.transaction().block_time().is_none());
+
+    let malformed_hex = rpc
+        .analyze_raw_transaction("not-hex".to_string())
+        .await
+        .expect_err("non-hex input must be rejected");
+    assert_eq!(malformed_hex.code(), -22);
+
+    // In a V4 transaction, the transparent input count follows the 4-byte header and 4-byte
+    // version group ID. Encode that small count using CompactSize's three-byte form.
+    let mut non_canonical_transaction = transaction_bytes.clone();
+    let transparent_input_count = non_canonical_transaction[8];
+    assert!(transparent_input_count < 0xfd);
+    non_canonical_transaction.splice(8..9, [0xfd, transparent_input_count, 0]);
+    let non_canonical_transaction_hex = hex::encode(non_canonical_transaction);
+    let non_canonical = rpc
+        .analyze_raw_transaction(non_canonical_transaction_hex.clone())
+        .await
+        .expect_err("non-canonical transaction encoding must be rejected");
+    assert_eq!(non_canonical.code(), -22);
+    assert!(non_canonical
+        .message()
+        .contains("non-canonical CompactSize"));
+
+    let send_non_canonical = rpc
+        .send_raw_transaction(non_canonical_transaction_hex, None)
+        .await
+        .expect_err("sendrawtransaction must reject non-canonical transaction encoding");
+    assert_eq!(send_non_canonical.code(), -22);
+    assert!(send_non_canonical
+        .message()
+        .contains("non-canonical CompactSize"));
+
+    let mut transaction_with_trailing_byte = transaction_bytes;
+    transaction_with_trailing_byte.push(0);
+    let transaction_with_trailing_byte_hex = hex::encode(transaction_with_trailing_byte);
+    let trailing_byte = rpc
+        .analyze_raw_transaction(transaction_with_trailing_byte_hex.clone())
+        .await
+        .expect_err("trailing bytes must be rejected");
+    assert_eq!(trailing_byte.code(), -22);
+    assert_eq!(
+        trailing_byte.message(),
+        "serialized transaction has trailing bytes"
+    );
+
+    let send_trailing_byte = rpc
+        .send_raw_transaction(transaction_with_trailing_byte_hex, None)
+        .await
+        .expect_err("sendrawtransaction must reject trailing bytes");
+    assert_eq!(send_trailing_byte.code(), -22);
+    assert_eq!(
+        send_trailing_byte.message(),
+        "serialized transaction has trailing bytes"
+    );
+
+    // Exercise the transaction deserializer's exact 2 MB bound through the analyzer. A v1
+    // transaction with one large transparent output has 23 bytes of framing at this script size:
+    // version (4), two vector counts (1 each), value (8), script CompactSize (5), and lock time
+    // (4). The exact-bound transaction is syntactically parseable; one byte more must fail before
+    // any state or mempool request is made.
+    let transaction_with_size = |target_size: usize| {
+        const LARGE_V1_TRANSACTION_FRAMING_SIZE: usize = 23;
+        let script_size = target_size - LARGE_V1_TRANSACTION_FRAMING_SIZE;
+        let output = transparent::Output::new(
+            Amount::<NonNegative>::try_from(0).expect("zero is a valid amount"),
+            transparent::Script::new(&vec![0; script_size]),
+        );
+        let transaction =
+            Transaction::test_v1(Vec::new(), vec![output], transaction::LockTime::unlocked());
+        assert_eq!(transaction.zcash_serialized_size(), target_size);
+        transaction
+    };
+    let max_transaction_size = usize::try_from(MAX_BLOCK_BYTES).expect("block size fits usize");
+    let max_transaction = transaction_with_size(max_transaction_size);
+    let max_transaction_hex = hex::encode(
+        max_transaction
+            .zcash_serialize_to_vec()
+            .expect("test transaction must serialize"),
+    );
+    let max_response = rpc
+        .analyze_raw_transaction(max_transaction_hex)
+        .await
+        .expect("an exact-bound transaction must be analyzable");
+    assert_eq!(
+        max_response.transaction().size(),
+        Some(i64::try_from(MAX_BLOCK_BYTES).expect("block size fits i64")),
+    );
+
+    let oversized_transaction = transaction_with_size(max_transaction_size + 1);
+    let oversized_transaction_hex = hex::encode(
+        oversized_transaction
+            .zcash_serialize_to_vec()
+            .expect("test transaction must serialize"),
+    );
+    let oversized = rpc
+        .analyze_raw_transaction(oversized_transaction_hex)
+        .await
+        .expect_err("a transaction above the deserializer bound must be rejected");
+    assert_eq!(oversized.code(), -22);
+
+    mempool.expect_no_requests().await;
+    state.expect_no_requests().await;
+    read_state.expect_no_requests().await;
 }
 
 /// `getblocksubsidy` must report the funding stream metadata era of the height's active upgrade,

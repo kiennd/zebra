@@ -24,6 +24,7 @@ use zebra_chain::{
 };
 
 use crate::{
+    response::ExplorerAddressUtxoSummary,
     service::{
         finalized_state::ZebraDb, non_finalized_state::Chain, read::FINALIZED_STATE_QUERY_RETRIES,
     },
@@ -101,6 +102,150 @@ impl AddressUtxos {
             )
         })
     }
+}
+
+/// Returns a newest-first, bounded page of current UTXOs for one transparent address.
+///
+/// A supplied cursor anchor must equal the sampled best tip exactly. UTXOs are a mutable set, so
+/// merely checking that an older anchor remains canonical would allow intervening spends to skip
+/// entries between pages.
+#[allow(clippy::type_complexity)]
+pub fn address_utxo_summary_page<C>(
+    chain: Option<C>,
+    db: &ZebraDb,
+    address: transparent::Address,
+    limit: usize,
+    before: Option<OutputLocation>,
+    cursor_anchor: Option<(Height, block::Hash)>,
+) -> Result<
+    (
+        Option<(Height, block::Hash)>,
+        Option<(Height, block::Hash)>,
+        bool,
+        Vec<ExplorerAddressUtxoSummary>,
+    ),
+    BoxError,
+>
+where
+    C: AsRef<Chain>,
+{
+    let chain_tip = chain
+        .as_ref()
+        .map(|chain| chain.as_ref().non_finalized_tip());
+    let addresses = HashSet::from([address]);
+    let (created_chain_utxos, spent_chain_utxos) = chain
+        .as_ref()
+        .map(|chain| chain.as_ref().partial_transparent_utxo_changes(&addresses))
+        .unwrap_or_default();
+
+    for attempt in 0..=FINALIZED_STATE_QUERY_RETRIES {
+        let start_finalized_tip = db.tip();
+        let best_tip = match (chain_tip, start_finalized_tip) {
+            (Some(chain_tip), Some(finalized_tip)) if finalized_tip.0 >= chain_tip.0 => {
+                Some(finalized_tip)
+            }
+            (Some(chain_tip), _) => Some(chain_tip),
+            (None, finalized_tip) => finalized_tip,
+        };
+        let cursor_valid = cursor_anchor.is_none_or(|anchor| Some(anchor) == best_tip);
+        if !cursor_valid || limit == 0 {
+            return Ok((best_tip, start_finalized_tip, cursor_valid, Vec::new()));
+        }
+
+        let finalized_height = start_finalized_tip.map(|(height, _hash)| height);
+        let mut page: Vec<(OutputLocation, transparent::Output, bool)> = created_chain_utxos
+            .iter()
+            .rev()
+            .filter(|(location, _output)| {
+                finalized_height.is_none_or(|height| location.height() > height)
+                    && before.is_none_or(|before| **location < before)
+                    && !spent_chain_utxos.contains(location)
+            })
+            .take(limit)
+            .map(|(location, output)| (*location, output.clone(), false))
+            .collect();
+
+        if page.len() < limit {
+            if let Some(finalized_height) = finalized_height {
+                let remaining = limit - page.len();
+                let scan_limit = finalized_scan_limit(remaining, spent_chain_utxos.len());
+                page.extend(
+                    db.address_utxos_reverse(&address, finalized_height, before, scan_limit)
+                        .into_iter()
+                        .filter(|(location, _output)| !spent_chain_utxos.contains(location))
+                        .take(remaining)
+                        .map(|(location, output)| (location, output, true)),
+                );
+            }
+        }
+
+        let end_finalized_tip = db.tip();
+        if start_finalized_tip != end_finalized_tip {
+            if attempt == FINALIZED_STATE_QUERY_RETRIES {
+                return Err(
+                    "finalized state changed repeatedly during address UTXO page query".into(),
+                );
+            }
+            continue;
+        }
+
+        let mut block_cache = BTreeMap::new();
+        let summaries = page
+            .into_iter()
+            .filter_map(|(location, output, finalized)| {
+                let transaction_location = location.transaction_location();
+                let transaction_hash = if finalized {
+                    db.transaction_hash(transaction_location)?
+                } else {
+                    chain
+                        .as_ref()?
+                        .as_ref()
+                        .block(location.height().into())?
+                        .block
+                        .transactions
+                        .get(location.transaction_index().as_usize())?
+                        .hash()
+                };
+
+                let (block_hash, block_time) = *block_cache
+                    .entry(location.height())
+                    .or_insert_with(|| {
+                        if finalized {
+                            let hash = db.hash(location.height())?;
+                            let time = db.block_header(hash.into())?.time;
+                            Some((hash, time))
+                        } else {
+                            let contextual =
+                                chain.as_ref()?.as_ref().block(location.height().into())?;
+                            Some((contextual.hash, contextual.block.header.time))
+                        }
+                    })
+                    .as_ref()?;
+
+                Some(ExplorerAddressUtxoSummary {
+                    location,
+                    transaction_hash,
+                    block_hash,
+                    block_time,
+                    output,
+                    finalized,
+                })
+            })
+            .collect();
+
+        if db.tip() != end_finalized_tip {
+            if attempt == FINALIZED_STATE_QUERY_RETRIES {
+                return Err(
+                    "finalized state changed repeatedly during address UTXO page query".into(),
+                );
+            }
+            continue;
+        }
+
+        return Ok((best_tip, end_finalized_tip, true, summaries));
+    }
+
+    unreachable!("address UTXO page retries either return a result or an error")
 }
 
 /// Returns the unspent transparent outputs (UTXOs) for the supplied [`transparent::Address`]es

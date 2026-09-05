@@ -13,16 +13,18 @@
 //! each time the database format (column, serialization, etc) changes.
 
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
-    ops::RangeInclusive,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ops::{
+        Bound::{Excluded, Included},
+        RangeInclusive,
+    },
     sync::Arc,
 };
 
 use rocksdb::ColumnFamily;
 use zebra_chain::{
     amount::{self, Amount, Constraint, NonNegative},
-    block::Height,
+    block::{self, Height},
     parameters::Network,
     transaction::{self, Transaction},
     transparent::{self, Input},
@@ -34,9 +36,9 @@ use crate::{
         disk_db::{DiskDb, DiskWriteBatch, ReadDisk, WriteDisk},
         disk_format::{
             transparent::{
-                AddressBalanceLocation, AddressBalanceLocationChange, AddressBalanceLocationInner,
-                AddressBalanceLocationUpdates, AddressLocation, AddressTransaction,
-                AddressUnspentOutput, OutputLocation,
+                AddressBalanceIndex, AddressBalanceLocation, AddressBalanceLocationChange,
+                AddressBalanceLocationInner, AddressBalanceLocationUpdates, AddressLocation,
+                AddressTransaction, AddressUnspentOutput, OutputLocation,
             },
             TransactionLocation,
         },
@@ -53,41 +55,18 @@ pub const TX_LOC_BY_SPENT_OUT_LOC: &str = "tx_loc_by_spent_out_loc";
 /// The name of the [balance](AddressBalanceLocation) by transparent address column family.
 pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 
+/// The name of the balance-ordered funded transparent address column family.
+pub const TRANSPARENT_ADDR_BY_BALANCE: &str = "transparent_addr_by_balance";
+
 /// The name of the [`BALANCE_BY_TRANSPARENT_ADDR`] column family's merge operator
 pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_received";
 
-/// A bounded-heap entry whose greatest value is the worst retained top-address candidate.
-#[derive(Clone, Copy, Debug)]
-struct TopAddressCandidate {
-    address: transparent::Address,
-    address_key: [u8; 21],
-    balance: Amount<NonNegative>,
-}
-
-impl PartialEq for TopAddressCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.address_key == other.address_key && self.balance == other.balance
-    }
-}
-
-impl Eq for TopAddressCandidate {}
-
-impl Ord for TopAddressCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Lower balances are worse. For equal balances, later database keys are worse, matching
-        // the deterministic order produced by the previous stable full sort.
-        other
-            .balance
-            .cmp(&self.balance)
-            .then_with(|| self.address_key.cmp(&other.address_key))
-    }
-}
-
-impl PartialOrd for TopAddressCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+/// Old and new finalized balances for addresses touched by one block.
+pub type AddressBalanceIndexUpdates = Vec<(
+    transparent::Address,
+    Amount<NonNegative>,
+    Amount<NonNegative>,
+)>;
 
 // Snapshot data functionality has been moved to the `snapshot` module.
 // Use `zebra_db::snapshot::SnapshotData` and related functions instead.
@@ -285,6 +264,57 @@ impl ZebraDb {
             .collect()
     }
 
+    /// Returns up to `limit` finalized UTXOs for `address`, newest first.
+    ///
+    /// `before`, when supplied, is an exclusive output-location cursor. Missing output values can
+    /// occur if a concurrent finalized block spends an output; callers that need a consistent
+    /// page must sample the finalized tip before and after this query and retry on change.
+    pub fn address_utxos_reverse(
+        &self,
+        address: &transparent::Address,
+        end_height: Height,
+        before: Option<OutputLocation>,
+        limit: usize,
+    ) -> Vec<(OutputLocation, transparent::Output)> {
+        let Some(address_location) = self.address_location(address) else {
+            return Vec::new();
+        };
+        if address_location.height() > end_height || limit == 0 {
+            return Vec::new();
+        }
+
+        let address_utxos = self
+            .db
+            .cf_handle("utxo_loc_by_transparent_addr_loc")
+            .unwrap();
+        let full_range = AddressUnspentOutput::address_iterator_range(
+            address_location,
+            Height::MIN..=end_height,
+        );
+        let first = *full_range.start();
+        let last = *full_range.end();
+
+        if before.is_some_and(|before| before <= first.unspent_output_location()) {
+            return Vec::new();
+        }
+
+        let upper_bound = match before {
+            Some(before) if before <= last.unspent_output_location() => {
+                Excluded(AddressUnspentOutput::new(address_location, before))
+            }
+            _ => Included(last),
+        };
+
+        self.db
+            .zs_reverse_range_iter(&address_utxos, (Included(first), upper_bound))
+            .filter_map(|(address_utxo, ())| {
+                let location = address_utxo.unspent_output_location();
+                Some((location, self.utxo_by_location(location)?.utxo.output))
+            })
+            .take(limit)
+            .collect()
+    }
+
     /// Returns the transaction hash for an [`TransactionLocation`].
     #[allow(clippy::unwrap_in_result)]
     pub fn tx_id_by_location(&self, tx_location: TransactionLocation) -> Option<transaction::Hash> {
@@ -350,6 +380,53 @@ impl ZebraDb {
         self.db
             .zs_forward_range_iter(&tx_loc_by_transparent_addr_loc, transaction_location_range)
             .map(|(tx_loc, ())| tx_loc)
+            .collect()
+    }
+
+    /// Returns up to `limit` finalized transaction locations involving `address`, newest first.
+    ///
+    /// `before`, when supplied, is an exclusive chain-location cursor. This query performs a
+    /// bounded reverse range scan over the address transaction index and does not materialize the
+    /// address's full transaction history.
+    pub fn address_transaction_locations_reverse(
+        &self,
+        address: &transparent::Address,
+        end_height: Height,
+        before: Option<TransactionLocation>,
+        limit: usize,
+    ) -> Vec<TransactionLocation> {
+        let Some(address_location) = self.address_location(address) else {
+            return Vec::new();
+        };
+        if address_location.height() > end_height {
+            return Vec::new();
+        }
+
+        let tx_loc_by_transparent_addr_loc =
+            self.db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap();
+        let full_range =
+            AddressTransaction::address_iterator_range(address_location, Height::MIN..=end_height);
+        let first = *full_range.start();
+        let last = *full_range.end();
+
+        if before.is_some_and(|before| before <= first.transaction_location()) {
+            return Vec::new();
+        }
+
+        let upper_bound = match before {
+            Some(before) if before <= last.transaction_location() => {
+                Excluded(AddressTransaction::new(address_location, before))
+            }
+            _ => Included(last),
+        };
+
+        self.db
+            .zs_reverse_range_iter(
+                &tx_loc_by_transparent_addr_loc,
+                (Included(first), upper_bound),
+            )
+            .map(|(address_tx, ())| address_tx.transaction_location())
+            .take(limit)
             .collect()
     }
 
@@ -449,12 +526,9 @@ impl ZebraDb {
     // Snapshot-related methods have been moved to the `snapshot` module.
     // Use `zebra_db::snapshot::*` functions instead.
 
-    /// Returns the top N addresses by balance in the finalized state.
+    /// Returns the finalized tip and top N funded addresses from one atomic database snapshot.
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
-    /// It should be run in a blocking thread to avoid hanging the tokio executor.
+    /// The balance-ordered secondary index makes this query O(`limit`).
     ///
     /// # Parameters
     ///
@@ -462,55 +536,25 @@ impl ZebraDb {
     pub fn top_addresses_by_balance(
         &self,
         limit: usize,
-    ) -> Vec<(transparent::Address, Amount<NonNegative>)> {
+    ) -> (
+        Option<(Height, block::Hash)>,
+        Vec<(transparent::Address, Amount<NonNegative>)>,
+    ) {
         let limit = limit.min(ReadRequest::MAX_TOP_ADDRESSES_RESULTS);
-        if limit == 0 {
-            return Vec::new();
-        }
+        let ordered_addresses = self.db.cf_handle(TRANSPARENT_ADDR_BY_BALANCE).unwrap();
+        let hash_by_height = self.db.cf_handle("hash_by_height").unwrap();
+        let snapshot = self.db.snapshot();
+        let finalized_tip = snapshot
+            .zs_reverse_iter::<_, Height, block::Hash>(&hash_by_height)
+            .next();
+        let addresses = snapshot
+            .zs_reverse_iter::<_, AddressBalanceIndex, ()>(&ordered_addresses)
+            .filter(|(entry, ())| entry.balance() > Amount::<NonNegative>::zero())
+            .take(limit)
+            .map(|(entry, ())| (entry.address(), entry.balance()))
+            .collect();
 
-        let balance_by_transparent_addr = self.address_balance_cf();
-        let mut top_addresses = BinaryHeap::with_capacity(limit);
-
-        for (address, balance_location) in self
-            .db
-            .zs_forward_range_iter::<_, transparent::Address, AddressBalanceLocation, _>(
-                &balance_by_transparent_addr,
-                ..,
-            )
-        {
-            let balance = balance_location.balance();
-            if balance == Amount::<NonNegative>::zero() {
-                continue;
-            }
-
-            let candidate = TopAddressCandidate {
-                address,
-                address_key: address.as_bytes(),
-                balance,
-            };
-
-            if top_addresses.len() < limit {
-                top_addresses.push(candidate);
-            } else if top_addresses
-                .peek()
-                .is_some_and(|worst_candidate| candidate < *worst_candidate)
-            {
-                top_addresses.pop();
-                top_addresses.push(candidate);
-            }
-        }
-
-        let mut top_addresses = top_addresses.into_vec();
-        top_addresses.sort_by(|a, b| {
-            b.balance
-                .cmp(&a.balance)
-                .then_with(|| a.address_key.cmp(&b.address_key))
-        });
-
-        top_addresses
-            .into_iter()
-            .map(|candidate| (candidate.address, candidate.balance))
-            .collect()
+        (finalized_tip, addresses)
     }
 
     /// Returns the transaction IDs that sent or received funds to `addresses`,
@@ -563,6 +607,7 @@ impl DiskWriteBatch {
             OutputLocation,
         >,
         mut address_balances: AddressBalanceLocationUpdates,
+        address_balance_index_updates: AddressBalanceIndexUpdates,
     ) {
         let db = &zebra_db.db;
         let FinalizedBlock { block, height, .. } = finalized;
@@ -612,6 +657,7 @@ impl DiskWriteBatch {
         }
 
         self.prepare_transparent_balances_batch(db, address_balances);
+        self.prepare_transparent_balance_index_batch(db, address_balance_index_updates);
     }
 
     /// Update `address_balances` in memory for the transparent transfers in `transactions`,
@@ -947,5 +993,32 @@ impl DiskWriteBatch {
                 }
             }
         };
+    }
+
+    /// Atomically updates the balance-ordered transparent-address index for one block.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn prepare_transparent_balance_index_batch(
+        &mut self,
+        db: &DiskDb,
+        updates: AddressBalanceIndexUpdates,
+    ) {
+        let ordered_addresses = db.cf_handle(TRANSPARENT_ADDR_BY_BALANCE).unwrap();
+        let zero = Amount::<NonNegative>::zero();
+
+        for (address, previous_balance, current_balance) in updates {
+            if previous_balance > zero {
+                self.zs_delete(
+                    &ordered_addresses,
+                    AddressBalanceIndex::new(previous_balance, address),
+                );
+            }
+            if current_balance > zero {
+                self.zs_insert(
+                    &ordered_addresses,
+                    AddressBalanceIndex::new(current_balance, address),
+                    (),
+                );
+            }
+        }
     }
 }

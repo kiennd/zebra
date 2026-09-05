@@ -31,6 +31,7 @@ use crate::{
 use crate::{
     error::{InvalidateError, LayeredStateError, ReconsiderError},
     AwaitUtxoError, CommitCheckpointVerifiedError, CommitSemanticallyVerifiedError,
+    TransactionLocation,
 };
 
 /// The per-pool nullifier types used by the indexer-only [`Spend`] enum, imported here rather than
@@ -1160,7 +1161,63 @@ pub enum ReadRequest {
     RecentBlockSummaries {
         /// Maximum number of summaries to return.
         limit: usize,
+        /// If present, only return blocks strictly below this height.
+        before_height: Option<block::Height>,
+        /// Original page-one best tip, used to detect reorgs affecting already-seen rows.
+        session_anchor: Option<(block::Height, block::Hash)>,
+        /// Canonical block at the exclusive boundary, used to reject stale cursors.
+        cursor_anchor: Option<(block::Height, block::Hash)>,
     },
+
+    /// Returns lightweight summaries for transactions in the current best chain.
+    ///
+    /// Results are ordered newest-first by [`TransactionLocation`] and are bounded by
+    /// [`ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS`].
+    TransactionSummaryPage {
+        /// Maximum number of summaries to return.
+        limit: usize,
+        /// If present, only return transactions strictly before this chain location.
+        before: Option<TransactionLocation>,
+        /// Original page-one best tip, used to detect reorgs affecting already-seen rows.
+        session_anchor: Option<(block::Height, block::Hash)>,
+        /// Canonical block containing `before`, used to reject stale cursors.
+        cursor_anchor: Option<(block::Height, block::Hash)>,
+    },
+
+    /// Returns lightweight summaries for transactions involving a transparent address.
+    ///
+    /// Results are ordered newest-first and are bounded by
+    /// [`ReadRequest::MAX_TRANSACTION_SUMMARY_PAGE_RESULTS`].
+    AddressTransactionSummaryPage {
+        /// The transparent address whose observable transactions should be returned.
+        address: transparent::Address,
+        /// Maximum number of summaries to return.
+        limit: usize,
+        /// If present, only return transactions strictly before this chain location.
+        before: Option<TransactionLocation>,
+        /// Original page-one best tip, used to detect reorgs affecting already-seen rows.
+        session_anchor: Option<(block::Height, block::Hash)>,
+        /// Canonical block containing `before`, used to reject stale cursors.
+        cursor_anchor: Option<(block::Height, block::Hash)>,
+    },
+
+    /// Returns a newest-first page of currently unspent outputs for one transparent address.
+    ///
+    /// Unlike append-only block and transaction pages, a UTXO page is bound to an exact best-chain
+    /// tip because a later block can spend outputs from any previous page.
+    AddressUtxoSummaryPage {
+        /// The transparent address whose UTXOs should be returned.
+        address: transparent::Address,
+        /// Maximum number of summaries to return.
+        limit: usize,
+        /// If present, only return outputs strictly before this chain location.
+        before: Option<crate::OutputLocation>,
+        /// Exact best-chain tip sampled for the first page.
+        cursor_anchor: Option<(block::Height, block::Hash)>,
+    },
+
+    /// Returns every currently tracked contextually valid non-finalized chain tip.
+    ExplorerChainTips,
 
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
@@ -1438,9 +1495,7 @@ pub enum ReadRequest {
 
     /// Returns the top N addresses by balance in the finalized state.
     ///
-    /// # Warning
-    ///
-    /// This operation scans the entire balance column family and may be slow.
+    /// Uses the mandatory balance-ordered index and performs O(`limit`) work.
     TopAddressesByBalance {
         /// Maximum number of addresses to return.
         limit: usize,
@@ -1599,6 +1654,12 @@ impl ReadRequest {
     /// Maximum number of recent block summaries returned by a public request.
     pub const MAX_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 100;
 
+    /// Maximum number of transaction summaries returned by a public request.
+    pub const MAX_TRANSACTION_SUMMARY_PAGE_RESULTS: usize = 100;
+
+    /// Maximum number of address UTXO summaries returned by a public request.
+    pub const MAX_ADDRESS_UTXO_SUMMARY_PAGE_RESULTS: usize = 100;
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -1608,6 +1669,10 @@ impl ReadRequest {
             ReadRequest::BlockInfo(_) => "block_info",
             ReadRequest::BlockSummary(_) => "block_summary",
             ReadRequest::RecentBlockSummaries { .. } => "recent_block_summaries",
+            ReadRequest::TransactionSummaryPage { .. } => "transaction_summary_page",
+            ReadRequest::AddressTransactionSummaryPage { .. } => "address_transaction_summary_page",
+            ReadRequest::AddressUtxoSummaryPage { .. } => "address_utxo_summary_page",
+            ReadRequest::ExplorerChainTips => "explorer_chain_tips",
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",

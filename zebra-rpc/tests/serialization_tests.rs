@@ -23,19 +23,21 @@ use zebra_rpc::client::zebra_chain::{
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
 };
 use zebra_rpc::client::{
-    BlockHeaderObject, BlockObject, BlockTemplateResponse, Commitments, DefaultRoots, EndOfService,
-    FundingStream, GetAddressBalanceRequest, GetAddressBalanceResponse, GetAddressTxIdsRequest,
-    GetAddressUtxosResponse, GetAddressUtxosResponseObject, GetBlockHashResponse,
-    GetBlockHeaderResponse, GetBlockHeightAndHashResponse, GetBlockResponse,
-    GetBlockSubsidyResponse, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
-    GetBlockTemplateResponse, GetBlockTransaction, GetBlockTrees, GetBlockchainInfoBalance,
-    GetBlockchainInfoResponse, GetDeprecationInfoResponse, GetInfoResponse, GetMiningInfoResponse,
-    GetNetworkInfoResponse, GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-    GetSubtreesByIndexResponse, GetTreestateResponse, Hash, Input, JoinSplit, MempoolObject,
-    Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey, ScriptSig,
-    SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
+    AnalyzeRawTransactionResponse, BlockHeaderObject, BlockObject, BlockTemplateResponse,
+    Commitments, DefaultRoots, EndOfService, FundingStream, GetAddressBalanceRequest,
+    GetAddressBalanceResponse, GetAddressTxIdsRequest, GetAddressUtxosResponse,
+    GetAddressUtxosResponseObject, GetBlockHashResponse, GetBlockHeaderResponse,
+    GetBlockHeightAndHashResponse, GetBlockResponse, GetBlockSubsidyResponse,
+    GetBlockTemplateParameters, GetBlockTemplateRequestMode, GetBlockTemplateResponse,
+    GetBlockTransaction, GetBlockTrees, GetBlockchainInfoBalance, GetBlockchainInfoResponse,
+    GetDeprecationInfoResponse, GetInfoResponse, GetMiningInfoResponse, GetNetworkInfoResponse,
+    GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
+    GetSubtreesByIndexResponse, GetTreestateResponse, GetZip317FeeParametersResponse, Hash, Input,
+    JoinSplit, MempoolObject, Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey,
+    ScriptSig, SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
     SubmitBlockResponse, SubtreeRpcData, TransactionObject, TransactionTemplate, Treestate, Utxo,
     ValidateAddressResponse, ZListUnifiedReceiversResponse, ZValidateAddressResponse,
+    Zip317FeeAnalysis,
 };
 
 #[test]
@@ -205,6 +207,77 @@ fn test_send_raw_transaction() -> Result<(), Box<dyn std::error::Error>> {
     let hash = obj.hash();
 
     let new_obj = SendRawTransactionResponse::new(hash);
+
+    assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_analyze_raw_transaction() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+{
+  "transaction": {
+    "hex": "",
+    "vin": [],
+    "vout": [],
+    "vShieldedSpend": [],
+    "vShieldedOutput": [],
+    "vjoinsplit": [],
+    "txid": "0000000000000000000000000000000000000000000000000000000000000000",
+    "overwintered": false,
+    "version": 4,
+    "locktime": 0
+  },
+  "zip317": {
+    "zip317_revision": 1,
+    "conventional_actions": 2,
+    "conventional_fee_zat": 10000,
+    "marginal_fee_zat": 5000,
+    "grace_actions": 2
+  }
+}
+"#;
+    let obj: AnalyzeRawTransactionResponse = serde_json::from_str(json)?;
+
+    let transaction = obj.transaction().clone();
+    let fee = obj.zip317();
+    let new_obj = AnalyzeRawTransactionResponse::new(
+        transaction,
+        Zip317FeeAnalysis::new(
+            fee.zip317_revision(),
+            fee.conventional_actions(),
+            fee.conventional_fee_zat(),
+            fee.marginal_fee_zat(),
+            fee.grace_actions(),
+        ),
+    );
+
+    assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_zip317_fee_parameters() -> Result<(), Box<dyn std::error::Error>> {
+    let json = r#"
+{
+  "zip317_revision": 1,
+  "marginal_fee_zat": 5000,
+  "grace_actions": 2,
+  "standard_transparent_input_size_bytes": 150,
+  "standard_transparent_output_size_bytes": 34
+}
+"#;
+    let obj: GetZip317FeeParametersResponse = serde_json::from_str(json)?;
+
+    let new_obj = GetZip317FeeParametersResponse::new(
+        obj.zip317_revision(),
+        obj.marginal_fee_zat(),
+        obj.grace_actions(),
+        obj.standard_transparent_input_size_bytes(),
+        obj.standard_transparent_output_size_bytes(),
+    );
 
     assert_eq!(obj, new_obj);
 

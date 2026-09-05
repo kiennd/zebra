@@ -1,0 +1,10 @@
+---
+source: zebra-state/src/service/finalized_state/disk_format/tests/snapshot.rs
+expression: cf_data
+---
+[
+  KV(
+    k: "00000000000030d4fc1088a0e06680edd5f9d000e5d28bbc542e0639bd",
+    v: "",
+  ),
+]

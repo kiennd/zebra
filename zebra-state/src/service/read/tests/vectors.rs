@@ -1,6 +1,6 @@
 //! Fixed test vectors for the ReadStateService.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use tower::ServiceExt;
 use zebra_chain::{
@@ -49,7 +49,12 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
 
     let recent_response = read_state
         .clone()
-        .oneshot(ReadRequest::RecentBlockSummaries { limit: 10 })
+        .oneshot(ReadRequest::RecentBlockSummaries {
+            limit: 10,
+            before_height: None,
+            session_anchor: None,
+            cursor_anchor: None,
+        })
         .await
         .expect("empty recent block summaries request should succeed");
     assert_eq!(
@@ -58,6 +63,41 @@ async fn empty_read_state_still_responds_to_requests() -> Result<()> {
             best_tip: None,
             finalized_tip: None,
             blocks: Vec::new(),
+            cursor_valid: true,
+        }
+    );
+
+    let transaction_response = read_state
+        .clone()
+        .oneshot(ReadRequest::TransactionSummaryPage {
+            limit: 10,
+            before: None,
+            session_anchor: None,
+            cursor_anchor: None,
+        })
+        .await
+        .expect("empty transaction summary request should succeed");
+    assert_eq!(
+        transaction_response,
+        ReadResponse::TransactionSummaryPage {
+            best_tip: None,
+            finalized_tip: None,
+            transactions: Vec::new(),
+            cursor_valid: true,
+        }
+    );
+
+    let chain_tips_response = read_state
+        .clone()
+        .oneshot(ReadRequest::ExplorerChainTips)
+        .await
+        .expect("empty chain tips request should succeed");
+    assert_eq!(
+        chain_tips_response,
+        ReadResponse::ExplorerChainTips {
+            best_tip: None,
+            finalized_tip: None,
+            tips: Vec::new(),
         }
     );
 
@@ -181,8 +221,12 @@ async fn recent_block_summaries_are_ordered_and_indexed() -> Result<()> {
 
     let requested_count = 3.min(blocks.len());
     let response = read_state
+        .clone()
         .oneshot(ReadRequest::RecentBlockSummaries {
             limit: requested_count,
+            before_height: None,
+            session_anchor: None,
+            cursor_anchor: None,
         })
         .await
         .expect("recent block summaries request should succeed");
@@ -190,16 +234,28 @@ async fn recent_block_summaries_are_ordered_and_indexed() -> Result<()> {
         best_tip,
         finalized_tip,
         blocks: summaries,
+        cursor_valid,
     } = response
     else {
         panic!("unexpected response to recent block summaries request")
     };
+    assert!(cursor_valid);
 
     let expected_tip = blocks.last().expect("test chain is not empty");
     let expected_tip = (expected_tip.coinbase_height().unwrap(), expected_tip.hash());
     assert_eq!(best_tip, Some(expected_tip));
     assert_eq!(finalized_tip, Some(expected_tip));
     assert_eq!(summaries.len(), requested_count);
+
+    let top_response = read_state
+        .clone()
+        .oneshot(ReadRequest::TopAddressesByBalance { limit: 1 })
+        .await
+        .expect("top-address request should succeed");
+    let ReadResponse::TopAddressesByBalance { finalized_tip, .. } = top_response else {
+        panic!("unexpected response to top-address request")
+    };
+    assert_eq!(finalized_tip, Some(expected_tip));
 
     for (summary, expected_block) in summaries.iter().zip(blocks.iter().rev()) {
         assert_eq!(summary.height, expected_block.coinbase_height().unwrap());
@@ -216,6 +272,368 @@ async fn recent_block_summaries_are_ordered_and_indexed() -> Result<()> {
         assert!(summary.info.total_fee().is_some());
         assert!(summary.finalized);
     }
+
+    let cursor_height = summaries
+        .last()
+        .expect("the first page is not empty")
+        .height;
+    let cursor_hash = summaries.last().expect("the first page is not empty").hash;
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::RecentBlockSummaries {
+            limit: requested_count,
+            before_height: Some(cursor_height),
+            session_anchor: Some(expected_tip),
+            cursor_anchor: Some((cursor_height, cursor_hash)),
+        })
+        .await
+        .expect("cursor block summaries request should succeed");
+    let ReadResponse::RecentBlockSummaries {
+        blocks: cursor_summaries,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to cursor block summaries request")
+    };
+    assert!(cursor_summaries
+        .iter()
+        .all(|summary| summary.height < cursor_height));
+
+    let expected_cursor_blocks = blocks
+        .iter()
+        .rev()
+        .skip(requested_count)
+        .take(requested_count);
+    for (summary, expected_block) in cursor_summaries.iter().zip(expected_cursor_blocks) {
+        assert_eq!(summary.height, expected_block.coinbase_height().unwrap());
+        assert_eq!(summary.hash, expected_block.hash());
+    }
+
+    let stale_response = read_state
+        .oneshot(ReadRequest::RecentBlockSummaries {
+            limit: requested_count,
+            before_height: Some(cursor_height),
+            session_anchor: Some((expected_tip.0, Hash([0x7f; 32]))),
+            cursor_anchor: Some((cursor_height, cursor_hash)),
+        })
+        .await
+        .expect("stale cursor request should return an explicit state response");
+    let ReadResponse::RecentBlockSummaries {
+        blocks,
+        cursor_valid,
+        ..
+    } = stale_response
+    else {
+        panic!("unexpected response to stale cursor block summaries request")
+    };
+    assert!(!cursor_valid);
+    assert!(blocks.is_empty());
+
+    Ok(())
+}
+
+/// Transaction summary pages are newest-first and use an exclusive chain-location cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_summary_pages_are_ordered_and_cursor_paginated() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    let expected_transactions: Vec<_> = blocks
+        .iter()
+        .rev()
+        .flat_map(|block| {
+            let height = block.coinbase_height().unwrap();
+            block
+                .transactions
+                .iter()
+                .enumerate()
+                .rev()
+                .map(move |(index, tx)| (height, block, index, tx))
+        })
+        .collect();
+    let requested_count = 3.min(expected_transactions.len());
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::TransactionSummaryPage {
+            limit: requested_count,
+            before: None,
+            session_anchor: None,
+            cursor_anchor: None,
+        })
+        .await
+        .expect("transaction summary page request should succeed");
+    let ReadResponse::TransactionSummaryPage {
+        best_tip,
+        finalized_tip,
+        transactions,
+        cursor_valid,
+    } = response
+    else {
+        panic!("unexpected response to transaction summary page request")
+    };
+    assert!(cursor_valid);
+
+    let expected_tip = blocks.last().expect("test chain is not empty");
+    let expected_tip = (expected_tip.coinbase_height().unwrap(), expected_tip.hash());
+    assert_eq!(best_tip, Some(expected_tip));
+    assert_eq!(finalized_tip, Some(expected_tip));
+    assert_eq!(transactions.len(), requested_count);
+
+    for (summary, (height, block, index, tx)) in
+        transactions.iter().zip(expected_transactions.iter())
+    {
+        assert_eq!(summary.location.height, *height);
+        assert_eq!(summary.location.index.as_usize(), *index);
+        assert_eq!(summary.hash, tx.hash());
+        assert_eq!(summary.block_hash, block.hash());
+        assert_eq!(summary.block_time, block.header.time);
+        assert_eq!(summary.size, tx.zcash_serialized_size() as u32);
+        assert_eq!(summary.version, tx.version());
+        assert_eq!(summary.coinbase, tx.is_coinbase());
+        assert!(summary.finalized);
+    }
+
+    let cursor = transactions
+        .last()
+        .expect("the first transaction page is not empty")
+        .location;
+    let cursor_hash = transactions
+        .last()
+        .expect("the first transaction page is not empty")
+        .block_hash;
+    let response = read_state
+        .oneshot(ReadRequest::TransactionSummaryPage {
+            limit: requested_count,
+            before: Some(cursor),
+            session_anchor: Some(expected_tip),
+            cursor_anchor: Some((cursor.height, cursor_hash)),
+        })
+        .await
+        .expect("cursor transaction summary page request should succeed");
+    let ReadResponse::TransactionSummaryPage {
+        transactions: cursor_transactions,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to cursor transaction summary page request")
+    };
+
+    for (summary, (height, _block, index, tx)) in cursor_transactions
+        .iter()
+        .zip(expected_transactions.iter().skip(requested_count))
+    {
+        assert_eq!(summary.location.height, *height);
+        assert_eq!(summary.location.index.as_usize(), *index);
+        assert_eq!(summary.hash, tx.hash());
+        assert!(summary.location < cursor);
+    }
+
+    Ok(())
+}
+
+/// Address transaction pages use the address index and an exclusive location cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn address_transaction_summary_pages_are_bounded_and_cursor_paginated() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (address, expected_hash) = blocks
+        .iter()
+        .rev()
+        .flat_map(|block| block.transactions.iter().rev())
+        .find_map(|tx| {
+            tx.outputs()
+                .iter()
+                .find_map(|output| output.address(&Mainnet))
+                .map(|address| (address, tx.hash()))
+        })
+        .expect("continuous blocks must contain a transparent output");
+    let session_block = blocks.last().expect("test chain is not empty");
+    let session_anchor = (
+        session_block.coinbase_height().unwrap(),
+        session_block.hash(),
+    );
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks, &Mainnet).await;
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::AddressTransactionSummaryPage {
+            address,
+            limit: 100,
+            before: None,
+            session_anchor: None,
+            cursor_anchor: None,
+        })
+        .await
+        .expect("address transaction summary page request should succeed");
+    let ReadResponse::AddressTransactionSummaryPage {
+        transactions: all_transactions,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to address transaction summary page request")
+    };
+    assert!(all_transactions
+        .iter()
+        .any(|summary| summary.hash == expected_hash));
+    assert!(all_transactions
+        .windows(2)
+        .all(|pair| pair[0].location > pair[1].location));
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::AddressTransactionSummaryPage {
+            address,
+            limit: 1,
+            before: None,
+            session_anchor: None,
+            cursor_anchor: None,
+        })
+        .await
+        .expect("first address transaction page request should succeed");
+    let ReadResponse::AddressTransactionSummaryPage {
+        transactions: first_page,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to first address transaction page request")
+    };
+    assert_eq!(first_page, all_transactions[..1]);
+
+    let cursor = first_page[0].location;
+    let cursor_hash = first_page[0].block_hash;
+    let response = read_state
+        .oneshot(ReadRequest::AddressTransactionSummaryPage {
+            address,
+            limit: 1,
+            before: Some(cursor),
+            session_anchor: Some(session_anchor),
+            cursor_anchor: Some((cursor.height, cursor_hash)),
+        })
+        .await
+        .expect("cursor address transaction page request should succeed");
+    let ReadResponse::AddressTransactionSummaryPage {
+        transactions: second_page,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to cursor address transaction page request")
+    };
+    assert_eq!(second_page, all_transactions.get(1..2).unwrap_or_default());
+    assert!(second_page.iter().all(|summary| summary.location < cursor));
+
+    Ok(())
+}
+
+/// Address UTXO pages are newest-first and bound to the exact best tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn address_utxo_summary_page_is_bounded_and_exact_tip_anchored() -> Result<()> {
+    let _init_guard = zebra_test::init();
+
+    let blocks: Vec<Arc<Block>> = zebra_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|block_bytes| block_bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let candidate_addresses: HashSet<_> = blocks
+        .iter()
+        .flat_map(|block| block.transactions.iter())
+        .flat_map(|transaction| transaction.outputs())
+        .filter_map(|output| output.address(&Mainnet))
+        .collect();
+    let (_state, read_state, _latest_chain_tip, _chain_tip_change) =
+        populated_state(blocks.clone(), &Mainnet).await;
+
+    let mut first_page = None;
+    for address in candidate_addresses {
+        let response = read_state
+            .clone()
+            .oneshot(ReadRequest::AddressUtxoSummaryPage {
+                address,
+                limit: 1,
+                before: None,
+                cursor_anchor: None,
+            })
+            .await
+            .expect("address UTXO summary request should succeed");
+        let ReadResponse::AddressUtxoSummaryPage {
+            best_tip,
+            finalized_tip,
+            cursor_valid,
+            utxos,
+        } = response
+        else {
+            panic!("unexpected response to address UTXO summary request")
+        };
+        if let Some(utxo) = utxos.into_iter().next() {
+            first_page = Some((address, best_tip.unwrap(), finalized_tip, utxo));
+            assert!(cursor_valid);
+            break;
+        }
+    }
+
+    let (address, anchor, finalized_tip, first_utxo) =
+        first_page.expect("continuous vectors contain an indexed unspent address output");
+    let expected_tip = blocks.last().expect("test chain is not empty");
+    assert_eq!(
+        anchor,
+        (expected_tip.coinbase_height().unwrap(), expected_tip.hash())
+    );
+    assert_eq!(finalized_tip, Some(anchor));
+    assert_eq!(first_utxo.output.address(&Mainnet), Some(address));
+
+    let response = read_state
+        .clone()
+        .oneshot(ReadRequest::AddressUtxoSummaryPage {
+            address,
+            limit: 1,
+            before: Some(first_utxo.location),
+            cursor_anchor: Some(anchor),
+        })
+        .await
+        .expect("anchored address UTXO page request should succeed");
+    let ReadResponse::AddressUtxoSummaryPage {
+        cursor_valid,
+        utxos,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to anchored address UTXO summary request")
+    };
+    assert!(cursor_valid);
+    assert!(utxos
+        .iter()
+        .all(|summary| summary.location < first_utxo.location));
+
+    let response = read_state
+        .oneshot(ReadRequest::AddressUtxoSummaryPage {
+            address,
+            limit: 1,
+            before: Some(first_utxo.location),
+            cursor_anchor: Some((anchor.0, Hash([0x7f; 32]))),
+        })
+        .await
+        .expect("stale address UTXO cursor should return an explicit state response");
+    let ReadResponse::AddressUtxoSummaryPage {
+        cursor_valid,
+        utxos,
+        ..
+    } = response
+    else {
+        panic!("unexpected response to stale address UTXO summary request")
+    };
+    assert!(!cursor_valid);
+    assert!(utxos.is_empty());
 
     Ok(())
 }
@@ -676,7 +1094,7 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
     finalized_state.set_finalized_value_pool(fake_value_pool);
 
     // Commit genesis as the first chain
-    non_finalized_state.commit_new_chain(genesis.prepare(), &finalized_state)?;
+    non_finalized_state.commit_new_chain(genesis.clone().prepare(), &finalized_state)?;
 
     // Commit best chain block (higher work) - extends the genesis chain
     non_finalized_state.commit_block(best_chain_block.clone().prepare(), &finalized_state)?;
@@ -693,7 +1111,7 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
 
     // Now test with the read interface
     // We'll use the low-level block lookup functions directly
-    use crate::service::read::block::{any_block, block};
+    use crate::service::read::block::{any_block, block, explorer_chain_tips};
 
     // Test 1: any_block with all chains should find the side chain block by hash
     let found = any_block(
@@ -729,6 +1147,23 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         "any_block should find best chain block by hash"
     );
     assert_eq!(found.unwrap().hash(), best_hash);
+
+    let (best_tip, finalized_tip, tips) =
+        explorer_chain_tips(&non_finalized_state, &finalized_state.db);
+    assert_eq!(
+        best_tip,
+        Some((best_chain_block.coinbase_height().unwrap(), best_hash))
+    );
+    assert_eq!(finalized_tip, None);
+    assert_eq!(tips.len(), 2);
+    assert!(tips[0].active);
+    assert_eq!(tips[0].hash, best_hash);
+    assert_eq!(tips[0].branch_length, 0);
+    assert!(!tips[1].active);
+    assert_eq!(tips[1].hash, side_hash);
+    assert_eq!(tips[1].branch_length, 1);
+    assert_eq!(tips[1].fork_height, genesis.coinbase_height());
+    assert_eq!(tips[1].fork_hash, Some(genesis.hash()));
 
     // Test 4: block should also find the best chain block by hash
     let found = block(
