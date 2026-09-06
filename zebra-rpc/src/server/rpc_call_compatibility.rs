@@ -33,6 +33,16 @@ impl<S> FixRpcResponseMiddleware<S> {
     }
 }
 
+fn preserves_json_rpc_invalid_params(method: &str) -> bool {
+    matches!(
+        method,
+        "getrecentblocksummaries"
+            | "gettransactionsummarypage"
+            | "getaddresstransactionsummarypage"
+            | "getaddressutxosummarypage"
+    )
+}
+
 impl<'a, S> RpcServiceT<'a> for FixRpcResponseMiddleware<S>
 where
     S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
@@ -41,13 +51,16 @@ where
 
     fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
         let service = self.service.clone();
+        let preserve_invalid_params = preserves_json_rpc_invalid_params(request.method_name());
         ResponseFuture::future(Box::pin(async move {
             let response = service.call(request).await;
             if response.is_error() {
                 let original_error_code = response
                     .as_error_code()
                     .expect("response should have an error code");
-                if original_error_code == jsonrpsee_types::ErrorCode::InvalidParams.code() {
+                if original_error_code == jsonrpsee_types::ErrorCode::InvalidParams.code()
+                    && !preserve_invalid_params
+                {
                     let new_error_code = crate::server::error::LegacyCode::Misc.into();
                     tracing::debug!(
                         "Replacing RPC error: {original_error_code} with {new_error_code}"
@@ -80,5 +93,25 @@ where
             }
             response
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preserves_json_rpc_invalid_params;
+
+    #[test]
+    fn explorer_cursor_methods_preserve_invalid_params() {
+        for method in [
+            "getrecentblocksummaries",
+            "gettransactionsummarypage",
+            "getaddresstransactionsummarypage",
+            "getaddressutxosummarypage",
+        ] {
+            assert!(preserves_json_rpc_invalid_params(method), "{method}");
+        }
+
+        assert!(!preserves_json_rpc_invalid_params("getblock"));
+        assert!(!preserves_json_rpc_invalid_params("sendrawtransaction"));
     }
 }
