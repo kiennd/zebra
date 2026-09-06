@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: 'Finalized analytics snapshots now persist exact accepted work, header-time bounds, block and transaction totals, reward composition, and neutral coinbase output routes. A fresh sync is required to populate complete historical mining intervals.'
+time: 2026-09-06T09:00:00.000000000Z

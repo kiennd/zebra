@@ -31,6 +31,7 @@ use zebra_db::{
     transparent::{
         BALANCE_BY_TRANSPARENT_ADDR, TRANSPARENT_ADDR_BY_BALANCE, TX_LOC_BY_SPENT_OUT_LOC,
     },
+    turnstile::{TURNSTILE_COHORTS, TURNSTILE_OUTPUTS},
 };
 
 use crate::{
@@ -62,7 +63,12 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use zebra_db::snapshot::{SnapshotData, SnapshotDateKey};
+#[allow(unused_imports)]
+pub use zebra_db::snapshot::{MiningIntervalData, SnapshotData, SnapshotDateKey};
+pub use zebra_db::turnstile::{
+    TurnstileCohort, TurnstileData, TurnstileSourcePool, TurnstileStats, TurnstileValue,
+    TurnstileWindow, TURNSTILE_CLASSIFICATION_VERSION,
+};
 pub use zebra_db::ZebraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -89,6 +95,8 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "utxo_by_out_loc",
     "utxo_loc_by_transparent_addr_loc",
     TX_LOC_BY_SPENT_OUT_LOC,
+    TURNSTILE_OUTPUTS,
+    TURNSTILE_COHORTS,
     // Sprout
     "sprout_nullifiers",
     "sprout_anchors",

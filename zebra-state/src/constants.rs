@@ -34,7 +34,7 @@ pub const STATE_DATABASE_KIND: &str = "state";
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 30;
+const DATABASE_FORMAT_VERSION: u64 = 32;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -45,6 +45,15 @@ const DATABASE_FORMAT_VERSION: u64 = 30;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 32.0.0: corrects Turnstile cohort dates, age windows, and maturity to use consensus
+///   median-time-past; classifies shielded sources exclusively by net pool debit; and removes
+///   spent output markers after their first-spend facts are aggregated. Existing v31 Turnstile
+///   records use incompatible semantics and must be synced again.
+/// - 31.0.0: adds mandatory, versioned incremental Turnstile output markers, daily cohorts, and
+///   exact mining analytics totals in daily snapshots. Historical eligible-output, first-spend,
+///   and accepted-work interval facts cannot be reconstructed by a bounded migration while blocks
+///   continue to finalize, so v30 databases require a fresh sync and are intentionally not
+///   restorable.
 /// - 30.0.0: adds a mandatory balance-ordered transparent-address index used to serve top-address
 ///   queries in O(K), with every delete/insert committed atomically with the finalized block. The
 ///   exact historical balance transitions needed to build this index safely are not available as

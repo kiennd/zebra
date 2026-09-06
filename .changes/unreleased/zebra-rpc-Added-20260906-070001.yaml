@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Added
+body: 'The new `getturnstiledata` RPC returns atomically finalized post-deshield output totals and bounded daily cohorts, including first-spend `shielding_observed` associations and mature 1/7/30-day windows.'
+time: 2026-09-06T07:00:01.000000000Z

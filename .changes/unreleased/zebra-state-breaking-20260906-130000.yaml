@@ -1,0 +1,4 @@
+project: zebra-state
+kind: breaking
+body: 'State database format 32 makes Turnstile cohort dates, age windows, and maturity use consensus median-time-past; classifies source pools by net debit; and deletes spent markers after aggregation. Existing format-31 explorer state must be synced again.'
+time: 2026-09-06T13:00:00.000000000Z

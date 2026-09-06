@@ -42,7 +42,8 @@ use crate::{
             transparent::{AddressBalanceLocation, AddressBalanceLocationUpdates, OutputLocation},
         },
         zebra_db::{
-            metrics::block_precommit_metrics, transparent::AddressBalanceIndexUpdates, ZebraDb,
+            metrics::block_precommit_metrics, transaction_facts::FinalizedTransactionFacts,
+            transparent::AddressBalanceIndexUpdates, ZebraDb,
         },
         FromDisk, RawBytes,
     },
@@ -482,6 +483,7 @@ impl ZebraDb {
             .enumerate()
             .map(|(index, hash)| (*hash, index))
             .collect();
+        let transaction_facts = FinalizedTransactionFacts::from_block(&finalized);
 
         // Get a list of the new UTXOs in the format we need for database updates.
         //
@@ -501,12 +503,9 @@ impl ZebraDb {
 
         // Get a list of the spent UTXOs, before we delete any from the database
         let spent_utxos: Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)> =
-            finalized
-                .block
-                .transactions
+            transaction_facts
                 .iter()
-                .flat_map(|tx| tx.inputs().into_iter())
-                .flat_map(|input| input.outpoint())
+                .flat_map(|facts| facts.transparent_input_outpoints.iter().copied())
                 .map(|outpoint| {
                     (
                         outpoint,
@@ -535,7 +534,6 @@ impl ZebraDb {
                 .collect();
 
         // TODO: Add `OutputLocation`s to the values in `spent_utxos_by_outpoint` to avoid creating a second hashmap with the same keys
-        #[cfg(feature = "indexer")]
         let out_loc_by_outpoint: HashMap<transparent::OutPoint, OutputLocation> = spent_utxos
             .iter()
             .map(|(outpoint, out_loc, _utxo)| (*outpoint, *out_loc))
@@ -619,10 +617,10 @@ impl ZebraDb {
             self,
             network,
             &finalized,
+            &transaction_facts,
             new_outputs_by_out_loc,
             spent_utxos_by_outpoint,
             spent_utxos_by_out_loc,
-            #[cfg(feature = "indexer")]
             out_loc_by_outpoint,
             address_balances,
             address_balance_index_updates,
@@ -733,6 +731,7 @@ fn transparent_address_balance_updates(
 
             (address, previous_balance, current_balance)
         })
+        .filter(|(_address, previous_balance, current_balance)| previous_balance != current_balance)
         .collect();
     let funded_count_delta = updates
         .iter()
@@ -842,15 +841,19 @@ mod funded_address_count_tests {
 
         // +1 for the new funded address, -1 for the emptied address, and zero for all other
         // transitions (positive-to-positive, same-block create/spend, and zero-valued output).
-        assert_eq!(
-            funded_transparent_address_count_delta(
-                &pre_block_balances,
-                &new_outputs,
-                &spent_outputs,
-                &network,
-            ),
-            0
+        let (funded_count_delta, balance_updates) = transparent_address_balance_updates(
+            &pre_block_balances,
+            &new_outputs,
+            &spent_outputs,
+            &network,
         );
+        assert_eq!(funded_count_delta, 0);
+        assert_eq!(balance_updates.len(), 2);
+        assert!(balance_updates
+            .iter()
+            .all(
+                |(_address, previous_balance, current_balance)| previous_balance != current_balance
+            ));
 
         assert_eq!(
             funded_transparent_address_count_delta(
@@ -887,18 +890,16 @@ impl DiskWriteBatch {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
-    pub fn prepare_block_batch(
+    fn prepare_block_batch(
         &mut self,
         zebra_db: &ZebraDb,
         network: &Network,
         finalized: &FinalizedBlock,
+        transaction_facts: &[FinalizedTransactionFacts],
         new_outputs_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
         spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo>,
         spent_utxos_by_out_loc: BTreeMap<OutputLocation, transparent::Utxo>,
-        #[cfg(feature = "indexer")] out_loc_by_outpoint: HashMap<
-            transparent::OutPoint,
-            OutputLocation,
-        >,
+        out_loc_by_outpoint: HashMap<transparent::OutPoint, OutputLocation>,
         address_balances: AddressBalanceLocationUpdates,
         address_balance_index_updates: AddressBalanceIndexUpdates,
         funded_transparent_address_count_delta: i64,
@@ -945,6 +946,16 @@ impl DiskWriteBatch {
             );
         }
 
+        // Persist deterministic post-deshield output facts and first-spend cohort updates in the
+        // same RocksDB batch as the finalized block. Input lookups reuse the already-resolved
+        // OutputLocation map built for the transparent spender index.
+        self.prepare_turnstile_batch(zebra_db, finalized, transaction_facts, &out_loc_by_outpoint)
+            .map_err(|error| {
+                CommitCheckpointVerifiedError::from(CommitBlockError::TurnstileIndex {
+                    reason: error.to_string(),
+                })
+            })?;
+
         // Commit UTXOs and value pools
         let (new_value_pool, block_size) = self.prepare_chain_value_pools_batch(
             zebra_db,
@@ -961,6 +972,7 @@ impl DiskWriteBatch {
                 zebra_db,
                 network,
                 finalized,
+                transaction_facts,
                 &spent_utxos_by_outpoint,
                 funded_transparent_address_count_delta,
                 new_value_pool,

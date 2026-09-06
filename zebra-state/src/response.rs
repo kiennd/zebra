@@ -684,6 +684,12 @@ pub enum ReadResponse {
         )>,
     },
 
+    /// Response to [`ReadRequest::TurnstileData`] with finalized, atomically anchored facts.
+    TurnstileData {
+        /// Complete query result, or `None` before the genesis accumulator has been initialized.
+        data: Option<crate::TurnstileData>,
+    },
+
     /// Response to [`ReadRequest::TransactionIdsByAddresses`]
     /// with the obtained transaction ids, in the order they appear in blocks.
     AddressesTransactionIds(BTreeMap<TransactionLocation, transaction::Hash>),
@@ -824,6 +830,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::TopAddressesByBalance { .. }
             | ReadResponse::HolderCountSnapshots { .. }
             | ReadResponse::SnapshotData { .. }
+            | ReadResponse::TurnstileData { .. }
             | ReadResponse::AddressesTransactionIds(_)
             | ReadResponse::AddressUtxos(_)
             | ReadResponse::ChainInfo(_)

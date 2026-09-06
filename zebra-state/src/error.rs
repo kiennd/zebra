@@ -120,6 +120,13 @@ pub enum CommitBlockError {
         reason: String,
     },
 
+    /// Local Turnstile facts could not be advanced atomically with the finalized block.
+    #[error("could not update the incremental turnstile index: {reason}")]
+    TurnstileIndex {
+        /// The index invariant or arithmetic error.
+        reason: String,
+    },
+
     /// The write task exited (likely during shutdown).
     #[error("block commit task exited. Is Zebra shutting down?")]
     #[non_exhaustive]

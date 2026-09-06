@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: 'Explorer nodes now use state database format 31 for complete Turnstile lifecycle analytics and exact historical mining intervals. Existing format-30 state is not reused and must be synced again.'
+time: 2026-09-06T07:00:02.000000000Z

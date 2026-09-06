@@ -118,6 +118,59 @@ pub struct DiskDbSnapshot<'a> {
 }
 
 impl DiskDbSnapshot<'_> {
+    /// Returns one typed value from this point-in-time snapshot.
+    pub fn zs_get<C, K, V>(&self, cf: &C, key: &K) -> Option<V>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        self.snapshot
+            .get_pinned_cf(cf, key.as_bytes())
+            .expect("unexpected database failure")
+            .map(V::from_bytes)
+    }
+
+    /// Returns typed entries in forward key order from this point-in-time snapshot.
+    pub fn zs_forward_range_iter<'a, C, K, V, R>(
+        &'a self,
+        cf: &'a C,
+        range: R,
+    ) -> impl Iterator<Item = (K, V)> + 'a
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk + FromDisk + 'a,
+        V: FromDisk + 'a,
+        R: RangeBounds<K> + 'a,
+    {
+        use std::ops::Bound::{self, *};
+
+        let map_to_vec = |bound: Bound<&K>| -> Bound<Vec<u8>> {
+            match bound {
+                Unbounded => Unbounded,
+                Included(value) => Included(value.as_bytes().as_ref().to_vec()),
+                Excluded(value) => Excluded(value.as_bytes().as_ref().to_vec()),
+            }
+        };
+        let byte_range = (
+            map_to_vec(range.start_bound()),
+            map_to_vec(range.end_bound()),
+        );
+        let mode = DiskDb::zs_iter_mode(&byte_range, false);
+        let options = DiskDb::zs_iter_opts(&byte_range);
+
+        self.snapshot
+            .iterator_cf_opt(cf, options, mode)
+            .map(|result| result.expect("unexpected database failure"))
+            .map(|(key, value)| (key.to_vec(), value))
+            .skip_while({
+                let byte_range = byte_range.clone();
+                move |(key, _)| !byte_range.contains(key)
+            })
+            .take_while(move |(key, _)| byte_range.contains(key))
+            .map(|(key, value)| (K::from_bytes(key), V::from_bytes(value)))
+    }
+
     /// Returns all entries in `cf` in reverse key order from this snapshot.
     pub fn zs_reverse_iter<'a, C, K, V>(&'a self, cf: &'a C) -> impl Iterator<Item = (K, V)> + 'a
     where
@@ -792,6 +845,29 @@ impl DiskDb {
         R: RangeBounds<K>,
     {
         self.zs_range_iter_with_direction(cf, range, false)
+    }
+
+    /// Returns values for `keys` using one RocksDB batched multi-get operation.
+    ///
+    /// Results preserve key order and contain `None` for keys which are not present.
+    ///
+    /// If `sorted_input` is true, `keys` must be sorted by their serialized byte representation.
+    pub fn zs_multi_get<C, K, V>(&self, cf: &C, keys: &[K], sorted_input: bool) -> Vec<Option<V>>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        let key_bytes: Vec<_> = keys.iter().map(IntoDisk::as_bytes).collect();
+        self.db
+            .batched_multi_get_cf(cf, &key_bytes, sorted_input)
+            .into_iter()
+            .map(|result| {
+                result
+                    .expect("unexpected database failure")
+                    .map(V::from_bytes)
+            })
+            .collect()
     }
 
     /// Returns a reverse iterator over the items in `cf` in `range`.

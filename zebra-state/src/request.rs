@@ -1535,6 +1535,22 @@ pub enum ReadRequest {
         limit: usize,
     },
 
+    /// Returns finalized post-deshield output totals and bounded daily cohorts.
+    ///
+    /// Cohorts are sorted by UTC creation date and source pool. All-time summaries are independent
+    /// of the requested date page. A missing `source_pool` returns separate records for every
+    /// source classification.
+    TurnstileData {
+        /// Optional inclusive start date as `(year, month, day)`.
+        start_date: Option<(u8, u8, u8)>,
+        /// Optional inclusive end date as `(year, month, day)`.
+        end_date: Option<(u8, u8, u8)>,
+        /// Maximum cohort records to return, with a complete-date allowance of at most five.
+        limit: usize,
+        /// Optional source-pool filter.
+        source_pool: Option<crate::TurnstileSourcePool>,
+    },
+
     /// Looks up transaction hashes that were sent or received from addresses,
     /// in an inclusive blockchain height range.
     ///
@@ -1651,6 +1667,12 @@ impl ReadRequest {
     /// Maximum number of snapshot records returned by a public request.
     pub const MAX_SNAPSHOT_DATA_RESULTS: usize = 10_000;
 
+    /// Maximum number of Turnstile cohort records returned by a public request.
+    ///
+    /// There are at most six rows per UTC day, so this bound permits the complete chain history in
+    /// one atomically anchored response for many decades.
+    pub const MAX_TURNSTILE_COHORT_RESULTS: usize = 100_000;
+
     /// Maximum number of recent block summaries returned by a public request.
     pub const MAX_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 100;
 
@@ -1700,6 +1722,7 @@ impl ReadRequest {
             ReadRequest::HolderCountSnapshots { .. } => "holder_count_snapshots",
             ReadRequest::SnapshotData { .. } => "snapshot_data",
             ReadRequest::SnapshotDataByDateRange { .. } => "snapshot_data_by_date_range",
+            ReadRequest::TurnstileData { .. } => "turnstile_data",
             ReadRequest::TransactionIdsByAddresses { .. } => "transaction_ids_by_addresses",
             ReadRequest::UtxosByAddresses { .. } => "utxos_by_addresses",
             ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {

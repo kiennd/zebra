@@ -4,9 +4,10 @@ pub mod shielded;
 
 pub use shielded::{
     fake_bundle_for_branch, fake_orchard_bundle, fake_orchard_bundle_duplicate_nullifiers,
-    fake_orchard_bundle_with_note, fake_v6_transaction, insert_fake_orchard_shielded_data,
-    outputs_enabled_flags, v6_ironwood_flags_offset, v6_orchard_flags_offset,
-    with_garbage_orchard_authorization, with_orchard_flags, with_orchard_value_balance,
+    fake_orchard_bundle_with_note, fake_v6_transaction, fake_zip318_transaction,
+    insert_fake_orchard_shielded_data, outputs_enabled_flags, v6_ironwood_flags_offset,
+    v6_orchard_flags_offset, with_garbage_orchard_authorization, with_orchard_flags,
+    with_orchard_value_balance,
 };
 
 use std::{cmp::max, collections::HashMap, ops::Neg, sync::Arc};

@@ -67,7 +67,9 @@ pub use service::{
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
-    OutputLocation, ReadState, State, TransactionIndex, TransactionLocation,
+    OutputLocation, ReadState, State, TransactionIndex, TransactionLocation, TurnstileCohort,
+    TurnstileData, TurnstileSourcePool, TurnstileStats, TurnstileValue, TurnstileWindow,
+    TURNSTILE_CLASSIFICATION_VERSION,
 };
 
 // Allow use in the scanner and external tests

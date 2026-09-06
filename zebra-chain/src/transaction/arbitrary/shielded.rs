@@ -332,6 +332,70 @@ pub fn fake_v6_transaction(
     )
 }
 
+/// Builds a structurally valid transaction matching the current public ZIP-318 Draft shape.
+///
+/// The transaction has two Orchard actions with spends and outputs enabled, one output-only
+/// Ironwood action, no transparent or Sapling bundle, the requested Ironwood denomination, the
+/// ZIP-317 conventional fee, zero lock time, and the supplied expiry height. Its proofs and
+/// signatures remain fake, like the other builders in this module. `seed_index` deterministically
+/// selects a disjoint three-seed range, so transactions built with distinct indices do not share
+/// fake nullifiers.
+pub fn fake_zip318_transaction(
+    denomination_zat: u64,
+    expiry_height: crate::block::Height,
+    seed_index: u64,
+) -> crate::transaction::Transaction {
+    let denomination_zat = i64::try_from(denomination_zat)
+        .expect("the ZIP-318 denomination must fit in a signed Zcash amount");
+    let first_action_seed = seed_index
+        .checked_mul(3)
+        .and_then(|offset| 0x3180_u64.checked_add(offset))
+        .expect("the ZIP-318 fake transaction seed index must fit in its action-seed range");
+    let ironwood_action_seed = first_action_seed
+        .checked_add(2)
+        .expect("the ZIP-318 fake transaction action-seed range must fit in u64");
+
+    let build = |orchard_value_balance: i64| {
+        let orchard = fake_orchard_bundle(
+            Flags::CROSS_ADDRESS_DISABLED,
+            ZatBalance::from_i64(orchard_value_balance)
+                .expect("the Orchard value balance must be valid"),
+            2,
+            first_action_seed,
+            BundleVersion::orchard_v3(),
+        );
+        let ironwood = fake_orchard_bundle(
+            Flags::SPENDS_DISABLED,
+            ZatBalance::from_i64(-denomination_zat)
+                .expect("the Ironwood value balance must be valid"),
+            1,
+            ironwood_action_seed,
+            BundleVersion::ironwood_v3(),
+        );
+
+        crate::transaction::Transaction::test_v6_with_bundles(
+            crate::parameters::NetworkUpgrade::Nu6_3,
+            Vec::new(),
+            Vec::new(),
+            crate::transaction::LockTime::unlocked(),
+            expiry_height,
+            Some(orchard),
+            Some(ironwood),
+        )
+    };
+
+    let provisional = build(denomination_zat);
+    let conventional_fee = i64::try_from(u64::from(crate::transaction::zip317::conventional_fee(
+        &provisional,
+    )))
+    .expect("the conventional fee fits in a signed Zcash amount");
+    let orchard_value_balance = denomination_zat
+        .checked_add(conventional_fee)
+        .expect("the denomination plus conventional fee must be valid");
+
+    build(orchard_value_balance)
+}
+
 /// Returns a copy of `tx` whose Orchard bundle carries `value_balance`.
 ///
 /// The bundle is owned by `zcash_primitives` and cannot be mutated in place, so this rebuilds
@@ -538,5 +602,42 @@ mod tests {
                 "bundles from different seeds must not collide"
             );
         }
+    }
+
+    /// ZIP-318-shaped test transactions need deterministic contents without accidentally looking
+    /// like double spends when several of them are placed in one block or mempool.
+    #[test]
+    fn fake_zip318_transactions_have_deterministic_disjoint_nullifiers() {
+        let expiry_height = crate::block::Height(3_490_560);
+        let first = fake_zip318_transaction(1_000_000, expiry_height, 0);
+        let first_again = fake_zip318_transaction(1_000_000, expiry_height, 0);
+        let second = fake_zip318_transaction(1_000_000, expiry_height, 1);
+
+        let nullifiers = |transaction: &Transaction| {
+            let mut nullifiers = transaction
+                .orchard_actions()
+                .map(|action| action.nullifier().to_bytes())
+                .collect::<Vec<_>>();
+            nullifiers.extend(
+                transaction
+                    .ironwood_actions()
+                    .map(|action| action.nullifier().to_bytes()),
+            );
+            nullifiers
+        };
+
+        assert_eq!(first.hash(), first_again.hash());
+        let first_nullifiers = nullifiers(&first);
+        let second_nullifiers = nullifiers(&second);
+        assert_eq!(first_nullifiers.len(), 3);
+        assert_eq!(second_nullifiers.len(), 3);
+
+        let mut unique_first_nullifiers = first_nullifiers.clone();
+        unique_first_nullifiers.sort_unstable();
+        unique_first_nullifiers.dedup();
+        assert_eq!(unique_first_nullifiers.len(), first_nullifiers.len());
+        assert!(first_nullifiers
+            .iter()
+            .all(|nullifier| !second_nullifiers.contains(nullifier)));
     }
 }

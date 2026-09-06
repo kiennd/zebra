@@ -147,6 +147,8 @@ pub(super) const PARAM_VERBOSE_DESC: &str =
     "Boolean flag to indicate verbosity, true for a json object, false for hex encoded data.";
 pub(super) const PARAM_POOL_DESC: &str =
     "The pool from which subtrees should be returned: \"sapling\", \"orchard\", or \"ironwood\".";
+pub(super) const PARAM_SOURCE_POOL_DESC: &str =
+    "Optional Turnstile source pool: sprout, sapling, orchard, ironwood, mixed, or all.";
 pub(super) const PARAM_START_INDEX_DESC: &str =
     "The index of the first 2^16-leaf subtree to return.";
 pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of items to return.";
@@ -184,6 +186,7 @@ pub(super) const PARAM_INCLUDE_MEMPOOL_DESC: &str =
 const DEFAULT_TOP_ADDRESSES_RESULTS: usize = 10;
 const DEFAULT_SNAPSHOT_DATA_RESULTS: usize = 100;
 const DEFAULT_DASHBOARD_DATA_RESULTS: usize = ReadRequest::MAX_SNAPSHOT_DATA_RESULTS;
+const DEFAULT_TURNSTILE_COHORT_RESULTS: usize = ReadRequest::MAX_TURNSTILE_COHORT_RESULTS;
 const DEFAULT_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 10;
 const DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS: usize = 25;
 const STALE_EXPLORER_CURSOR_CODE: i32 = -32010;
@@ -795,6 +798,36 @@ pub trait Rpc {
         end_date: Option<String>,
         limit: Option<usize>,
     ) -> Result<GetDashboardDataResponse>;
+
+    /// Returns deterministic finalized-chain facts for eligible post-deshield transparent outputs.
+    ///
+    /// An eligible transaction is non-coinbase, has no transparent inputs, has at least one
+    /// positive transparent output, and has an observable positive net debit from at least one
+    /// shielded pool. Every positive transparent output in that transaction is indexed.
+    ///
+    /// `shielding_observed` means only that an eligible output's first spending transaction
+    /// contains an observable shielded-pool credit. Values always sum the original transparent
+    /// outputs; they are not attributed shielded-credit amounts.
+    ///
+    /// method: post
+    /// tags: blockchain
+    ///
+    /// # Parameters
+    ///
+    /// - `start_date`: (string, optional) Inclusive UTC creation date in `YY:MM:DD` format.
+    /// - `end_date`: (string, optional) Inclusive UTC creation date in `YY:MM:DD` format.
+    /// - `limit`: (number, optional, default=100000, maximum=100000) Cohort row bound. Pages never
+    ///   split one date and can exceed a smaller limit by at most four rows.
+    /// - `source_pool`: (string, optional) `sprout`, `sapling`, `orchard`, `ironwood`, or `mixed`.
+    ///   Omit it or use `all` to return separate rows for every source.
+    #[method(name = "getturnstiledata")]
+    async fn get_turnstile_data(
+        &self,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<usize>,
+        source_pool: Option<String>,
+    ) -> Result<GetTurnstileDataResponse>;
 
     /// Decodes a serialized transaction and returns its public structure and ZIP-317 fee analysis.
     ///
@@ -2064,6 +2097,8 @@ where
             .into_iter()
             .map(|(date_key, snapshot_data)| {
                 let pool_values = snapshot_data.pool_values();
+                let mining = snapshot_data.mining_interval();
+                let ironwood = snapshot_data.ironwood_observatory_interval();
                 SnapshotDataEntry {
                     date_key: format!(
                         "{:02}:{:02}:{:02}",
@@ -2103,6 +2138,67 @@ where
                     average_block_time: snapshot_data.average_block_time(),
                     average_block_fee_zat: snapshot_data.average_block_fee_zat(),
                     average_block_size: snapshot_data.average_block_size(),
+                    interval_block_count: mining.map(|value| value.block_count()),
+                    interval_transaction_count: mining.map(|value| value.transaction_count()),
+                    interval_empty_block_count: mining.map(|value| value.empty_block_count()),
+                    interval_min_header_timestamp: mining.map(|value| value.min_header_timestamp()),
+                    interval_max_header_timestamp: mining.map(|value| value.max_header_timestamp()),
+                    interval_elapsed_header_time_seconds: mining
+                        .map(|value| value.elapsed_header_time_seconds()),
+                    interval_accepted_work: mining.map(|value| value.accepted_work().to_string()),
+                    interval_total_fees_zat: mining.map(|value| value.total_fees_zat().to_string()),
+                    interval_total_block_size_bytes: mining
+                        .map(|value| value.total_block_size_bytes()),
+                    interval_total_subsidy_zat: mining
+                        .map(|value| value.total_subsidy_zat().to_string()),
+                    interval_miner_subsidy_zat: mining
+                        .map(|value| value.miner_subsidy_zat().to_string()),
+                    interval_founders_reward_zat: mining
+                        .map(|value| value.founders_reward_zat().to_string()),
+                    interval_funding_streams_zat: mining
+                        .map(|value| value.funding_streams_zat().to_string()),
+                    interval_deferred_subsidy_zat: mining
+                        .map(|value| value.deferred_subsidy_zat().to_string()),
+                    interval_lockbox_disbursement_zat: mining
+                        .map(|value| value.lockbox_disbursement_zat().to_string()),
+                    coinbase_output_transparent_zat: mining
+                        .map(|value| value.coinbase_output_transparent_zat().to_string()),
+                    coinbase_output_sapling_zat: mining
+                        .map(|value| value.coinbase_output_sapling_zat().to_string()),
+                    coinbase_output_orchard_zat: mining
+                        .map(|value| value.coinbase_output_orchard_zat().to_string()),
+                    coinbase_output_ironwood_zat: mining
+                        .map(|value| value.coinbase_output_ironwood_zat().to_string()),
+                    coinbase_unclaimed_zat: mining
+                        .map(|value| value.coinbase_unclaimed_zat().to_string()),
+                    interval_v6_transaction_count: ironwood
+                        .map(|value| value.v6_transaction_count()),
+                    interval_ironwood_bundle_transaction_count: ironwood
+                        .map(|value| value.ironwood_bundle_transaction_count()),
+                    interval_orchard_bundle_transaction_count: ironwood
+                        .map(|value| value.orchard_bundle_transaction_count()),
+                    interval_orchard_ironwood_transaction_count: ironwood
+                        .map(|value| value.orchard_ironwood_transaction_count()),
+                    interval_orchard_action_count: ironwood
+                        .map(|value| value.orchard_action_count()),
+                    interval_ironwood_action_count: ironwood
+                        .map(|value| value.ironwood_action_count()),
+                    interval_ironwood_active_block_count: ironwood
+                        .map(|value| value.ironwood_active_block_count()),
+                    interval_observable_orchard_to_ironwood_transaction_count: ironwood
+                        .map(|value| value.observable_orchard_to_ironwood_transaction_count()),
+                    interval_observable_orchard_to_ironwood_value_zat: ironwood
+                        .map(|value| value.observable_orchard_to_ironwood_value_zat().to_string()),
+                    interval_zip318_action_shape_transaction_count: ironwood
+                        .map(|value| value.zip318_action_shape_transaction_count()),
+                    interval_zip318_denomination_transaction_count: ironwood
+                        .map(|value| value.zip318_denomination_transaction_count()),
+                    interval_zip318_fee_transaction_count: ironwood
+                        .map(|value| value.zip318_fee_transaction_count()),
+                    interval_zip318_schedule_transaction_count: ironwood
+                        .map(|value| value.zip318_schedule_transaction_count()),
+                    interval_ironwood_canonical_denomination_counts: ironwood
+                        .map(|value| value.ironwood_denomination_counts().into_iter().collect()),
                 }
             })
             .collect();
@@ -2110,6 +2206,89 @@ where
         Ok(GetDashboardDataResponse {
             entries,
             next_start_date,
+        })
+    }
+
+    async fn get_turnstile_data(
+        &self,
+        start_date: Option<String>,
+        end_date: Option<String>,
+        limit: Option<usize>,
+        source_pool: Option<String>,
+    ) -> Result<GetTurnstileDataResponse> {
+        let limit = validated_paginated_rpc_limit(
+            limit,
+            DEFAULT_TURNSTILE_COHORT_RESULTS,
+            ReadRequest::MAX_TURNSTILE_COHORT_RESULTS,
+        )
+        .map_err(invalid_params)?;
+        let start_date_tuple = start_date
+            .as_deref()
+            .map(parse_snapshot_date)
+            .transpose()
+            .map_err(|error| invalid_params(format!("invalid start_date: {error}")))?;
+        let end_date_tuple = end_date
+            .as_deref()
+            .map(parse_snapshot_date)
+            .transpose()
+            .map_err(|error| invalid_params(format!("invalid end_date: {error}")))?;
+        validate_snapshot_date_range(start_date_tuple, end_date_tuple).map_err(invalid_params)?;
+
+        let source_pool = match source_pool.as_deref() {
+            None | Some("all") => None,
+            Some(source_pool) => Some(
+                source_pool
+                    .parse::<zebra_state::TurnstileSourcePool>()
+                    .map_err(invalid_params)?,
+            ),
+        };
+        let response = self
+            .read_state
+            .clone()
+            .oneshot(ReadRequest::TurnstileData {
+                start_date: start_date_tuple,
+                end_date: end_date_tuple,
+                limit,
+                source_pool,
+            })
+            .await
+            .map_misc_error()?;
+        let data = match response {
+            ReadResponse::TurnstileData { data: Some(data) } => data,
+            ReadResponse::TurnstileData { data: None } => {
+                return Err(ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    "turnstile index is not initialized at genesis".to_string(),
+                    None::<()>,
+                ));
+            }
+            _ => {
+                return Err(ErrorObject::owned(
+                    ErrorCode::InternalError.code(),
+                    "Unexpected response type".to_string(),
+                    None::<()>,
+                ));
+            }
+        };
+
+        Ok(GetTurnstileDataResponse {
+            classification_version: data.classification_version,
+            as_of_height: data.as_of_height.0,
+            as_of_hash: data.as_of_hash.to_string(),
+            as_of_timestamp: data.as_of_timestamp,
+            maturity_timestamp: data.maturity_timestamp,
+            coverage_start_timestamp: data.coverage_start_timestamp,
+            summaries: data
+                .summaries
+                .into_iter()
+                .map(TurnstileStatsEntry::from)
+                .collect(),
+            cohorts: data
+                .cohorts
+                .into_iter()
+                .map(TurnstileCohortEntry::from)
+                .collect(),
+            next_start_date: data.next_start_date.map(|date| date.to_string()),
         })
     }
 
@@ -2132,46 +2311,123 @@ where
             zebra_state::ReadResponse::SnapshotData { snapshots } => Ok(GetSnapshotDataResponse {
                 snapshots: snapshots
                     .into_iter()
-                    .map(|(date_key, snapshot_data)| SnapshotDataEntry {
-                        date_key: format!(
-                            "{:02}:{:02}:{:02}",
-                            date_key.year, date_key.month, date_key.day
-                        ),
-                        height: snapshot_data.block_height(),
-                        funded_transparent_address_count: snapshot_data
-                            .funded_transparent_address_count(),
-                        pool_transparent: snapshot_data.pool_values().transparent_amount(),
-                        pool_sprout: snapshot_data.pool_values().sprout_amount(),
-                        pool_sapling: snapshot_data.pool_values().sapling_amount(),
-                        pool_orchard: snapshot_data.pool_values().orchard_amount(),
-                        pool_deferred: snapshot_data.pool_values().deferred_amount(),
-                        pool_ironwood: snapshot_data.pool_values().ironwood_amount(),
-                        difficulty: snapshot_data.work_difficulty(),
-                        total_issuance: snapshot_data.total_issuance(),
-                        inflation_rate_percent: snapshot_data.inflation_rate_percent(),
-                        block_timestamp: snapshot_data.block_timestamp(),
-                        transparent_tx_count: snapshot_data.transparent_tx_count(),
-                        transparent_coinbase_tx_count: snapshot_data
-                            .transparent_coinbase_tx_count(),
-                        shielded_coinbase_migration_tx_count: snapshot_data
-                            .shielded_coinbase_migration_tx_count(),
-                        sprout_tx_count: snapshot_data.sprout_tx_count(),
-                        sapling_tx_count: snapshot_data.sapling_tx_count(),
-                        orchard_tx_count: snapshot_data.orchard_tx_count(),
-                        ironwood_tx_count: snapshot_data.ironwood_tx_count(),
-                        transparent_inflow: snapshot_data.transparent_inflow(),
-                        transparent_outflow: snapshot_data.transparent_outflow(),
-                        sprout_inflow: snapshot_data.sprout_inflow(),
-                        sprout_outflow: snapshot_data.sprout_outflow(),
-                        sapling_inflow: snapshot_data.sapling_inflow(),
-                        sapling_outflow: snapshot_data.sapling_outflow(),
-                        orchard_inflow: snapshot_data.orchard_inflow(),
-                        orchard_outflow: snapshot_data.orchard_outflow(),
-                        ironwood_inflow: snapshot_data.ironwood_inflow(),
-                        ironwood_outflow: snapshot_data.ironwood_outflow(),
-                        average_block_time: snapshot_data.average_block_time(),
-                        average_block_fee_zat: snapshot_data.average_block_fee_zat(),
-                        average_block_size: snapshot_data.average_block_size(),
+                    .map(|(date_key, snapshot_data)| {
+                        let mining = snapshot_data.mining_interval();
+                        let ironwood = snapshot_data.ironwood_observatory_interval();
+                        SnapshotDataEntry {
+                            date_key: format!(
+                                "{:02}:{:02}:{:02}",
+                                date_key.year, date_key.month, date_key.day
+                            ),
+                            height: snapshot_data.block_height(),
+                            funded_transparent_address_count: snapshot_data
+                                .funded_transparent_address_count(),
+                            pool_transparent: snapshot_data.pool_values().transparent_amount(),
+                            pool_sprout: snapshot_data.pool_values().sprout_amount(),
+                            pool_sapling: snapshot_data.pool_values().sapling_amount(),
+                            pool_orchard: snapshot_data.pool_values().orchard_amount(),
+                            pool_deferred: snapshot_data.pool_values().deferred_amount(),
+                            pool_ironwood: snapshot_data.pool_values().ironwood_amount(),
+                            difficulty: snapshot_data.work_difficulty(),
+                            total_issuance: snapshot_data.total_issuance(),
+                            inflation_rate_percent: snapshot_data.inflation_rate_percent(),
+                            block_timestamp: snapshot_data.block_timestamp(),
+                            transparent_tx_count: snapshot_data.transparent_tx_count(),
+                            transparent_coinbase_tx_count: snapshot_data
+                                .transparent_coinbase_tx_count(),
+                            shielded_coinbase_migration_tx_count: snapshot_data
+                                .shielded_coinbase_migration_tx_count(),
+                            sprout_tx_count: snapshot_data.sprout_tx_count(),
+                            sapling_tx_count: snapshot_data.sapling_tx_count(),
+                            orchard_tx_count: snapshot_data.orchard_tx_count(),
+                            ironwood_tx_count: snapshot_data.ironwood_tx_count(),
+                            transparent_inflow: snapshot_data.transparent_inflow(),
+                            transparent_outflow: snapshot_data.transparent_outflow(),
+                            sprout_inflow: snapshot_data.sprout_inflow(),
+                            sprout_outflow: snapshot_data.sprout_outflow(),
+                            sapling_inflow: snapshot_data.sapling_inflow(),
+                            sapling_outflow: snapshot_data.sapling_outflow(),
+                            orchard_inflow: snapshot_data.orchard_inflow(),
+                            orchard_outflow: snapshot_data.orchard_outflow(),
+                            ironwood_inflow: snapshot_data.ironwood_inflow(),
+                            ironwood_outflow: snapshot_data.ironwood_outflow(),
+                            average_block_time: snapshot_data.average_block_time(),
+                            average_block_fee_zat: snapshot_data.average_block_fee_zat(),
+                            average_block_size: snapshot_data.average_block_size(),
+                            interval_block_count: mining.map(|value| value.block_count()),
+                            interval_transaction_count: mining
+                                .map(|value| value.transaction_count()),
+                            interval_empty_block_count: mining
+                                .map(|value| value.empty_block_count()),
+                            interval_min_header_timestamp: mining
+                                .map(|value| value.min_header_timestamp()),
+                            interval_max_header_timestamp: mining
+                                .map(|value| value.max_header_timestamp()),
+                            interval_elapsed_header_time_seconds: mining
+                                .map(|value| value.elapsed_header_time_seconds()),
+                            interval_accepted_work: mining
+                                .map(|value| value.accepted_work().to_string()),
+                            interval_total_fees_zat: mining
+                                .map(|value| value.total_fees_zat().to_string()),
+                            interval_total_block_size_bytes: mining
+                                .map(|value| value.total_block_size_bytes()),
+                            interval_total_subsidy_zat: mining
+                                .map(|value| value.total_subsidy_zat().to_string()),
+                            interval_miner_subsidy_zat: mining
+                                .map(|value| value.miner_subsidy_zat().to_string()),
+                            interval_founders_reward_zat: mining
+                                .map(|value| value.founders_reward_zat().to_string()),
+                            interval_funding_streams_zat: mining
+                                .map(|value| value.funding_streams_zat().to_string()),
+                            interval_deferred_subsidy_zat: mining
+                                .map(|value| value.deferred_subsidy_zat().to_string()),
+                            interval_lockbox_disbursement_zat: mining
+                                .map(|value| value.lockbox_disbursement_zat().to_string()),
+                            coinbase_output_transparent_zat: mining
+                                .map(|value| value.coinbase_output_transparent_zat().to_string()),
+                            coinbase_output_sapling_zat: mining
+                                .map(|value| value.coinbase_output_sapling_zat().to_string()),
+                            coinbase_output_orchard_zat: mining
+                                .map(|value| value.coinbase_output_orchard_zat().to_string()),
+                            coinbase_output_ironwood_zat: mining
+                                .map(|value| value.coinbase_output_ironwood_zat().to_string()),
+                            coinbase_unclaimed_zat: mining
+                                .map(|value| value.coinbase_unclaimed_zat().to_string()),
+                            interval_v6_transaction_count: ironwood
+                                .map(|value| value.v6_transaction_count()),
+                            interval_ironwood_bundle_transaction_count: ironwood
+                                .map(|value| value.ironwood_bundle_transaction_count()),
+                            interval_orchard_bundle_transaction_count: ironwood
+                                .map(|value| value.orchard_bundle_transaction_count()),
+                            interval_orchard_ironwood_transaction_count: ironwood
+                                .map(|value| value.orchard_ironwood_transaction_count()),
+                            interval_orchard_action_count: ironwood
+                                .map(|value| value.orchard_action_count()),
+                            interval_ironwood_action_count: ironwood
+                                .map(|value| value.ironwood_action_count()),
+                            interval_ironwood_active_block_count: ironwood
+                                .map(|value| value.ironwood_active_block_count()),
+                            interval_observable_orchard_to_ironwood_transaction_count: ironwood
+                                .map(|value| {
+                                    value.observable_orchard_to_ironwood_transaction_count()
+                                }),
+                            interval_observable_orchard_to_ironwood_value_zat: ironwood.map(
+                                |value| {
+                                    value.observable_orchard_to_ironwood_value_zat().to_string()
+                                },
+                            ),
+                            interval_zip318_action_shape_transaction_count: ironwood
+                                .map(|value| value.zip318_action_shape_transaction_count()),
+                            interval_zip318_denomination_transaction_count: ironwood
+                                .map(|value| value.zip318_denomination_transaction_count()),
+                            interval_zip318_fee_transaction_count: ironwood
+                                .map(|value| value.zip318_fee_transaction_count()),
+                            interval_zip318_schedule_transaction_count: ironwood
+                                .map(|value| value.zip318_schedule_transaction_count()),
+                            interval_ironwood_canonical_denomination_counts: ironwood.map(
+                                |value| value.ironwood_denomination_counts().into_iter().collect(),
+                            ),
+                        }
                     })
                     .collect(),
             }),
@@ -5801,6 +6057,163 @@ pub struct SnapshotDataEntry {
     /// Average block size in bytes (from previous snapshot to this snapshot).
     #[getter(copy)]
     pub average_block_size: u32,
+    /// Number of accepted canonical blocks in this snapshot interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_block_count: Option<u64>,
+    /// Number of transactions, including coinbase, in this snapshot interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_transaction_count: Option<u64>,
+    /// Number of blocks with no non-coinbase transactions in this snapshot interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_empty_block_count: Option<u64>,
+    /// Minimum committed header timestamp used by the interval solution-rate estimator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_min_header_timestamp: Option<i64>,
+    /// Maximum committed header timestamp used by the interval solution-rate estimator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_max_header_timestamp: Option<i64>,
+    /// Difference between the interval's maximum and minimum committed header timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_elapsed_header_time_seconds: Option<u64>,
+    /// Exact accepted proof-of-work sum, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_accepted_work: Option<String>,
+    /// Exact transaction fees in zatoshis, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_total_fees_zat: Option<String>,
+    /// Total serialized block bytes in this snapshot interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_total_block_size_bytes: Option<u64>,
+    /// Scheduled block subsidy in zatoshis, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_total_subsidy_zat: Option<String>,
+    /// Scheduled miner subsidy, excluding fees, in zatoshis as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_miner_subsidy_zat: Option<String>,
+    /// Pre-Canopy Founder Reward in zatoshis, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_founders_reward_zat: Option<String>,
+    /// Direct non-deferred funding streams in zatoshis, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_funding_streams_zat: Option<String>,
+    /// New subsidy routed into the deferred pool, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_deferred_subsidy_zat: Option<String>,
+    /// One-time outputs released from the existing deferred pool, as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_lockbox_disbursement_zat: Option<String>,
+    /// All transparent coinbase outputs, including protocol recipients, as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub coinbase_output_transparent_zat: Option<String>,
+    /// All Sapling coinbase output value, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub coinbase_output_sapling_zat: Option<String>,
+    /// All Orchard coinbase output value, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub coinbase_output_orchard_zat: Option<String>,
+    /// All Ironwood coinbase output value, encoded as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub coinbase_output_ironwood_zat: Option<String>,
+    /// Consensus-permitted coinbase value left unclaimed in outputs, as a decimal string.
+    ///
+    /// This historical pre-NU6 remainder is not necessarily miner allocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub coinbase_unclaimed_zat: Option<String>,
+    /// Accepted v6 transactions in this interval, independent of primary classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_v6_transaction_count: Option<u64>,
+    /// Transactions containing a non-empty Ironwood bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_ironwood_bundle_transaction_count: Option<u64>,
+    /// Transactions containing a non-empty Orchard bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_orchard_bundle_transaction_count: Option<u64>,
+    /// Transactions containing both Orchard and Ironwood bundles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_orchard_ironwood_transaction_count: Option<u64>,
+    /// Public Orchard action descriptions in this interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_orchard_action_count: Option<u64>,
+    /// Public Ironwood action descriptions in this interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_ironwood_action_count: Option<u64>,
+    /// Blocks containing at least one non-empty Ironwood bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_ironwood_active_block_count: Option<u64>,
+    /// Direct, unambiguous observable Orchard-to-Ironwood crossings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_observable_orchard_to_ironwood_transaction_count: Option<u64>,
+    /// Exact public Ironwood credit in direct Orchard-to-Ironwood crossings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_observable_orchard_to_ironwood_value_zat: Option<String>,
+    /// Cumulative ZIP-318 funnel stage: version, bundles, actions, and public flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_zip318_action_shape_transaction_count: Option<u64>,
+    /// Cumulative ZIP-318 funnel stage: canonical draft denomination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_zip318_denomination_transaction_count: Option<u64>,
+    /// Cumulative ZIP-318 funnel stage: exact ZIP-317 conventional fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_zip318_fee_transaction_count: Option<u64>,
+    /// Cumulative ZIP-318 funnel stage: zero lock time and bucketed expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    #[getter(copy)]
+    pub interval_zip318_schedule_transaction_count: Option<u64>,
+    /// Counts for the 19 current draft denominations, ordered from 0.01 to 10,000 ZEC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub interval_ironwood_canonical_denomination_counts: Option<Vec<u64>>,
 }
 
 /// Response to [`RpcServer::get_snapshot_data`] RPC method.
@@ -5819,6 +6232,176 @@ pub struct GetDashboardDataResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[new(default)]
     pub next_start_date: Option<String>,
+}
+
+/// A lossless count/value pair in a Turnstile response.
+///
+/// Both fields are decimal strings because cumulative lifecycle volume can exceed JavaScript's
+/// exact integer range even though every individual Zcash amount is consensus-bounded.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct TurnstileValueEntry {
+    /// Number of eligible outputs, encoded as an unsigned decimal string.
+    pub count: String,
+    /// Sum of original eligible output values in zatoshis, as an unsigned decimal string.
+    pub value_zat: String,
+}
+
+impl From<zebra_state::TurnstileValue> for TurnstileValueEntry {
+    fn from(value: zebra_state::TurnstileValue) -> Self {
+        Self {
+            count: value.count.to_string(),
+            value_zat: value.value_zat.to_string(),
+        }
+    }
+}
+
+/// All-time current Turnstile totals for one source-pool classification.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct TurnstileStatsEntry {
+    /// Stable lowercase source-pool name.
+    pub source_pool: String,
+    /// Every eligible output indexed through the finalized anchor.
+    pub eligible: TurnstileValueEntry,
+    /// Eligible outputs first-spent through the finalized anchor.
+    pub spent: TurnstileValueEntry,
+    /// Eligible outputs still unspent at the finalized anchor.
+    pub unspent: TurnstileValueEntry,
+    /// First-spent outputs whose spending transaction contains a shielded-pool credit.
+    pub shielding_observed: TurnstileValueEntry,
+}
+
+impl From<zebra_state::TurnstileStats> for TurnstileStatsEntry {
+    fn from(stats: zebra_state::TurnstileStats) -> Self {
+        Self {
+            source_pool: stats.source_pool.to_string(),
+            eligible: stats.eligible.into(),
+            spent: stats.spent.into(),
+            unspent: stats.unspent.into(),
+            shielding_observed: stats.shielding_observed.into(),
+        }
+    }
+}
+
+/// First-spend facts observed inside a fixed cohort-age window.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct TurnstileWindowEntry {
+    /// Outputs first-spent inside the window.
+    pub spent: TurnstileValueEntry,
+    /// Outputs first-spent inside the window with shielding observed.
+    pub shielding_observed: TurnstileValueEntry,
+}
+
+impl From<zebra_state::TurnstileWindow> for TurnstileWindowEntry {
+    fn from(window: zebra_state::TurnstileWindow) -> Self {
+        Self {
+            spent: window.spent.into(),
+            shielding_observed: window.shielding_observed.into(),
+        }
+    }
+}
+
+/// One daily, per-source Turnstile cohort.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct TurnstileCohortEntry {
+    /// UTC creation date in `YY:MM:DD` format.
+    pub date_key: String,
+    /// Stable lowercase source-pool name.
+    pub source_pool: String,
+    /// Every eligible output created in the cohort.
+    pub eligible: TurnstileValueEntry,
+    /// Cohort outputs which have been first-spent.
+    pub spent: TurnstileValueEntry,
+    /// First-spent outputs whose spending transaction contains a shielded-pool credit.
+    pub shielding_observed: TurnstileValueEntry,
+    /// One-day window; omitted until the complete UTC cohort is mature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_1d: Option<TurnstileWindowEntry>,
+    /// Seven-day window; omitted until the complete UTC cohort is mature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_7d: Option<TurnstileWindowEntry>,
+    /// Thirty-day window; omitted until the complete UTC cohort is mature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within_30d: Option<TurnstileWindowEntry>,
+}
+
+impl From<zebra_state::TurnstileCohort> for TurnstileCohortEntry {
+    fn from(cohort: zebra_state::TurnstileCohort) -> Self {
+        Self {
+            date_key: cohort.date_key.to_string(),
+            source_pool: cohort.source_pool.to_string(),
+            eligible: cohort.eligible.into(),
+            spent: cohort.spent.into(),
+            shielding_observed: cohort.shielding_observed.into(),
+            within_1d: cohort.within_1d.map(Into::into),
+            within_7d: cohort.within_7d.map(Into::into),
+            within_30d: cohort.within_30d.map(Into::into),
+        }
+    }
+}
+
+/// Response to [`RpcServer::get_turnstile_data`].
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters)]
+pub struct GetTurnstileDataResponse {
+    /// Deterministic classifier/schema version.
+    #[getter(copy)]
+    pub classification_version: u32,
+    /// Exact finalized height anchoring every returned field.
+    #[getter(copy)]
+    pub as_of_height: u32,
+    /// Canonical hash at `as_of_height`.
+    pub as_of_hash: String,
+    /// Header timestamp at `as_of_height`.
+    #[getter(copy)]
+    pub as_of_timestamp: i64,
+    /// Consensus median-time-past for the next block, used to decide cohort maturity.
+    #[getter(copy)]
+    pub maturity_timestamp: i64,
+    /// Genesis chain timestamp defining complete indexed coverage, including zero days.
+    #[getter(copy)]
+    pub coverage_start_timestamp: i64,
+    /// All-time current totals, independent of the requested date range or page.
+    pub summaries: Vec<TurnstileStatsEntry>,
+    /// Bounded cohort records, sorted by creation date and source pool.
+    pub cohorts: Vec<TurnstileCohortEntry>,
+    /// First wholly unreturned date, or absent when this response contains the full range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_start_date: Option<String>,
+}
+
+#[cfg(test)]
+mod turnstile_response_tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_values_serialize_losslessly_as_decimal_strings() {
+        let entry = TurnstileValueEntry {
+            count: u64::MAX.to_string(),
+            value_zat: u64::MAX.to_string(),
+        };
+        let json = serde_json::to_value(entry).expect("turnstile values must serialize");
+        assert_eq!(json["count"], u64::MAX.to_string());
+        assert_eq!(json["value_zat"], u64::MAX.to_string());
+        assert!(json["count"].is_string());
+        assert!(json["value_zat"].is_string());
+    }
+
+    #[test]
+    fn immature_windows_are_omitted() {
+        let entry = TurnstileCohortEntry {
+            date_key: "24:01:01".to_string(),
+            source_pool: "orchard".to_string(),
+            eligible: zebra_state::TurnstileValue::default().into(),
+            spent: zebra_state::TurnstileValue::default().into(),
+            shielding_observed: zebra_state::TurnstileValue::default().into(),
+            within_1d: None,
+            within_7d: None,
+            within_30d: None,
+        };
+        let json = serde_json::to_value(entry).expect("turnstile cohort must serialize");
+        assert!(json.get("within_1d").is_none());
+        assert!(json.get("within_7d").is_none());
+        assert!(json.get("within_30d").is_none());
+    }
 }
 
 #[cfg(test)]
@@ -5864,10 +6447,48 @@ mod snapshot_data_entry_ironwood_tests {
             average_block_time: 13.5,
             average_block_fee_zat: zero,
             average_block_size: 14,
+            interval_block_count: Some(15),
+            interval_transaction_count: Some(16),
+            interval_empty_block_count: Some(17),
+            interval_min_header_timestamp: Some(18),
+            interval_max_header_timestamp: Some(19),
+            interval_elapsed_header_time_seconds: Some(1),
+            interval_accepted_work: Some("20".to_string()),
+            interval_total_fees_zat: Some("21".to_string()),
+            interval_total_block_size_bytes: Some(22),
+            interval_total_subsidy_zat: Some("23".to_string()),
+            interval_miner_subsidy_zat: Some("24".to_string()),
+            interval_founders_reward_zat: Some("25".to_string()),
+            interval_funding_streams_zat: Some("26".to_string()),
+            interval_deferred_subsidy_zat: Some("27".to_string()),
+            interval_lockbox_disbursement_zat: Some("28".to_string()),
+            coinbase_output_transparent_zat: Some("29".to_string()),
+            coinbase_output_sapling_zat: Some("30".to_string()),
+            coinbase_output_orchard_zat: Some("31".to_string()),
+            coinbase_output_ironwood_zat: Some("32".to_string()),
+            coinbase_unclaimed_zat: Some("33".to_string()),
+            interval_v6_transaction_count: Some(34),
+            interval_ironwood_bundle_transaction_count: Some(35),
+            interval_orchard_bundle_transaction_count: Some(36),
+            interval_orchard_ironwood_transaction_count: Some(37),
+            interval_orchard_action_count: Some(38),
+            interval_ironwood_action_count: Some(39),
+            interval_ironwood_active_block_count: Some(40),
+            interval_observable_orchard_to_ironwood_transaction_count: Some(41),
+            interval_observable_orchard_to_ironwood_value_zat: Some("42".to_string()),
+            interval_zip318_action_shape_transaction_count: Some(43),
+            interval_zip318_denomination_transaction_count: Some(44),
+            interval_zip318_fee_transaction_count: Some(45),
+            interval_zip318_schedule_transaction_count: Some(46),
+            interval_ironwood_canonical_denomination_counts: Some(vec![47; 19]),
         };
 
         let mut json = serde_json::to_value(&entry).expect("snapshot entry must serialize");
         assert_eq!(json["funded_transparent_address_count"], 2);
+        assert_eq!(json["interval_accepted_work"], "20");
+        assert_eq!(json["interval_total_fees_zat"], "21");
+        assert_eq!(json["interval_lockbox_disbursement_zat"], "28");
+        assert_eq!(json["coinbase_output_transparent_zat"], "29");
         assert!(json.get("holder_count").is_none());
 
         let round_trip: SnapshotDataEntry =
@@ -5894,6 +6515,26 @@ mod snapshot_data_entry_ironwood_tests {
             "ironwood_tx_count",
             "ironwood_inflow",
             "ironwood_outflow",
+            "interval_block_count",
+            "interval_transaction_count",
+            "interval_empty_block_count",
+            "interval_min_header_timestamp",
+            "interval_max_header_timestamp",
+            "interval_elapsed_header_time_seconds",
+            "interval_accepted_work",
+            "interval_total_fees_zat",
+            "interval_total_block_size_bytes",
+            "interval_total_subsidy_zat",
+            "interval_miner_subsidy_zat",
+            "interval_founders_reward_zat",
+            "interval_funding_streams_zat",
+            "interval_deferred_subsidy_zat",
+            "interval_lockbox_disbursement_zat",
+            "coinbase_output_transparent_zat",
+            "coinbase_output_sapling_zat",
+            "coinbase_output_orchard_zat",
+            "coinbase_output_ironwood_zat",
+            "coinbase_unclaimed_zat",
         ] {
             assert!(object.remove(field).is_some(), "missing {field} JSON field");
         }
@@ -5904,6 +6545,9 @@ mod snapshot_data_entry_ironwood_tests {
         assert_eq!(legacy.ironwood_tx_count, 0);
         assert_eq!(legacy.ironwood_inflow, 0);
         assert_eq!(legacy.ironwood_outflow, 0);
+        assert_eq!(legacy.interval_block_count, None);
+        assert_eq!(legacy.interval_accepted_work, None);
+        assert_eq!(legacy.coinbase_output_transparent_zat, None);
     }
 
     #[test]

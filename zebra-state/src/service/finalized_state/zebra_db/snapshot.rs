@@ -18,7 +18,9 @@ use zebra_chain::{
     amount::{Amount, NonNegative},
     block::Height,
     parameters::{
-        subsidy::{block_subsidy, halving, height_for_halving},
+        subsidy::{
+            block_subsidy, founders_reward, funding_stream_values, halving, height_for_halving,
+        },
         Network, NetworkUpgrade,
     },
     transparent,
@@ -35,7 +37,7 @@ use crate::{
     BoxError, FromDisk, IntoDisk,
 };
 
-use super::super::TypedColumnFamily;
+use super::{super::TypedColumnFamily, transaction_facts::FinalizedTransactionFacts};
 
 /// The name of the snapshot data by date column family.
 /// Stores funded transparent address count, pool values, difficulty, issuance, inflation rate,
@@ -51,7 +53,7 @@ pub const SNAPSHOT_DATA_BY_DATE: &str = "snapshot_data_by_date";
 pub const REALTIME_SNAPSHOT_DATA: &str = "realtime_snapshot_data";
 
 /// The version of the persistent incremental snapshot accumulator format.
-const SNAPSHOT_ACCUMULATOR_VERSION: u32 = 1;
+const SNAPSHOT_ACCUMULATOR_VERSION: u32 = 3;
 
 /// The number of mutually-exclusive transaction classes stored in the accumulator.
 const SNAPSHOT_TRANSACTION_CLASS_COUNT: usize = 7;
@@ -59,16 +61,135 @@ const SNAPSHOT_TRANSACTION_CLASS_COUNT: usize = 7;
 /// The number of directional pool flows stored in the accumulator.
 const SNAPSHOT_POOL_FLOW_COUNT: usize = 10;
 
+/// Independent Ironwood counters. These overlap intentionally and must not be confused with the
+/// mutually-exclusive primary transaction classes above.
+const SNAPSHOT_IRONWOOD_COUNTER_COUNT: usize = 12;
+const IRONWOOD_V6_TX_INDEX: usize = 0;
+const IRONWOOD_BUNDLE_TX_INDEX: usize = 1;
+const ORCHARD_BUNDLE_TX_INDEX: usize = 2;
+const ORCHARD_IRONWOOD_TX_INDEX: usize = 3;
+const ORCHARD_ACTION_INDEX: usize = 4;
+const IRONWOOD_ACTION_INDEX: usize = 5;
+const IRONWOOD_ACTIVE_BLOCK_INDEX: usize = 6;
+const OBSERVABLE_ORCHARD_TO_IRONWOOD_TX_INDEX: usize = 7;
+const ZIP318_ACTION_SHAPE_TX_INDEX: usize = 8;
+const ZIP318_DENOMINATION_TX_INDEX: usize = 9;
+const ZIP318_FEE_TX_INDEX: usize = 10;
+const ZIP318_SCHEDULE_TX_INDEX: usize = 11;
+
+/// The current ZIP-318 Draft expiry bucket: 30 days at the 75-second target spacing.
+const ZIP318_EXPIRY_MODULUS: u32 = 34_560;
+
+/// The current ZIP-318 Draft anchor-height bucket: about three hours at the 75-second target
+/// spacing.
+const ZIP318_ANCHOR_MODULUS: u32 = 144;
+
+/// ZIP-318's current draft denomination set, in zatoshis: 1/2/5 times powers of ten from 0.01 to
+/// 10,000 ZEC. This is explicitly versioned in API methodology because ZIP-318 remains a draft.
+const IRONWOOD_CANONICAL_DENOMINATIONS_ZAT: [u64; 19] = [
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    50_000_000,
+    100_000_000,
+    200_000_000,
+    500_000_000,
+    1_000_000_000,
+    2_000_000_000,
+    5_000_000_000,
+    10_000_000_000,
+    20_000_000_000,
+    50_000_000_000,
+    100_000_000_000,
+    200_000_000_000,
+    500_000_000_000,
+    1_000_000_000_000,
+];
+
+/// Returns true when the public locktime and expiry fields are compatible with the current
+/// ZIP-318 Draft schedule at the transaction's inclusion height.
+///
+/// The scheduled broadcast height is private wallet state, so chain data cannot prove the exact
+/// schedule formula. But it can reject expired values and expiry buckets whose possible scheduled
+/// heights do not overlap the public inclusion height and ZIP-318's network-wide schedule floor.
+fn has_zip318_schedule_shape(
+    network: &Network,
+    inclusion_height: Height,
+    raw_lock_time: u32,
+    expiry_height: Option<u32>,
+) -> bool {
+    let (Some(expiry_height), Some(activation_height)) = (
+        expiry_height,
+        NetworkUpgrade::Nu6_3.activation_height(network),
+    ) else {
+        return false;
+    };
+    let inclusion_height = inclusion_height.0;
+
+    // ZIP-318 lower-bounds the schedule's running height at one complete anchor bucket after the
+    // first anchor boundary strictly above NU6.3 activation. A funding note created later can
+    // only raise this bound, so this is the earliest schedule height observable chain-wide.
+    let earliest_schedule_height = (activation_height.0 / ZIP318_ANCHOR_MODULUS)
+        .checked_add(2)
+        .and_then(|bucket| bucket.checked_mul(ZIP318_ANCHOR_MODULUS));
+
+    // For a canonical expiry E, its possible private scheduled height S is in
+    // [E - 2 * EXPIRY_MODULUS, E - EXPIRY_MODULUS - 1]. The transaction is compatible only when
+    // that interval intersects [earliest_schedule_height, inclusion_height].
+    let scheduled_height_range = expiry_height
+        .checked_sub(2 * ZIP318_EXPIRY_MODULUS)
+        .and_then(|start| {
+            expiry_height
+                .checked_sub(ZIP318_EXPIRY_MODULUS + 1)
+                .map(|end| (start, end))
+        });
+
+    raw_lock_time == 0
+        && expiry_height % ZIP318_EXPIRY_MODULUS == 0
+        && expiry_height >= inclusion_height
+        && earliest_schedule_height
+            .zip(scheduled_height_range)
+            .is_some_and(|(earliest, (scheduled_start, scheduled_end))| {
+                inclusion_height >= earliest
+                    && scheduled_start <= inclusion_height
+                    && scheduled_end >= earliest
+            })
+}
+
 /// The encoded byte length of [`SnapshotMetricTotals`].
-const SNAPSHOT_METRIC_TOTALS_LEN: usize =
-    SNAPSHOT_TRANSACTION_CLASS_COUNT * 8 + SNAPSHOT_POOL_FLOW_COUNT * 16 + 16 + 8 + 8;
+const SNAPSHOT_METRIC_TOTALS_LEN: usize = SNAPSHOT_TRANSACTION_CLASS_COUNT * 8
+    + SNAPSHOT_POOL_FLOW_COUNT * 16
+    + SNAPSHOT_IRONWOOD_COUNTER_COUNT * 8
+    + IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len() * 8
+    + 16
+    + 16
+    + 8
+    + 8
+    + 8
+    + 8
+    + 16
+    + 6 * 16
+    + 5 * 16;
+
+/// The encoded byte length of the two active header-time ranges.
+const SNAPSHOT_TIME_RANGES_LEN: usize = 4 * 8;
 
 /// The encoded byte length of [`SnapshotMetricAnchor`].
 const SNAPSHOT_METRIC_ANCHOR_LEN: usize = 1 + 4 + 8 + SNAPSHOT_METRIC_TOTALS_LEN;
 
 /// The encoded byte length of [`SnapshotAccumulator`].
-const SNAPSHOT_ACCUMULATOR_LEN: usize =
-    4 + 4 + 8 + 48 + 8 + 8 + 8 + SNAPSHOT_METRIC_TOTALS_LEN + 2 * SNAPSHOT_METRIC_ANCHOR_LEN;
+const SNAPSHOT_ACCUMULATOR_LEN: usize = 4
+    + 4
+    + 8
+    + 48
+    + 8
+    + 8
+    + 8
+    + SNAPSHOT_METRIC_TOTALS_LEN
+    + SNAPSHOT_TIME_RANGES_LEN
+    + 2 * SNAPSHOT_METRIC_ANCHOR_LEN;
 
 const TRANSPARENT_TX_INDEX: usize = 0;
 const TRANSPARENT_COINBASE_TX_INDEX: usize = 1;
@@ -261,15 +382,34 @@ pub(crate) enum SnapshotAccumulatorError {
 struct SnapshotMetricTotals {
     transaction_counts: [u64; SNAPSHOT_TRANSACTION_CLASS_COUNT],
     pool_flows: [u128; SNAPSHOT_POOL_FLOW_COUNT],
+    ironwood_counts: [u64; SNAPSHOT_IRONWOOD_COUNTER_COUNT],
+    ironwood_denomination_counts: [u64; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()],
+    observable_orchard_to_ironwood_value_zat: u128,
     total_fees_zat: u128,
     total_block_size: u64,
     block_count: u64,
+    transaction_count: u64,
+    empty_block_count: u64,
+    accepted_work: u128,
+    total_subsidy_zat: u128,
+    miner_subsidy_zat: u128,
+    founders_reward_zat: u128,
+    funding_streams_zat: u128,
+    deferred_subsidy_zat: u128,
+    lockbox_disbursement_zat: u128,
+    coinbase_output_transparent_zat: u128,
+    coinbase_output_sapling_zat: u128,
+    coinbase_output_orchard_zat: u128,
+    coinbase_output_ironwood_zat: u128,
+    coinbase_unclaimed_zat: u128,
 }
 
 impl SnapshotMetricTotals {
     fn from_block(
-        finalized: &FinalizedBlock,
+        transaction_facts: &[FinalizedTransactionFacts],
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        network: &Network,
+        block_height: Height,
         block_size: u32,
     ) -> Result<Self, SnapshotAccumulatorError> {
         fn add_count(
@@ -297,6 +437,18 @@ impl SnapshotMetricTotals {
             Ok(())
         }
 
+        fn add_ironwood_count(
+            totals: &mut SnapshotMetricTotals,
+            index: usize,
+            value: u64,
+            metric: &'static str,
+        ) -> Result<(), SnapshotAccumulatorError> {
+            totals.ironwood_counts[index] = totals.ironwood_counts[index]
+                .checked_add(value)
+                .ok_or(SnapshotAccumulatorError::Arithmetic { metric })?;
+            Ok(())
+        }
+
         fn add_signed_pool_flow(
             totals: &mut SnapshotMetricTotals,
             value_zat: i64,
@@ -320,66 +472,106 @@ impl SnapshotMetricTotals {
         let mut totals = Self {
             total_block_size: u64::from(block_size),
             block_count: 1,
+            transaction_count: u64::try_from(transaction_facts.len()).map_err(|_| {
+                SnapshotAccumulatorError::Arithmetic {
+                    metric: "per-block transaction count",
+                }
+            })?,
+            empty_block_count: u64::from(transaction_facts.len() <= 1),
             ..Self::default()
         };
+        totals.ironwood_counts[IRONWOOD_ACTIVE_BLOCK_INDEX] = u64::from(
+            transaction_facts
+                .iter()
+                .any(|facts| facts.ironwood_action_count > 0),
+        );
 
-        for transaction in &finalized.block.transactions {
-            let is_coinbase = transaction.is_coinbase();
-            let has_transparent =
-                transaction.has_transparent_inputs() || transaction.has_transparent_outputs();
-            let has_sprout = transaction.has_sprout_joinsplit_data();
-            let has_sapling = transaction.has_sapling_shielded_data();
-            let has_orchard = transaction.has_orchard_shielded_data();
-            let has_ironwood = transaction.has_ironwood_shielded_data();
-            let has_shielded_outputs = transaction.has_shielded_outputs();
+        for facts in transaction_facts {
+            let has_transparent = facts.has_transparent_inputs || facts.has_transparent_outputs();
             let mut spends_coinbase_output = false;
             let mut transparent_input_zat = 0i128;
             let mut transparent_output_zat = 0i128;
             let mut sprout_inflow_zat = 0i128;
             let mut sprout_outflow_zat = 0i128;
 
+            add_ironwood_count(
+                &mut totals,
+                IRONWOOD_V6_TX_INDEX,
+                u64::from(facts.is_v6),
+                "v6 transaction count",
+            )?;
+            add_ironwood_count(
+                &mut totals,
+                IRONWOOD_BUNDLE_TX_INDEX,
+                u64::from(facts.ironwood_action_count > 0),
+                "Ironwood bundle transaction count",
+            )?;
+            add_ironwood_count(
+                &mut totals,
+                ORCHARD_BUNDLE_TX_INDEX,
+                u64::from(facts.orchard_action_count > 0),
+                "Orchard bundle transaction count",
+            )?;
+            add_ironwood_count(
+                &mut totals,
+                ORCHARD_IRONWOOD_TX_INDEX,
+                u64::from(facts.orchard_action_count > 0 && facts.ironwood_action_count > 0),
+                "Orchard and Ironwood transaction count",
+            )?;
+            add_ironwood_count(
+                &mut totals,
+                ORCHARD_ACTION_INDEX,
+                u64::from(facts.orchard_action_count),
+                "Orchard action count",
+            )?;
+            add_ironwood_count(
+                &mut totals,
+                IRONWOOD_ACTION_INDEX,
+                u64::from(facts.ironwood_action_count),
+                "Ironwood action count",
+            )?;
+
             // The verifier already resolved every spent output, including same-block spends. Use
             // that map for flows, migration classification, and fees rather than reading old
             // transactions back from RocksDB.
-            for input in transaction.inputs() {
-                if let Some(outpoint) = input.outpoint() {
-                    let utxo = spent_utxos
-                        .get(&outpoint)
-                        .ok_or(SnapshotAccumulatorError::MissingSpentUtxo { outpoint })?;
-                    add_flow(
-                        &mut totals,
-                        TRANSPARENT_OUTFLOW_INDEX,
-                        utxo.output.value().zatoshis() as u128,
-                    )?;
-                    transparent_input_zat = transparent_input_zat
-                        .checked_add(i128::from(utxo.output.value().zatoshis()))
-                        .ok_or(SnapshotAccumulatorError::Arithmetic {
-                            metric: "transparent input value",
-                        })?;
-                    spends_coinbase_output |= utxo.from_coinbase;
-                }
+            for outpoint in &facts.transparent_input_outpoints {
+                let utxo = spent_utxos.get(outpoint).ok_or(
+                    SnapshotAccumulatorError::MissingSpentUtxo {
+                        outpoint: *outpoint,
+                    },
+                )?;
+                add_flow(
+                    &mut totals,
+                    TRANSPARENT_OUTFLOW_INDEX,
+                    utxo.output.value().zatoshis() as u128,
+                )?;
+                transparent_input_zat = transparent_input_zat
+                    .checked_add(i128::from(utxo.output.value().zatoshis()))
+                    .ok_or(SnapshotAccumulatorError::Arithmetic {
+                        metric: "transparent input value",
+                    })?;
+                spends_coinbase_output |= utxo.from_coinbase;
             }
 
             // These classes are intentionally exclusive and ordered from most-specific to
             // least-specific, so their sum never exceeds the transaction count.
-            if !is_coinbase && spends_coinbase_output && has_shielded_outputs {
+            if !facts.is_coinbase && spends_coinbase_output && facts.has_shielded_outputs {
                 add_count(&mut totals, SHIELDED_COINBASE_MIGRATION_TX_INDEX)?;
-            } else if has_ironwood {
+            } else if facts.has_ironwood {
                 add_count(&mut totals, IRONWOOD_TX_INDEX)?;
-            } else if has_orchard {
+            } else if facts.has_orchard {
                 add_count(&mut totals, ORCHARD_TX_INDEX)?;
-            } else if has_sapling {
+            } else if facts.has_sapling {
                 add_count(&mut totals, SAPLING_TX_INDEX)?;
-            } else if has_sprout {
+            } else if facts.has_sprout {
                 add_count(&mut totals, SPROUT_TX_INDEX)?;
-            } else if is_coinbase {
+            } else if facts.is_coinbase {
                 add_count(&mut totals, TRANSPARENT_COINBASE_TX_INDEX)?;
             } else if has_transparent {
                 add_count(&mut totals, TRANSPARENT_TX_INDEX)?;
             }
 
-            for output in transaction.outputs() {
-                let value_zat = output.value().zatoshis();
+            for value_zat in facts.transparent_output_values_zat.iter().copied() {
                 add_flow(&mut totals, TRANSPARENT_INFLOW_INDEX, value_zat as u128)?;
                 transparent_output_zat = transparent_output_zat
                     .checked_add(i128::from(value_zat))
@@ -389,7 +581,7 @@ impl SnapshotMetricTotals {
             }
 
             // Sprout vpub_old enters the shielded pool and vpub_new leaves it.
-            for vpub_old_zat in transaction.output_values_to_sprout() {
+            for vpub_old_zat in facts.sprout_inflow_values_zat.iter().copied() {
                 let vpub_old = Amount::<NonNegative>::try_from(vpub_old_zat).map_err(|error| {
                     SnapshotAccumulatorError::InvalidValue {
                         metric: "Sprout inflow",
@@ -407,7 +599,7 @@ impl SnapshotMetricTotals {
                         metric: "Sprout inflow value",
                     })?;
             }
-            for vpub_new_zat in transaction.input_values_from_sprout() {
+            for vpub_new_zat in facts.sprout_outflow_values_zat.iter().copied() {
                 let vpub_new = Amount::<NonNegative>::try_from(vpub_new_zat).map_err(|error| {
                     SnapshotAccumulatorError::InvalidValue {
                         metric: "Sprout outflow",
@@ -426,18 +618,9 @@ impl SnapshotMetricTotals {
                     })?;
             }
 
-            let sapling_value_zat = transaction
-                .sapling_value_balance()
-                .sapling_amount()
-                .zatoshis();
-            let orchard_value_zat = transaction
-                .orchard_value_balance()
-                .orchard_amount()
-                .zatoshis();
-            let ironwood_value_zat = transaction
-                .ironwood_value_balance()
-                .ironwood_amount()
-                .zatoshis();
+            let sapling_value_zat = facts.sapling_value_balance_zat;
+            let orchard_value_zat = facts.orchard_value_balance_zat;
+            let ironwood_value_zat = facts.ironwood_value_balance_zat;
             add_signed_pool_flow(
                 &mut totals,
                 sapling_value_zat,
@@ -457,7 +640,7 @@ impl SnapshotMetricTotals {
                 IRONWOOD_OUTFLOW_INDEX,
             )?;
 
-            if !is_coinbase {
+            if !facts.is_coinbase {
                 // Consensus fee formula, using values already visited for flows above:
                 // transparent inputs - outputs + Sprout vpub_new - vpub_old + each modern
                 // shielded value balance. Semantically verified transactions cannot be negative.
@@ -482,10 +665,252 @@ impl SnapshotMetricTotals {
                         metric: "per-block fees",
                     },
                 )?;
+
+                // A direct crossing has a single publicly observable net source (Orchard) and
+                // destination (Ironwood). This does not identify a wallet, user, or intent.
+                let is_observable_orchard_to_ironwood = facts.orchard_action_count > 0
+                    && facts.ironwood_action_count > 0
+                    && orchard_value_zat > 0
+                    && ironwood_value_zat < 0
+                    && !has_transparent
+                    && !facts.has_sprout
+                    && !facts.has_sapling;
+                if is_observable_orchard_to_ironwood {
+                    add_ironwood_count(
+                        &mut totals,
+                        OBSERVABLE_ORCHARD_TO_IRONWOOD_TX_INDEX,
+                        1,
+                        "observable Orchard-to-Ironwood transaction count",
+                    )?;
+                    let ironwood_credit_zat = ironwood_value_zat.unsigned_abs();
+                    totals.observable_orchard_to_ironwood_value_zat = totals
+                        .observable_orchard_to_ironwood_value_zat
+                        .checked_add(u128::from(ironwood_credit_zat))
+                        .ok_or(SnapshotAccumulatorError::Arithmetic {
+                            metric: "observable Orchard-to-Ironwood value",
+                        })?;
+
+                    // These are cumulative public-field checks from ZIP-318 Draft. Anchor-root
+                    // membership is intentionally not claimed here, so the API exposes these as
+                    // individual funnel stages rather than a binary compliance result.
+                    let has_action_shape = facts.is_v6
+                        && facts.orchard_action_count == 2
+                        && facts.ironwood_action_count == 1
+                        && facts.orchard_spends_enabled
+                        && facts.orchard_outputs_enabled
+                        && !facts.ironwood_spends_enabled
+                        && facts.ironwood_outputs_enabled;
+                    if has_action_shape {
+                        add_ironwood_count(
+                            &mut totals,
+                            ZIP318_ACTION_SHAPE_TX_INDEX,
+                            1,
+                            "ZIP-318 action-shape transaction count",
+                        )?;
+
+                        if let Some(denomination_index) = IRONWOOD_CANONICAL_DENOMINATIONS_ZAT
+                            .iter()
+                            .position(|denomination| *denomination == ironwood_credit_zat)
+                        {
+                            add_ironwood_count(
+                                &mut totals,
+                                ZIP318_DENOMINATION_TX_INDEX,
+                                1,
+                                "ZIP-318 denomination transaction count",
+                            )?;
+                            totals.ironwood_denomination_counts[denomination_index] = totals
+                                .ironwood_denomination_counts[denomination_index]
+                                .checked_add(1)
+                                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                                    metric: "Ironwood denomination count",
+                                })?;
+
+                            if fee_zat == i128::from(facts.conventional_fee_zat) {
+                                add_ironwood_count(
+                                    &mut totals,
+                                    ZIP318_FEE_TX_INDEX,
+                                    1,
+                                    "ZIP-318 conventional-fee transaction count",
+                                )?;
+
+                                let has_schedule_shape = has_zip318_schedule_shape(
+                                    network,
+                                    block_height,
+                                    facts.raw_lock_time,
+                                    facts.expiry_height,
+                                );
+                                if has_schedule_shape {
+                                    add_ironwood_count(
+                                        &mut totals,
+                                        ZIP318_SCHEDULE_TX_INDEX,
+                                        1,
+                                        "ZIP-318 schedule-shape transaction count",
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
         Ok(totals)
+    }
+
+    /// Adds deterministic proof-of-work, subsidy, and coinbase output-route facts for one block.
+    ///
+    /// Output routes use aggregate coinbase value balances, not recipient heuristics. They include
+    /// every coinbase recipient, including consensus funding recipients.
+    fn add_mining_accounting(
+        &mut self,
+        finalized: &FinalizedBlock,
+        network: &Network,
+        subsidy: Amount<NonNegative>,
+        block_fees: Amount<NonNegative>,
+    ) -> Result<(), SnapshotAccumulatorError> {
+        fn shielded_coinbase_credit(
+            value_balance_zat: i64,
+            pool: &'static str,
+        ) -> Result<u128, SnapshotAccumulatorError> {
+            if value_balance_zat > 0 {
+                return Err(SnapshotAccumulatorError::InvalidValue {
+                    metric: "coinbase output route",
+                    reason: format!(
+                        "verified coinbase withdraws {value_balance_zat} zatoshis from {pool}"
+                    ),
+                });
+            }
+
+            Ok(u128::from(value_balance_zat.unsigned_abs()))
+        }
+
+        let height = finalized.height;
+        let work = finalized
+            .block
+            .header
+            .difficulty_threshold
+            .to_work()
+            .ok_or(SnapshotAccumulatorError::InvalidDifficulty { height })?
+            .as_u128();
+        let founder_reward = founders_reward(network, height);
+        let funding_stream_values =
+            funding_stream_values(height, network, subsidy).map_err(|error| {
+                SnapshotAccumulatorError::InvalidValue {
+                    metric: "funding streams",
+                    reason: error.to_string(),
+                }
+            })?;
+        let mut direct_funding_streams_zat = 0u128;
+        let mut deferred_subsidy_zat = 0u128;
+        for (receiver, value) in funding_stream_values {
+            let value = u128::from(value.zatoshis() as u64);
+            if receiver.is_deferred() {
+                deferred_subsidy_zat = deferred_subsidy_zat.checked_add(value).ok_or(
+                    SnapshotAccumulatorError::Arithmetic {
+                        metric: "deferred subsidy",
+                    },
+                )?;
+            } else {
+                direct_funding_streams_zat = direct_funding_streams_zat.checked_add(value).ok_or(
+                    SnapshotAccumulatorError::Arithmetic {
+                        metric: "direct funding streams",
+                    },
+                )?;
+            }
+        }
+
+        let subsidy_zat = u128::from(subsidy.zatoshis() as u64);
+        let founders_reward_zat = u128::from(founder_reward.zatoshis() as u64);
+        let protocol_subsidy_zat = founders_reward_zat
+            .checked_add(direct_funding_streams_zat)
+            .and_then(|value| value.checked_add(deferred_subsidy_zat))
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "subsidy composition",
+            })?;
+        let miner_subsidy_zat = subsidy_zat.checked_sub(protocol_subsidy_zat).ok_or(
+            SnapshotAccumulatorError::InvalidValue {
+                metric: "subsidy composition",
+                reason: format!(
+                    "protocol subsidy {protocol_subsidy_zat} exceeds total subsidy {subsidy_zat}"
+                ),
+            },
+        )?;
+
+        let (transparent_output_zat, sapling_output_zat, orchard_output_zat, ironwood_output_zat) =
+            if let Some(coinbase) = finalized.block.transactions.first() {
+                let transparent_output_zat =
+                    coinbase.outputs().iter().try_fold(0u128, |total, output| {
+                        total
+                            .checked_add(u128::from(output.value().zatoshis() as u64))
+                            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                                metric: "coinbase transparent outputs",
+                            })
+                    })?;
+                (
+                    transparent_output_zat,
+                    shielded_coinbase_credit(
+                        coinbase.sapling_value_balance().sapling_amount().zatoshis(),
+                        "Sapling",
+                    )?,
+                    shielded_coinbase_credit(
+                        coinbase.orchard_value_balance().orchard_amount().zatoshis(),
+                        "Orchard",
+                    )?,
+                    shielded_coinbase_credit(
+                        coinbase
+                            .ironwood_value_balance()
+                            .ironwood_amount()
+                            .zatoshis(),
+                        "Ironwood",
+                    )?,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
+
+        let observed_coinbase_output_zat = transparent_output_zat
+            .checked_add(sapling_output_zat)
+            .and_then(|value| value.checked_add(orchard_output_zat))
+            .and_then(|value| value.checked_add(ironwood_output_zat))
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "observed coinbase output",
+            })?;
+        // Deferred contributions are not transaction outputs. Conversely, a one-time lockbox
+        // disbursement is an output funded by the existing deferred pool, not new subsidy.
+        // Any remainder after subtracting every observed coinbase output is permitted coinbase
+        // input value that was not claimed in an output; it is not necessarily miner allocation.
+        let lockbox_disbursement_zat =
+            u128::from(network.lockbox_disbursement_total_amount(height).zatoshis() as u64);
+        let allowed_coinbase_output_zat = subsidy_zat
+            .checked_sub(deferred_subsidy_zat)
+            .and_then(|value| value.checked_add(u128::from(block_fees.zatoshis() as u64)))
+            .and_then(|value| value.checked_add(lockbox_disbursement_zat))
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "allowed coinbase output",
+            })?;
+        let unclaimed_zat = allowed_coinbase_output_zat
+            .checked_sub(observed_coinbase_output_zat)
+            .ok_or(SnapshotAccumulatorError::InvalidValue {
+                metric: "coinbase output",
+                reason: format!(
+                    "observed coinbase output {observed_coinbase_output_zat} exceeds allowed output {allowed_coinbase_output_zat}"
+                ),
+            })?;
+
+        self.accepted_work = work;
+        self.total_subsidy_zat = subsidy_zat;
+        self.miner_subsidy_zat = miner_subsidy_zat;
+        self.founders_reward_zat = founders_reward_zat;
+        self.funding_streams_zat = direct_funding_streams_zat;
+        self.deferred_subsidy_zat = deferred_subsidy_zat;
+        self.lockbox_disbursement_zat = lockbox_disbursement_zat;
+        self.coinbase_output_transparent_zat = transparent_output_zat;
+        self.coinbase_output_sapling_zat = sapling_output_zat;
+        self.coinbase_output_orchard_zat = orchard_output_zat;
+        self.coinbase_output_ironwood_zat = ironwood_output_zat;
+        self.coinbase_unclaimed_zat = unclaimed_zat;
+
+        Ok(())
     }
 
     fn checked_add_assign(
@@ -512,6 +937,33 @@ impl SnapshotMetricTotals {
                 })?;
         }
 
+        for (total, value) in self.ironwood_counts.iter_mut().zip(block.ironwood_counts) {
+            *total = total
+                .checked_add(value)
+                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                    metric: "Ironwood observatory count",
+                })?;
+        }
+
+        for (total, value) in self
+            .ironwood_denomination_counts
+            .iter_mut()
+            .zip(block.ironwood_denomination_counts)
+        {
+            *total = total
+                .checked_add(value)
+                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                    metric: "Ironwood denomination count",
+                })?;
+        }
+
+        self.observable_orchard_to_ironwood_value_zat = self
+            .observable_orchard_to_ironwood_value_zat
+            .checked_add(block.observable_orchard_to_ironwood_value_zat)
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "observable Orchard-to-Ironwood value",
+            })?;
+
         self.total_fees_zat = self
             .total_fees_zat
             .checked_add(block.total_fees_zat)
@@ -529,6 +981,47 @@ impl SnapshotMetricTotals {
                 metric: "block count",
             },
         )?;
+        self.transaction_count = self
+            .transaction_count
+            .checked_add(block.transaction_count)
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "transaction count",
+            })?;
+        self.empty_block_count = self
+            .empty_block_count
+            .checked_add(block.empty_block_count)
+            .ok_or(SnapshotAccumulatorError::Arithmetic {
+                metric: "empty block count",
+            })?;
+        self.accepted_work = self.accepted_work.checked_add(block.accepted_work).ok_or(
+            SnapshotAccumulatorError::Arithmetic {
+                metric: "accepted work",
+            },
+        )?;
+
+        macro_rules! checked_add_mining_total {
+            ($field:ident, $metric:literal) => {
+                self.$field = self
+                    .$field
+                    .checked_add(block.$field)
+                    .ok_or(SnapshotAccumulatorError::Arithmetic { metric: $metric })?;
+            };
+        }
+
+        checked_add_mining_total!(total_subsidy_zat, "total subsidy");
+        checked_add_mining_total!(miner_subsidy_zat, "miner subsidy");
+        checked_add_mining_total!(founders_reward_zat, "founders reward");
+        checked_add_mining_total!(funding_streams_zat, "funding streams");
+        checked_add_mining_total!(deferred_subsidy_zat, "deferred subsidy");
+        checked_add_mining_total!(lockbox_disbursement_zat, "lockbox disbursement");
+        checked_add_mining_total!(
+            coinbase_output_transparent_zat,
+            "transparent coinbase output"
+        );
+        checked_add_mining_total!(coinbase_output_sapling_zat, "Sapling coinbase output");
+        checked_add_mining_total!(coinbase_output_orchard_zat, "Orchard coinbase output");
+        checked_add_mining_total!(coinbase_output_ironwood_zat, "Ironwood coinbase output");
+        checked_add_mining_total!(coinbase_unclaimed_zat, "unclaimed coinbase value");
 
         Ok(())
     }
@@ -561,9 +1054,44 @@ impl SnapshotMetricTotals {
                     })?;
         }
 
+        let mut ironwood_counts = [0; SNAPSHOT_IRONWOOD_COUNTER_COUNT];
+        for (difference, (total, anchor)) in ironwood_counts
+            .iter_mut()
+            .zip(self.ironwood_counts.into_iter().zip(anchor.ironwood_counts))
+        {
+            *difference =
+                total
+                    .checked_sub(anchor)
+                    .ok_or(SnapshotAccumulatorError::Arithmetic {
+                        metric: "Ironwood observatory count interval",
+                    })?;
+        }
+
+        let mut ironwood_denomination_counts = [0; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()];
+        for (difference, (total, anchor)) in ironwood_denomination_counts.iter_mut().zip(
+            self.ironwood_denomination_counts
+                .into_iter()
+                .zip(anchor.ironwood_denomination_counts),
+        ) {
+            *difference =
+                total
+                    .checked_sub(anchor)
+                    .ok_or(SnapshotAccumulatorError::Arithmetic {
+                        metric: "Ironwood denomination count interval",
+                    })?;
+        }
+
         Ok(Self {
             transaction_counts,
             pool_flows,
+            ironwood_counts,
+            ironwood_denomination_counts,
+            observable_orchard_to_ironwood_value_zat: self
+                .observable_orchard_to_ironwood_value_zat
+                .checked_sub(anchor.observable_orchard_to_ironwood_value_zat)
+                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                    metric: "observable Orchard-to-Ironwood value interval",
+                })?,
             total_fees_zat: self
                 .total_fees_zat
                 .checked_sub(anchor.total_fees_zat)
@@ -581,6 +1109,78 @@ impl SnapshotMetricTotals {
                     metric: "block count interval",
                 },
             )?,
+            transaction_count: self
+                .transaction_count
+                .checked_sub(anchor.transaction_count)
+                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                    metric: "transaction count interval",
+                })?,
+            empty_block_count: self
+                .empty_block_count
+                .checked_sub(anchor.empty_block_count)
+                .ok_or(SnapshotAccumulatorError::Arithmetic {
+                    metric: "empty block count interval",
+                })?,
+            accepted_work: self.accepted_work.checked_sub(anchor.accepted_work).ok_or(
+                SnapshotAccumulatorError::Arithmetic {
+                    metric: "accepted work interval",
+                },
+            )?,
+            total_subsidy_zat: checked_sub_mining_total(
+                self.total_subsidy_zat,
+                anchor.total_subsidy_zat,
+                "total subsidy interval",
+            )?,
+            miner_subsidy_zat: checked_sub_mining_total(
+                self.miner_subsidy_zat,
+                anchor.miner_subsidy_zat,
+                "miner subsidy interval",
+            )?,
+            founders_reward_zat: checked_sub_mining_total(
+                self.founders_reward_zat,
+                anchor.founders_reward_zat,
+                "founders reward interval",
+            )?,
+            funding_streams_zat: checked_sub_mining_total(
+                self.funding_streams_zat,
+                anchor.funding_streams_zat,
+                "funding streams interval",
+            )?,
+            deferred_subsidy_zat: checked_sub_mining_total(
+                self.deferred_subsidy_zat,
+                anchor.deferred_subsidy_zat,
+                "deferred subsidy interval",
+            )?,
+            lockbox_disbursement_zat: checked_sub_mining_total(
+                self.lockbox_disbursement_zat,
+                anchor.lockbox_disbursement_zat,
+                "lockbox disbursement interval",
+            )?,
+            coinbase_output_transparent_zat: checked_sub_mining_total(
+                self.coinbase_output_transparent_zat,
+                anchor.coinbase_output_transparent_zat,
+                "transparent coinbase output interval",
+            )?,
+            coinbase_output_sapling_zat: checked_sub_mining_total(
+                self.coinbase_output_sapling_zat,
+                anchor.coinbase_output_sapling_zat,
+                "Sapling coinbase output interval",
+            )?,
+            coinbase_output_orchard_zat: checked_sub_mining_total(
+                self.coinbase_output_orchard_zat,
+                anchor.coinbase_output_orchard_zat,
+                "Orchard coinbase output interval",
+            )?,
+            coinbase_output_ironwood_zat: checked_sub_mining_total(
+                self.coinbase_output_ironwood_zat,
+                anchor.coinbase_output_ironwood_zat,
+                "Ironwood coinbase output interval",
+            )?,
+            coinbase_unclaimed_zat: checked_sub_mining_total(
+                self.coinbase_unclaimed_zat,
+                anchor.coinbase_unclaimed_zat,
+                "unclaimed coinbase value interval",
+            )?,
         })
     }
 
@@ -591,9 +1191,30 @@ impl SnapshotMetricTotals {
         for flow in self.pool_flows {
             bytes.extend_from_slice(&flow.to_be_bytes());
         }
+        for count in self.ironwood_counts {
+            bytes.extend_from_slice(&count.to_be_bytes());
+        }
+        for count in self.ironwood_denomination_counts {
+            bytes.extend_from_slice(&count.to_be_bytes());
+        }
+        bytes.extend_from_slice(&self.observable_orchard_to_ironwood_value_zat.to_be_bytes());
         bytes.extend_from_slice(&self.total_fees_zat.to_be_bytes());
         bytes.extend_from_slice(&self.total_block_size.to_be_bytes());
         bytes.extend_from_slice(&self.block_count.to_be_bytes());
+        bytes.extend_from_slice(&self.transaction_count.to_be_bytes());
+        bytes.extend_from_slice(&self.empty_block_count.to_be_bytes());
+        bytes.extend_from_slice(&self.accepted_work.to_be_bytes());
+        bytes.extend_from_slice(&self.total_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.miner_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.founders_reward_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.funding_streams_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.deferred_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.lockbox_disbursement_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_transparent_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_sapling_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_orchard_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_ironwood_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_unclaimed_zat.to_be_bytes());
     }
 
     fn take_bytes(bytes: &[u8], offset: &mut usize) -> Self {
@@ -607,12 +1228,101 @@ impl SnapshotMetricTotals {
             *flow = u128::from_be_bytes(take_accumulator_bytes(bytes, offset));
         }
 
+        let mut ironwood_counts = [0; SNAPSHOT_IRONWOOD_COUNTER_COUNT];
+        for count in &mut ironwood_counts {
+            *count = u64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+        }
+
+        let mut ironwood_denomination_counts = [0; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()];
+        for count in &mut ironwood_denomination_counts {
+            *count = u64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+        }
+
         Self {
             transaction_counts,
             pool_flows,
+            ironwood_counts,
+            ironwood_denomination_counts,
+            observable_orchard_to_ironwood_value_zat: u128::from_be_bytes(take_accumulator_bytes(
+                bytes, offset,
+            )),
             total_fees_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
             total_block_size: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
             block_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            transaction_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            empty_block_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            accepted_work: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            total_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            miner_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            founders_reward_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            funding_streams_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            deferred_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            lockbox_disbursement_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_transparent_zat: u128::from_be_bytes(take_accumulator_bytes(
+                bytes, offset,
+            )),
+            coinbase_output_sapling_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_orchard_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_ironwood_zat: u128::from_be_bytes(take_accumulator_bytes(
+                bytes, offset,
+            )),
+            coinbase_unclaimed_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+        }
+    }
+}
+
+fn checked_sub_mining_total(
+    total: u128,
+    anchor: u128,
+    metric: &'static str,
+) -> Result<u128, SnapshotAccumulatorError> {
+    total
+        .checked_sub(anchor)
+        .ok_or(SnapshotAccumulatorError::Arithmetic { metric })
+}
+
+/// The minimum and maximum committed header times observed in an active snapshot interval.
+///
+/// Each range includes the interval's anchor header, matching the denominator used by Zebra's
+/// `getnetworksolps` estimator for a contiguous block window.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct SnapshotHeaderTimeRange {
+    min_timestamp: i64,
+    max_timestamp: i64,
+}
+
+impl SnapshotHeaderTimeRange {
+    fn singleton(timestamp: i64) -> Self {
+        Self {
+            min_timestamp: timestamp,
+            max_timestamp: timestamp,
+        }
+    }
+
+    fn include(&mut self, timestamp: i64) {
+        self.min_timestamp = self.min_timestamp.min(timestamp);
+        self.max_timestamp = self.max_timestamp.max(timestamp);
+    }
+
+    fn elapsed_seconds(self) -> u64 {
+        u64::try_from(self.max_timestamp.saturating_sub(self.min_timestamp)).unwrap_or(u64::MAX)
+    }
+
+    fn append_bytes(self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.min_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.max_timestamp.to_be_bytes());
+    }
+
+    fn take_bytes(bytes: &[u8], offset: &mut usize) -> Self {
+        let min_timestamp = i64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+        let max_timestamp = i64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+        assert!(
+            min_timestamp <= max_timestamp,
+            "snapshot header-time range minimum must not exceed its maximum"
+        );
+        Self {
+            min_timestamp,
+            max_timestamp,
         }
     }
 }
@@ -668,6 +1378,10 @@ pub(crate) struct SnapshotAccumulator {
     funded_transparent_address_count: u64,
     total_issuance: u64,
     totals: SnapshotMetricTotals,
+    /// Header-time range beginning at `daily_anchor`.
+    daily_header_time_range: SnapshotHeaderTimeRange,
+    /// Header-time range beginning at `realtime_anchor`.
+    realtime_header_time_range: SnapshotHeaderTimeRange,
     /// The latest daily snapshot endpoint.
     daily_anchor: SnapshotMetricAnchor,
     /// The endpoint preceding the latest daily snapshot.
@@ -690,6 +1404,8 @@ impl SnapshotAccumulator {
             funded_transparent_address_count: 0,
             total_issuance: 0,
             totals: SnapshotMetricTotals::default(),
+            daily_header_time_range: SnapshotHeaderTimeRange::singleton(genesis_timestamp),
+            realtime_header_time_range: SnapshotHeaderTimeRange::singleton(genesis_timestamp),
             daily_anchor: before_genesis,
             realtime_anchor: before_genesis,
         }
@@ -743,6 +1459,8 @@ impl IntoDisk for SnapshotAccumulator {
         bytes.extend_from_slice(&self.funded_transparent_address_count.to_be_bytes());
         bytes.extend_from_slice(&self.total_issuance.to_be_bytes());
         self.totals.append_bytes(&mut bytes);
+        self.daily_header_time_range.append_bytes(&mut bytes);
+        self.realtime_header_time_range.append_bytes(&mut bytes);
         self.daily_anchor.append_bytes(&mut bytes);
         self.realtime_anchor.append_bytes(&mut bytes);
         debug_assert_eq!(bytes.len(), SNAPSHOT_ACCUMULATOR_LEN);
@@ -779,6 +1497,8 @@ impl FromDisk for SnapshotAccumulator {
             u64::from_be_bytes(take_accumulator_bytes(bytes, &mut offset));
         let total_issuance = u64::from_be_bytes(take_accumulator_bytes(bytes, &mut offset));
         let totals = SnapshotMetricTotals::take_bytes(bytes, &mut offset);
+        let daily_header_time_range = SnapshotHeaderTimeRange::take_bytes(bytes, &mut offset);
+        let realtime_header_time_range = SnapshotHeaderTimeRange::take_bytes(bytes, &mut offset);
         let daily_anchor = SnapshotMetricAnchor::take_bytes(bytes, &mut offset);
         let realtime_anchor = SnapshotMetricAnchor::take_bytes(bytes, &mut offset);
 
@@ -796,6 +1516,8 @@ impl FromDisk for SnapshotAccumulator {
             funded_transparent_address_count,
             total_issuance,
             totals,
+            daily_header_time_range,
+            realtime_header_time_range,
             daily_anchor,
             realtime_anchor,
         }
@@ -822,8 +1544,21 @@ const TRANSITIONAL_SNAPSHOT_DATA_LEN: usize = 192;
 /// Date-indexed snapshot records written by early versions of the fork, with a 32-byte expanded
 /// difficulty. (The older 196-byte records used a separate height-indexed column family.)
 const EXPANDED_DIFFICULTY_SNAPSHOT_DATA_LEN: usize = 208;
-/// Current snapshot records, including the Ironwood pool and its transaction/flow metrics.
-const CURRENT_SNAPSHOT_DATA_LEN: usize = 212;
+/// Snapshot records with the Ironwood pool and its transaction/flow metrics, but no mining totals.
+const IRONWOOD_SNAPSHOT_DATA_LEN: usize = 212;
+/// The encoded byte length of [`MiningIntervalData`] before Ironwood observatory counters.
+const LEGACY_MINING_INTERVAL_DATA_LEN: usize = 256;
+/// The encoded Ironwood observatory suffix in [`MiningIntervalData`].
+const IRONWOOD_OBSERVATORY_INTERVAL_DATA_LEN: usize =
+    SNAPSHOT_IRONWOOD_COUNTER_COUNT * 8 + IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len() * 8 + 16;
+/// The encoded byte length of the current [`MiningIntervalData`].
+const MINING_INTERVAL_DATA_LEN: usize =
+    LEGACY_MINING_INTERVAL_DATA_LEN + IRONWOOD_OBSERVATORY_INTERVAL_DATA_LEN;
+/// Snapshot records with exact interval mining totals but no Ironwood observatory counters.
+const MINING_SNAPSHOT_DATA_LEN: usize =
+    IRONWOOD_SNAPSHOT_DATA_LEN + LEGACY_MINING_INTERVAL_DATA_LEN;
+/// Current snapshot records, including exact interval mining and Ironwood observatory totals.
+const CURRENT_SNAPSHOT_DATA_LEN: usize = IRONWOOD_SNAPSHOT_DATA_LEN + MINING_INTERVAL_DATA_LEN;
 
 /// The target duration represented by the first date-indexed snapshot.
 ///
@@ -869,7 +1604,302 @@ enum SnapshotDiskFormat {
     Legacy,
     Transitional,
     ExpandedDifficulty,
+    /// Current mining totals, written before independent Ironwood counters were added.
+    Mining,
+    /// A historical layout whose legacy-only fields have already been normalized in memory.
+    ResolvedLegacy,
     Current,
+}
+
+/// Exact on-chain mining totals for the height interval represented by a snapshot.
+///
+/// These fields intentionally contain additive integer facts. Consumers can safely combine daily
+/// rows before deriving averages. `accepted_work / elapsed_header_time_seconds` is an estimated
+/// network solution rate, not directly-observed hashrate.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MiningIntervalData {
+    block_count: u64,
+    transaction_count: u64,
+    empty_block_count: u64,
+    min_header_timestamp: i64,
+    max_header_timestamp: i64,
+    accepted_work: u128,
+    total_fees_zat: u128,
+    total_block_size_bytes: u64,
+    total_subsidy_zat: u128,
+    miner_subsidy_zat: u128,
+    founders_reward_zat: u128,
+    funding_streams_zat: u128,
+    deferred_subsidy_zat: u128,
+    lockbox_disbursement_zat: u128,
+    coinbase_output_transparent_zat: u128,
+    coinbase_output_sapling_zat: u128,
+    coinbase_output_orchard_zat: u128,
+    coinbase_output_ironwood_zat: u128,
+    coinbase_unclaimed_zat: u128,
+    ironwood_counts: [u64; SNAPSHOT_IRONWOOD_COUNTER_COUNT],
+    ironwood_denomination_counts: [u64; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()],
+    observable_orchard_to_ironwood_value_zat: u128,
+}
+
+impl MiningIntervalData {
+    fn from_interval(
+        interval: SnapshotMetricTotals,
+        header_time_range: SnapshotHeaderTimeRange,
+    ) -> Self {
+        Self {
+            block_count: interval.block_count,
+            transaction_count: interval.transaction_count,
+            empty_block_count: interval.empty_block_count,
+            min_header_timestamp: header_time_range.min_timestamp,
+            max_header_timestamp: header_time_range.max_timestamp,
+            accepted_work: interval.accepted_work,
+            total_fees_zat: interval.total_fees_zat,
+            total_block_size_bytes: interval.total_block_size,
+            total_subsidy_zat: interval.total_subsidy_zat,
+            miner_subsidy_zat: interval.miner_subsidy_zat,
+            founders_reward_zat: interval.founders_reward_zat,
+            funding_streams_zat: interval.funding_streams_zat,
+            deferred_subsidy_zat: interval.deferred_subsidy_zat,
+            lockbox_disbursement_zat: interval.lockbox_disbursement_zat,
+            coinbase_output_transparent_zat: interval.coinbase_output_transparent_zat,
+            coinbase_output_sapling_zat: interval.coinbase_output_sapling_zat,
+            coinbase_output_orchard_zat: interval.coinbase_output_orchard_zat,
+            coinbase_output_ironwood_zat: interval.coinbase_output_ironwood_zat,
+            coinbase_unclaimed_zat: interval.coinbase_unclaimed_zat,
+            ironwood_counts: interval.ironwood_counts,
+            ironwood_denomination_counts: interval.ironwood_denomination_counts,
+            observable_orchard_to_ironwood_value_zat: interval
+                .observable_orchard_to_ironwood_value_zat,
+        }
+    }
+
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    pub fn transaction_count(&self) -> u64 {
+        self.transaction_count
+    }
+
+    pub fn empty_block_count(&self) -> u64 {
+        self.empty_block_count
+    }
+
+    pub fn min_header_timestamp(&self) -> i64 {
+        self.min_header_timestamp
+    }
+
+    pub fn max_header_timestamp(&self) -> i64 {
+        self.max_header_timestamp
+    }
+
+    pub fn elapsed_header_time_seconds(&self) -> u64 {
+        SnapshotHeaderTimeRange {
+            min_timestamp: self.min_header_timestamp,
+            max_timestamp: self.max_header_timestamp,
+        }
+        .elapsed_seconds()
+    }
+
+    pub fn accepted_work(&self) -> u128 {
+        self.accepted_work
+    }
+
+    pub fn estimated_network_solution_rate(&self) -> Option<u128> {
+        let elapsed = self.elapsed_header_time_seconds();
+        (elapsed > 0).then(|| self.accepted_work / u128::from(elapsed))
+    }
+
+    pub fn total_fees_zat(&self) -> u128 {
+        self.total_fees_zat
+    }
+
+    pub fn total_block_size_bytes(&self) -> u64 {
+        self.total_block_size_bytes
+    }
+
+    pub fn total_subsidy_zat(&self) -> u128 {
+        self.total_subsidy_zat
+    }
+
+    pub fn miner_subsidy_zat(&self) -> u128 {
+        self.miner_subsidy_zat
+    }
+
+    pub fn founders_reward_zat(&self) -> u128 {
+        self.founders_reward_zat
+    }
+
+    /// Returns direct funding-stream outputs, excluding deferred-pool contributions.
+    pub fn funding_streams_zat(&self) -> u128 {
+        self.funding_streams_zat
+    }
+
+    /// Returns new subsidy routed into the deferred pool, not later lockbox disbursements.
+    pub fn deferred_subsidy_zat(&self) -> u128 {
+        self.deferred_subsidy_zat
+    }
+
+    /// Returns output value released from the existing deferred pool, not new issuance.
+    pub fn lockbox_disbursement_zat(&self) -> u128 {
+        self.lockbox_disbursement_zat
+    }
+
+    pub fn coinbase_output_transparent_zat(&self) -> u128 {
+        self.coinbase_output_transparent_zat
+    }
+
+    pub fn coinbase_output_sapling_zat(&self) -> u128 {
+        self.coinbase_output_sapling_zat
+    }
+
+    pub fn coinbase_output_orchard_zat(&self) -> u128 {
+        self.coinbase_output_orchard_zat
+    }
+
+    pub fn coinbase_output_ironwood_zat(&self) -> u128 {
+        self.coinbase_output_ironwood_zat
+    }
+
+    /// Returns consensus-permitted coinbase value left unclaimed in outputs.
+    ///
+    /// This remainder was historically possible before NU6 and is not necessarily miner
+    /// allocation.
+    pub fn coinbase_unclaimed_zat(&self) -> u128 {
+        self.coinbase_unclaimed_zat
+    }
+
+    pub fn v6_transaction_count(&self) -> u64 {
+        self.ironwood_counts[IRONWOOD_V6_TX_INDEX]
+    }
+
+    pub fn ironwood_bundle_transaction_count(&self) -> u64 {
+        self.ironwood_counts[IRONWOOD_BUNDLE_TX_INDEX]
+    }
+
+    pub fn orchard_bundle_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ORCHARD_BUNDLE_TX_INDEX]
+    }
+
+    pub fn orchard_ironwood_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ORCHARD_IRONWOOD_TX_INDEX]
+    }
+
+    pub fn orchard_action_count(&self) -> u64 {
+        self.ironwood_counts[ORCHARD_ACTION_INDEX]
+    }
+
+    pub fn ironwood_action_count(&self) -> u64 {
+        self.ironwood_counts[IRONWOOD_ACTION_INDEX]
+    }
+
+    pub fn ironwood_active_block_count(&self) -> u64 {
+        self.ironwood_counts[IRONWOOD_ACTIVE_BLOCK_INDEX]
+    }
+
+    pub fn observable_orchard_to_ironwood_transaction_count(&self) -> u64 {
+        self.ironwood_counts[OBSERVABLE_ORCHARD_TO_IRONWOOD_TX_INDEX]
+    }
+
+    pub fn observable_orchard_to_ironwood_value_zat(&self) -> u128 {
+        self.observable_orchard_to_ironwood_value_zat
+    }
+
+    pub fn zip318_action_shape_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ZIP318_ACTION_SHAPE_TX_INDEX]
+    }
+
+    pub fn zip318_denomination_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ZIP318_DENOMINATION_TX_INDEX]
+    }
+
+    pub fn zip318_fee_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ZIP318_FEE_TX_INDEX]
+    }
+
+    pub fn zip318_schedule_transaction_count(&self) -> u64 {
+        self.ironwood_counts[ZIP318_SCHEDULE_TX_INDEX]
+    }
+
+    pub fn ironwood_denomination_counts(
+        &self,
+    ) -> [u64; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()] {
+        self.ironwood_denomination_counts
+    }
+
+    fn append_bytes(self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.block_count.to_be_bytes());
+        bytes.extend_from_slice(&self.transaction_count.to_be_bytes());
+        bytes.extend_from_slice(&self.empty_block_count.to_be_bytes());
+        bytes.extend_from_slice(&self.min_header_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.max_header_timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.accepted_work.to_be_bytes());
+        bytes.extend_from_slice(&self.total_fees_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.total_block_size_bytes.to_be_bytes());
+        bytes.extend_from_slice(&self.total_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.miner_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.founders_reward_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.funding_streams_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.deferred_subsidy_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.lockbox_disbursement_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_transparent_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_sapling_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_orchard_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_output_ironwood_zat.to_be_bytes());
+        bytes.extend_from_slice(&self.coinbase_unclaimed_zat.to_be_bytes());
+        for count in self.ironwood_counts {
+            bytes.extend_from_slice(&count.to_be_bytes());
+        }
+        for count in self.ironwood_denomination_counts {
+            bytes.extend_from_slice(&count.to_be_bytes());
+        }
+        bytes.extend_from_slice(&self.observable_orchard_to_ironwood_value_zat.to_be_bytes());
+    }
+
+    fn take_bytes(bytes: &[u8], offset: &mut usize, has_ironwood_observatory: bool) -> Self {
+        let mut value = Self {
+            block_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            transaction_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            empty_block_count: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            min_header_timestamp: i64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            max_header_timestamp: i64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            accepted_work: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            total_fees_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            total_block_size_bytes: u64::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            total_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            miner_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            founders_reward_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            funding_streams_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            deferred_subsidy_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            lockbox_disbursement_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_transparent_zat: u128::from_be_bytes(take_accumulator_bytes(
+                bytes, offset,
+            )),
+            coinbase_output_sapling_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_orchard_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            coinbase_output_ironwood_zat: u128::from_be_bytes(take_accumulator_bytes(
+                bytes, offset,
+            )),
+            coinbase_unclaimed_zat: u128::from_be_bytes(take_accumulator_bytes(bytes, offset)),
+            ironwood_counts: [0; SNAPSHOT_IRONWOOD_COUNTER_COUNT],
+            ironwood_denomination_counts: [0; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()],
+            observable_orchard_to_ironwood_value_zat: 0,
+        };
+
+        if has_ironwood_observatory {
+            for count in &mut value.ironwood_counts {
+                *count = u64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+            }
+            for count in &mut value.ironwood_denomination_counts {
+                *count = u64::from_be_bytes(take_accumulator_bytes(bytes, offset));
+            }
+            value.observable_orchard_to_ironwood_value_zat =
+                u128::from_be_bytes(take_accumulator_bytes(bytes, offset));
+        }
+
+        value
+    }
 }
 
 /// Snapshot date key in format YY:MM:DD (year, month, day)
@@ -1011,6 +2041,8 @@ pub struct SnapshotData {
     average_block_fee_zat: u64,
     /// Average block size in bytes (from previous snapshot to this snapshot).
     average_block_size: u32,
+    /// Exact additive mining metrics for this interval, or `None` for historical layouts.
+    mining_interval: Option<MiningIntervalData>,
 }
 
 impl SnapshotData {
@@ -1044,6 +2076,7 @@ impl SnapshotData {
         average_block_time: f32,
         average_block_fee_zat: Amount<NonNegative>,
         average_block_size: u32,
+        mining_interval: Option<MiningIntervalData>,
     ) -> Self {
         // Convert inflation rate to basis points (hundredths of a percent)
         let inflation_rate_bps = (inflation_rate_percent * 100.0).round() as u32;
@@ -1078,12 +2111,14 @@ impl SnapshotData {
             average_block_time_bits: average_block_time.to_bits(),
             average_block_fee_zat: average_block_fee_zat.zatoshis() as u64,
             average_block_size,
+            mining_interval,
         }
     }
 
     fn from_accumulator(
         accumulator: &SnapshotAccumulator,
         interval_anchor: SnapshotMetricAnchor,
+        header_time_range: SnapshotHeaderTimeRange,
         network: &Network,
     ) -> Result<Self, SnapshotAccumulatorError> {
         fn count(
@@ -1105,6 +2140,7 @@ impl SnapshotData {
         }
 
         let interval = accumulator.totals.checked_sub(interval_anchor.totals)?;
+        let mining_interval = MiningIntervalData::from_interval(interval, header_time_range);
         let time_interval_count = if interval_anchor.initialized {
             interval.block_count
         } else {
@@ -1208,6 +2244,7 @@ impl SnapshotData {
             average_block_time,
             average_fee,
             average_block_size,
+            Some(mining_interval),
         ))
     }
 
@@ -1243,7 +2280,12 @@ impl SnapshotData {
             .to_bits();
         }
 
-        if self.disk_format != SnapshotDiskFormat::Current {
+        if matches!(
+            self.disk_format,
+            SnapshotDiskFormat::Legacy
+                | SnapshotDiskFormat::Transitional
+                | SnapshotDiskFormat::ExpandedDifficulty
+        ) {
             use std::ops::Add;
 
             let slow_start_issuance = Self::slow_start_issuance_through(self.block_height, network)
@@ -1271,7 +2313,7 @@ impl SnapshotData {
             }
 
             // All legacy-only fields have now been converted to the current in-memory meaning.
-            self.disk_format = SnapshotDiskFormat::Current;
+            self.disk_format = SnapshotDiskFormat::ResolvedLegacy;
         }
 
         self
@@ -1428,6 +2470,20 @@ impl SnapshotData {
     pub fn average_block_size(&self) -> u32 {
         self.average_block_size
     }
+
+    /// Returns exact additive on-chain mining totals, if this row uses the current disk layout.
+    pub fn mining_interval(&self) -> Option<MiningIntervalData> {
+        self.mining_interval
+    }
+
+    /// Returns independent Ironwood observatory totals when the snapshot was written by a format
+    /// that actually indexed them. Older rows must report these metrics as unavailable rather
+    /// than as misleading zeroes.
+    pub fn ironwood_observatory_interval(&self) -> Option<MiningIntervalData> {
+        (self.disk_format == SnapshotDiskFormat::Current)
+            .then_some(self.mining_interval)
+            .flatten()
+    }
 }
 
 impl IntoDisk for SnapshotData {
@@ -1465,7 +2521,12 @@ impl IntoDisk for SnapshotData {
         bytes.extend_from_slice(&self.ironwood_tx_count.to_be_bytes());
         bytes.extend_from_slice(&self.ironwood_inflow.to_be_bytes());
         bytes.extend_from_slice(&self.ironwood_outflow.to_be_bytes());
-        debug_assert_eq!(bytes.len(), CURRENT_SNAPSHOT_DATA_LEN);
+        if let Some(mining_interval) = self.mining_interval {
+            mining_interval.append_bytes(&mut bytes);
+            debug_assert_eq!(bytes.len(), CURRENT_SNAPSHOT_DATA_LEN);
+        } else {
+            debug_assert_eq!(bytes.len(), IRONWOOD_SNAPSHOT_DATA_LEN);
+        }
         bytes
     }
 }
@@ -1580,17 +2641,22 @@ impl FromDisk for SnapshotData {
                 average_block_time_bits,
                 average_block_fee_zat,
                 average_block_size,
+                mining_interval: None,
             };
         }
 
         let (disk_format, pool_values_len) = match bytes.len() {
             LEGACY_SNAPSHOT_DATA_LEN => (SnapshotDiskFormat::Legacy, 40),
             TRANSITIONAL_SNAPSHOT_DATA_LEN => (SnapshotDiskFormat::Transitional, 48),
+            IRONWOOD_SNAPSHOT_DATA_LEN => (SnapshotDiskFormat::Current, 48),
+            MINING_SNAPSHOT_DATA_LEN => (SnapshotDiskFormat::Mining, 48),
             CURRENT_SNAPSHOT_DATA_LEN => (SnapshotDiskFormat::Current, 48),
             actual_len => panic!(
                 "SnapshotData deserialization error: expected {LEGACY_SNAPSHOT_DATA_LEN}, \
                  {TRANSITIONAL_SNAPSHOT_DATA_LEN}, {EXPANDED_DIFFICULTY_SNAPSHOT_DATA_LEN}, \
-                 or {CURRENT_SNAPSHOT_DATA_LEN} bytes, got {actual_len} bytes"
+                 {IRONWOOD_SNAPSHOT_DATA_LEN}, {MINING_SNAPSHOT_DATA_LEN}, or \
+                 {CURRENT_SNAPSHOT_DATA_LEN} bytes, got \
+                 {actual_len} bytes"
             ),
         };
 
@@ -1636,7 +2702,10 @@ impl FromDisk for SnapshotData {
         // The fork writers used by both pre-current layouts labelled vpub_new as inflow and
         // vpub_old as outflow, which is the reverse of the pool's actual direction. Correct those
         // records while decoding.
-        let (sprout_inflow, sprout_outflow) = if bytes.len() != CURRENT_SNAPSHOT_DATA_LEN {
+        let (sprout_inflow, sprout_outflow) = if matches!(
+            bytes.len(),
+            LEGACY_SNAPSHOT_DATA_LEN | TRANSITIONAL_SNAPSHOT_DATA_LEN
+        ) {
             (stored_sprout_outflow, stored_sprout_inflow)
         } else {
             (stored_sprout_inflow, stored_sprout_outflow)
@@ -1652,16 +2721,31 @@ impl FromDisk for SnapshotData {
             u64::from_be_bytes(take(bytes, &mut offset, "average block fee"));
         let average_block_size = u32::from_be_bytes(take(bytes, &mut offset, "average block size"));
 
-        let (ironwood_tx_count, ironwood_inflow, ironwood_outflow) =
-            if bytes.len() == CURRENT_SNAPSHOT_DATA_LEN {
-                (
-                    u32::from_be_bytes(take(bytes, &mut offset, "ironwood tx count")),
-                    u64::from_be_bytes(take(bytes, &mut offset, "ironwood inflow")),
-                    u64::from_be_bytes(take(bytes, &mut offset, "ironwood outflow")),
-                )
-            } else {
-                (0, 0, 0)
-            };
+        let has_ironwood_metrics = matches!(
+            bytes.len(),
+            IRONWOOD_SNAPSHOT_DATA_LEN | MINING_SNAPSHOT_DATA_LEN | CURRENT_SNAPSHOT_DATA_LEN
+        );
+        let (ironwood_tx_count, ironwood_inflow, ironwood_outflow) = if has_ironwood_metrics {
+            (
+                u32::from_be_bytes(take(bytes, &mut offset, "ironwood tx count")),
+                u64::from_be_bytes(take(bytes, &mut offset, "ironwood inflow")),
+                u64::from_be_bytes(take(bytes, &mut offset, "ironwood outflow")),
+            )
+        } else {
+            (0, 0, 0)
+        };
+
+        let mining_interval = matches!(
+            bytes.len(),
+            MINING_SNAPSHOT_DATA_LEN | CURRENT_SNAPSHOT_DATA_LEN
+        )
+        .then(|| {
+            MiningIntervalData::take_bytes(
+                bytes,
+                &mut offset,
+                bytes.len() == CURRENT_SNAPSHOT_DATA_LEN,
+            )
+        });
 
         assert_eq!(
             offset,
@@ -1699,6 +2783,7 @@ impl FromDisk for SnapshotData {
             average_block_time_bits,
             average_block_fee_zat,
             average_block_size,
+            mining_interval,
         }
     }
 }
@@ -1710,11 +2795,12 @@ impl DiskWriteBatch {
     /// caller also passes the resulting chain value pool and serialized block size, avoiding
     /// duplicate state reads and block serialization.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_snapshot_accumulator_batch(
+    pub(super) fn prepare_snapshot_accumulator_batch(
         &mut self,
         db: &ZebraDb,
         network: &Network,
         finalized: &FinalizedBlock,
+        transaction_facts: &[FinalizedTransactionFacts],
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
         funded_transparent_address_count_delta: i64,
         new_pool_values: ValueBalance<NonNegative>,
@@ -1722,7 +2808,13 @@ impl DiskWriteBatch {
     ) -> Result<Amount<NonNegative>, SnapshotAccumulatorError> {
         let height = finalized.height;
         let timestamp = finalized.block.header.time.timestamp();
-        let block_metrics = SnapshotMetricTotals::from_block(finalized, spent_utxos, block_size)?;
+        let mut block_metrics = SnapshotMetricTotals::from_block(
+            transaction_facts,
+            spent_utxos,
+            network,
+            height,
+            block_size,
+        )?;
         let block_total_fee_zat = u64::try_from(block_metrics.total_fees_zat).map_err(|_| {
             SnapshotAccumulatorError::Arithmetic {
                 metric: "per-block fees",
@@ -1779,8 +2871,11 @@ impl DiskWriteBatch {
                 reason: error.to_string(),
             }
         })?;
+        block_metrics.add_mining_accounting(finalized, network, subsidy, block_total_fee)?;
 
         accumulator.totals.checked_add_assign(&block_metrics)?;
+        accumulator.daily_header_time_range.include(timestamp);
+        accumulator.realtime_header_time_range.include(timestamp);
         accumulator.apply_funded_count_delta(funded_transparent_address_count_delta)?;
         accumulator.total_issuance = accumulator
             .total_issuance
@@ -2567,7 +3662,17 @@ impl ZebraDb {
         } else {
             accumulator.daily_anchor
         };
-        let snapshot_data = SnapshotData::from_accumulator(&accumulator, interval_anchor, network)?;
+        let header_time_range = if store_as_realtime || replaces_same_daily_date {
+            accumulator.realtime_header_time_range
+        } else {
+            accumulator.daily_header_time_range
+        };
+        let snapshot_data = SnapshotData::from_accumulator(
+            &accumulator,
+            interval_anchor,
+            header_time_range,
+            network,
+        )?;
 
         let mut batch = DiskWriteBatch::new();
         let realtime_cf = self.realtime_snapshot_data_cf();
@@ -2596,9 +3701,13 @@ impl ZebraDb {
             batch.zs_delete(realtime_cf, REALTIME_SNAPSHOT_ANCHOR_KEY);
 
             let previous_daily_anchor = accumulator.daily_anchor;
+            let completed_daily_header_time_range = accumulator.daily_header_time_range;
             accumulator.daily_anchor = accumulator.current_anchor();
+            accumulator.daily_header_time_range =
+                SnapshotHeaderTimeRange::singleton(accumulator.latest_timestamp);
             if !replaces_same_daily_date {
                 accumulator.realtime_anchor = previous_daily_anchor;
+                accumulator.realtime_header_time_range = completed_daily_header_time_range;
             }
             // The daily value and both anchor shifts are committed atomically. A failed write can
             // therefore be retried without dropping or double-counting an interval.
@@ -2840,6 +3949,7 @@ impl ZebraDb {
             average_block_time,
             average_block_fee_zat,
             average_block_size,
+            None,
         );
 
         // 14. Store in RocksDB
@@ -3172,7 +4282,7 @@ mod tests {
         amount::DeferredPoolBalanceChange,
         block::{self, Block},
         serialization::ZcashDeserializeInto,
-        transaction::{LockTime, Transaction},
+        transaction::{arbitrary::fake_zip318_transaction, LockTime, Transaction},
         transparent::{new_ordered_outputs_with_height, Input, OutPoint, Output, Script},
     };
 
@@ -3185,6 +4295,300 @@ mod tests {
 
     fn amount(zatoshis: u64) -> Amount<NonNegative> {
         Amount::try_from(zatoshis).expect("test amount must be valid")
+    }
+
+    fn zip318_test_facts(
+        height: Height,
+        denomination_zat: u64,
+        expiry_height: Height,
+        seed_index: u64,
+    ) -> (Vec<FinalizedTransactionFacts>, u64) {
+        let transaction = Arc::new(fake_zip318_transaction(
+            denomination_zat,
+            expiry_height,
+            seed_index,
+        ));
+        let conventional_fee_zat = u64::from(zebra_chain::transaction::zip317::conventional_fee(
+            &transaction,
+        ));
+
+        let mut header: block::Header = zebra_test::vectors::DUMMY_HEADER
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("dummy header should deserialize");
+        header.difficulty_threshold = Network::Mainnet.target_difficulty_limit().to_compact();
+        let block = Arc::new(Block {
+            header: Arc::new(header),
+            transactions: vec![test_coinbase(height), transaction],
+        });
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = new_ordered_outputs_with_height(&block, height, &transaction_hashes);
+        let finalized = FinalizedBlock::from_checkpoint_verified(
+            CheckpointVerifiedBlock(SemanticallyVerifiedBlock {
+                block: block.clone(),
+                hash: block.hash(),
+                height,
+                new_outputs,
+                transaction_hashes,
+                block_miner_fees: None,
+            }),
+            Treestate::default(),
+            DeferredPoolBalanceChange::zero(),
+        );
+
+        (
+            FinalizedTransactionFacts::from_block(&finalized),
+            conventional_fee_zat,
+        )
+    }
+
+    fn zip318_metrics(
+        transaction_facts: &[FinalizedTransactionFacts],
+        height: Height,
+    ) -> SnapshotMetricTotals {
+        SnapshotMetricTotals::from_block(
+            transaction_facts,
+            &HashMap::new(),
+            &Network::Mainnet,
+            height,
+            123,
+        )
+        .expect("the ZIP-318-shaped test facts must produce valid metrics")
+    }
+
+    fn assert_zip318_funnel(metrics: &SnapshotMetricTotals, expected: [u64; 5]) {
+        assert_eq!(
+            [
+                metrics.ironwood_counts[OBSERVABLE_ORCHARD_TO_IRONWOOD_TX_INDEX],
+                metrics.ironwood_counts[ZIP318_ACTION_SHAPE_TX_INDEX],
+                metrics.ironwood_counts[ZIP318_DENOMINATION_TX_INDEX],
+                metrics.ironwood_counts[ZIP318_FEE_TX_INDEX],
+                metrics.ironwood_counts[ZIP318_SCHEDULE_TX_INDEX],
+            ],
+            expected,
+        );
+    }
+
+    #[test]
+    fn zip318_schedule_shape_is_compatible_with_the_inclusion_height() {
+        let network = Network::Mainnet;
+        let activation_height = Height(3_428_143);
+        let earliest_schedule_height = Height(3_428_352);
+        let canonical_expiry = 3_490_560;
+
+        assert_eq!(
+            NetworkUpgrade::Nu6_3.activation_height(&network),
+            Some(activation_height)
+        );
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            activation_height,
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            Height(earliest_schedule_height.0 - 1),
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(has_zip318_schedule_shape(
+            &network,
+            Height(3_456_000),
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(has_zip318_schedule_shape(
+            &network,
+            Height(3_456_000),
+            0,
+            Some(3_525_120),
+        ));
+        assert!(has_zip318_schedule_shape(
+            &network,
+            Height(canonical_expiry),
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            Height(canonical_expiry + 1),
+            0,
+            Some(canonical_expiry),
+        ));
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            1,
+            Some(canonical_expiry),
+        ));
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            0,
+            Some(canonical_expiry + 1),
+        ));
+        // Its entire scheduled-height bucket ends before ZIP-318's global lower bound.
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            0,
+            Some(3_456_000),
+        ));
+        // Its scheduled-height bucket begins after the transaction's inclusion height.
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            0,
+            Some(3_525_120),
+        ));
+        assert!(!has_zip318_schedule_shape(
+            &network,
+            earliest_schedule_height,
+            0,
+            None,
+        ));
+
+        let testnet = Network::new_default_testnet();
+        let testnet_activation_height = Height(4_134_000);
+        let testnet_earliest_schedule_height = Height(4_134_240);
+        assert_eq!(
+            NetworkUpgrade::Nu6_3.activation_height(&testnet),
+            Some(testnet_activation_height)
+        );
+        assert!(!has_zip318_schedule_shape(
+            &testnet,
+            testnet_activation_height,
+            0,
+            Some(4_181_760),
+        ));
+        assert!(has_zip318_schedule_shape(
+            &testnet,
+            testnet_earliest_schedule_height,
+            0,
+            Some(4_181_760),
+        ));
+    }
+
+    #[test]
+    fn v6_zip318_transaction_reaches_every_observable_funnel_stage() {
+        let height = Height(3_428_352);
+        let denomination_zat = IRONWOOD_CANONICAL_DENOMINATIONS_ZAT[0];
+        let (facts, conventional_fee_zat) =
+            zip318_test_facts(height, denomination_zat, Height(3_490_560), 0);
+
+        assert_eq!(facts.len(), 2);
+        let migration = &facts[1];
+        assert!(migration.is_v6);
+        assert_eq!(migration.orchard_action_count, 2);
+        assert_eq!(migration.ironwood_action_count, 1);
+        assert!(migration.orchard_spends_enabled);
+        assert!(migration.orchard_outputs_enabled);
+        assert!(!migration.ironwood_spends_enabled);
+        assert!(migration.ironwood_outputs_enabled);
+        assert_eq!(migration.raw_lock_time, 0);
+        assert_eq!(migration.expiry_height, Some(3_490_560));
+
+        let metrics = zip318_metrics(&facts, height);
+        for index in [
+            IRONWOOD_V6_TX_INDEX,
+            IRONWOOD_BUNDLE_TX_INDEX,
+            ORCHARD_BUNDLE_TX_INDEX,
+            ORCHARD_IRONWOOD_TX_INDEX,
+            OBSERVABLE_ORCHARD_TO_IRONWOOD_TX_INDEX,
+            ZIP318_ACTION_SHAPE_TX_INDEX,
+            ZIP318_DENOMINATION_TX_INDEX,
+            ZIP318_FEE_TX_INDEX,
+            ZIP318_SCHEDULE_TX_INDEX,
+        ] {
+            assert_eq!(metrics.ironwood_counts[index], 1, "funnel index {index}");
+        }
+        assert_eq!(metrics.ironwood_counts[ORCHARD_ACTION_INDEX], 2);
+        assert_eq!(metrics.ironwood_counts[IRONWOOD_ACTION_INDEX], 1);
+        assert_eq!(metrics.ironwood_denomination_counts[0], 1);
+        assert_eq!(
+            metrics.observable_orchard_to_ironwood_value_zat,
+            u128::from(denomination_zat)
+        );
+        assert_eq!(metrics.total_fees_zat, u128::from(conventional_fee_zat));
+    }
+
+    #[test]
+    fn zip318_observable_funnel_rejects_each_noncanonical_stage() {
+        let height = Height(3_428_352);
+        let denomination_zat = IRONWOOD_CANONICAL_DENOMINATIONS_ZAT[0];
+        let (facts, conventional_fee_zat) =
+            zip318_test_facts(height, denomination_zat, Height(3_490_560), 1);
+        let denomination_zat = i64::try_from(denomination_zat).expect("test value fits in i64");
+        let conventional_fee_zat =
+            i64::try_from(conventional_fee_zat).expect("test fee fits in i64");
+
+        assert_zip318_funnel(&zip318_metrics(&facts, height), [1, 1, 1, 1, 1]);
+
+        // Preserve the fee but reverse the publicly observable crossing direction.
+        let mut reversed_direction = facts.clone();
+        reversed_direction[1].orchard_value_balance_zat = -denomination_zat;
+        reversed_direction[1].ironwood_value_balance_zat = denomination_zat + conventional_fee_zat;
+        assert_zip318_funnel(
+            &zip318_metrics(&reversed_direction, height),
+            [0, 0, 0, 0, 0],
+        );
+
+        // Even a zero-valued transparent output is an extra publicly observable component.
+        let mut extra_component = facts.clone();
+        extra_component[1].transparent_output_values_zat.push(0);
+        assert_zip318_funnel(&zip318_metrics(&extra_component, height), [0, 0, 0, 0, 0]);
+
+        let mut wrong_action_count = facts.clone();
+        wrong_action_count[1].orchard_action_count = 1;
+        assert_zip318_funnel(
+            &zip318_metrics(&wrong_action_count, height),
+            [1, 0, 0, 0, 0],
+        );
+
+        let mut wrong_flags = facts.clone();
+        wrong_flags[1].ironwood_spends_enabled = true;
+        assert_zip318_funnel(&zip318_metrics(&wrong_flags, height), [1, 0, 0, 0, 0]);
+
+        let mut noncanonical_denomination = facts.clone();
+        let noncanonical_denomination_zat = 1_500_000;
+        noncanonical_denomination[1].ironwood_value_balance_zat = -noncanonical_denomination_zat;
+        noncanonical_denomination[1].orchard_value_balance_zat =
+            noncanonical_denomination_zat + conventional_fee_zat;
+        assert_zip318_funnel(
+            &zip318_metrics(&noncanonical_denomination, height),
+            [1, 1, 0, 0, 0],
+        );
+
+        let mut noncanonical_fee = facts.clone();
+        noncanonical_fee[1].orchard_value_balance_zat += 1;
+        assert_zip318_funnel(&zip318_metrics(&noncanonical_fee, height), [1, 1, 1, 0, 0]);
+
+        let mut noncanonical_lock_time = facts.clone();
+        noncanonical_lock_time[1].raw_lock_time = 1;
+        assert_zip318_funnel(
+            &zip318_metrics(&noncanonical_lock_time, height),
+            [1, 1, 1, 1, 0],
+        );
+
+        // This expiry's possible scheduled heights all precede ZIP-318's global schedule floor.
+        let mut pre_zip318_expiry_bucket = facts.clone();
+        pre_zip318_expiry_bucket[1].expiry_height = Some(3_456_000);
+        assert_zip318_funnel(
+            &zip318_metrics(&pre_zip318_expiry_bucket, height),
+            [1, 1, 1, 1, 0],
+        );
+
+        assert_zip318_funnel(
+            &zip318_metrics(&facts, Height(height.0 - 1)),
+            [1, 1, 1, 1, 0],
+        );
     }
 
     fn test_pool_values() -> ValueBalance<NonNegative> {
@@ -3301,6 +4705,34 @@ mod tests {
             average_block_time_bits: 30.5f32.to_bits(),
             average_block_fee_zat: 31,
             average_block_size: 32,
+            mining_interval: Some(test_mining_interval()),
+        }
+    }
+
+    fn test_mining_interval() -> MiningIntervalData {
+        MiningIntervalData {
+            block_count: 1,
+            transaction_count: 2,
+            empty_block_count: 3,
+            min_header_timestamp: 4,
+            max_header_timestamp: 5,
+            accepted_work: 6,
+            total_fees_zat: 7,
+            total_block_size_bytes: 8,
+            total_subsidy_zat: 9,
+            miner_subsidy_zat: 10,
+            founders_reward_zat: 11,
+            funding_streams_zat: 12,
+            deferred_subsidy_zat: 13,
+            lockbox_disbursement_zat: 14,
+            coinbase_output_transparent_zat: 15,
+            coinbase_output_sapling_zat: 16,
+            coinbase_output_orchard_zat: 17,
+            coinbase_output_ironwood_zat: 18,
+            coinbase_unclaimed_zat: 19,
+            ironwood_counts: std::array::from_fn(|index| 20 + index as u64),
+            ironwood_denomination_counts: std::array::from_fn(|index| 40 + index as u64),
+            observable_orchard_to_ironwood_value_zat: 60,
         }
     }
 
@@ -3381,7 +4813,7 @@ mod tests {
         };
 
         SnapshotData {
-            disk_format: SnapshotDiskFormat::Current,
+            disk_format: SnapshotDiskFormat::ResolvedLegacy,
             legacy_expanded_difficulty: None,
             pool_values,
             work_difficulty_bits: SnapshotData::relative_work_difficulty(
@@ -3394,6 +4826,7 @@ mod tests {
             ironwood_tx_count: 0,
             ironwood_inflow: 0,
             ironwood_outflow: 0,
+            mining_interval: None,
             ..snapshot
         }
     }
@@ -3408,6 +4841,44 @@ mod tests {
     }
 
     #[test]
+    fn pre_mining_snapshot_defaults_mining_interval_to_unavailable() {
+        let snapshot = test_snapshot();
+        let bytes = snapshot.as_bytes();
+        let decoded = SnapshotData::from_bytes(&bytes[..IRONWOOD_SNAPSHOT_DATA_LEN]);
+
+        assert_eq!(
+            decoded,
+            SnapshotData {
+                mining_interval: None,
+                ..snapshot
+            }
+        );
+    }
+
+    #[test]
+    fn pre_observatory_mining_snapshot_keeps_mining_but_hides_ironwood_totals() {
+        let snapshot = test_snapshot();
+        let bytes = snapshot.as_bytes();
+        let decoded = SnapshotData::from_bytes(&bytes[..MINING_SNAPSHOT_DATA_LEN]);
+        let mut legacy_mining = test_mining_interval();
+        legacy_mining.ironwood_counts = [0; SNAPSHOT_IRONWOOD_COUNTER_COUNT];
+        legacy_mining.ironwood_denomination_counts =
+            [0; IRONWOOD_CANONICAL_DENOMINATIONS_ZAT.len()];
+        legacy_mining.observable_orchard_to_ironwood_value_zat = 0;
+
+        assert_eq!(
+            decoded,
+            SnapshotData {
+                disk_format: SnapshotDiskFormat::Mining,
+                mining_interval: Some(legacy_mining),
+                ..snapshot
+            }
+        );
+        assert_eq!(decoded.mining_interval(), Some(legacy_mining));
+        assert_eq!(decoded.ironwood_observatory_interval(), None);
+    }
+
+    #[test]
     fn snapshot_accumulator_disk_round_trip_is_fixed_and_deterministic() {
         let totals = SnapshotMetricTotals {
             transaction_counts: [1, 2, 3, 4, 5, 6, 7],
@@ -3415,6 +4886,7 @@ mod tests {
             total_fees_zat: 18,
             total_block_size: 19,
             block_count: 20,
+            ..SnapshotMetricTotals::default()
         };
         let accumulator = SnapshotAccumulator {
             latest_height: 21,
@@ -3424,6 +4896,14 @@ mod tests {
             funded_transparent_address_count: 24,
             total_issuance: 25,
             totals,
+            daily_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: 13,
+                max_timestamp: 22,
+            },
+            realtime_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: 22,
+                max_timestamp: 26,
+            },
             daily_anchor: SnapshotMetricAnchor {
                 initialized: true,
                 height: 12,
@@ -3459,6 +4939,18 @@ mod tests {
                 total_fees_zat: 1_000,
                 total_block_size: 1_000,
                 block_count: 10,
+                transaction_count: 20,
+                empty_block_count: 3,
+                accepted_work: 10_000,
+                ..SnapshotMetricTotals::default()
+            },
+            daily_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: 1_000,
+                max_timestamp: 1_800,
+            },
+            realtime_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: 900,
+                max_timestamp: 1_800,
             },
             daily_anchor: SnapshotMetricAnchor {
                 initialized: true,
@@ -3470,6 +4962,10 @@ mod tests {
                     total_fees_zat: 200,
                     total_block_size: 200,
                     block_count: 2,
+                    transaction_count: 5,
+                    empty_block_count: 1,
+                    accepted_work: 2_000,
+                    ..SnapshotMetricTotals::default()
                 },
             },
             realtime_anchor: SnapshotMetricAnchor {
@@ -3482,13 +4978,21 @@ mod tests {
                     total_fees_zat: 100,
                     total_block_size: 100,
                     block_count: 1,
+                    transaction_count: 1,
+                    empty_block_count: 0,
+                    accepted_work: 1_000,
+                    ..SnapshotMetricTotals::default()
                 },
             },
         };
 
-        let daily =
-            SnapshotData::from_accumulator(&accumulator, accumulator.daily_anchor, &network)
-                .expect("daily interval should materialize");
+        let daily = SnapshotData::from_accumulator(
+            &accumulator,
+            accumulator.daily_anchor,
+            accumulator.daily_header_time_range,
+            &network,
+        )
+        .expect("daily interval should materialize");
         assert_eq!(daily.funded_transparent_address_count(), 42);
         assert_eq!(daily.transparent_tx_count(), 15);
         assert_eq!(daily.ironwood_tx_count(), 15);
@@ -3497,10 +5001,20 @@ mod tests {
         assert_eq!(daily.average_block_time(), 100.0);
         assert_eq!(daily.average_block_fee_zat(), amount(100));
         assert_eq!(daily.average_block_size(), 100);
+        let daily_mining = daily.mining_interval().expect("mining totals should exist");
+        assert_eq!(daily_mining.block_count(), 8);
+        assert_eq!(daily_mining.transaction_count(), 15);
+        assert_eq!(daily_mining.empty_block_count(), 2);
+        assert_eq!(daily_mining.accepted_work(), 8_000);
+        assert_eq!(daily_mining.elapsed_header_time_seconds(), 800);
 
-        let realtime =
-            SnapshotData::from_accumulator(&accumulator, accumulator.realtime_anchor, &network)
-                .expect("realtime replacement interval should materialize");
+        let realtime = SnapshotData::from_accumulator(
+            &accumulator,
+            accumulator.realtime_anchor,
+            accumulator.realtime_header_time_range,
+            &network,
+        )
+        .expect("realtime replacement interval should materialize");
         assert_eq!(realtime.transparent_tx_count(), 19);
         assert_eq!(realtime.transparent_inflow(), 190);
         assert_eq!(realtime.average_block_time(), 100.0);
@@ -3527,6 +5041,8 @@ mod tests {
                 block_count: 1,
                 ..SnapshotMetricTotals::default()
             },
+            daily_header_time_range: SnapshotHeaderTimeRange::singleton(genesis_timestamp),
+            realtime_header_time_range: SnapshotHeaderTimeRange::singleton(genesis_timestamp),
             daily_anchor: before_genesis,
             realtime_anchor: before_genesis,
         };
@@ -3561,6 +5077,12 @@ mod tests {
         // virtual pre-genesis anchor.
         accumulator.latest_height = 1;
         accumulator.latest_timestamp = genesis_timestamp + 75;
+        accumulator
+            .daily_header_time_range
+            .include(accumulator.latest_timestamp);
+        accumulator
+            .realtime_header_time_range
+            .include(accumulator.latest_timestamp);
         accumulator.totals.transaction_counts[TRANSPARENT_COINBASE_TX_INDEX] = 2;
         accumulator.totals.block_count = 2;
         let mut batch = DiskWriteBatch::new();
@@ -3590,6 +5112,12 @@ mod tests {
         let next_day_date = SnapshotDateKey::from_timestamp(next_day_timestamp);
         accumulator.latest_height = 2;
         accumulator.latest_timestamp = next_day_timestamp;
+        accumulator
+            .daily_header_time_range
+            .include(accumulator.latest_timestamp);
+        accumulator
+            .realtime_header_time_range
+            .include(accumulator.latest_timestamp);
         accumulator.totals.transaction_counts[TRANSPARENT_COINBASE_TX_INDEX] = 3;
         accumulator.totals.block_count = 3;
         let mut batch = DiskWriteBatch::new();
@@ -3620,6 +5148,12 @@ mod tests {
         // Realtime now replaces the height-2 daily row and includes heights 1 through 3.
         accumulator.latest_height = 3;
         accumulator.latest_timestamp = next_day_timestamp + 75;
+        accumulator
+            .daily_header_time_range
+            .include(accumulator.latest_timestamp);
+        accumulator
+            .realtime_header_time_range
+            .include(accumulator.latest_timestamp);
         accumulator.totals.transaction_counts[TRANSPARENT_COINBASE_TX_INDEX] = 4;
         accumulator.totals.block_count = 4;
         let mut batch = DiskWriteBatch::new();
@@ -3692,9 +5226,16 @@ mod tests {
             DeferredPoolBalanceChange::zero(),
         );
         let spent_utxos = HashMap::from([(spent_outpoint, spent_utxo)]);
+        let transaction_facts = FinalizedTransactionFacts::from_block(&finalized);
 
-        let metrics = SnapshotMetricTotals::from_block(&finalized, &spent_utxos, 123)
-            .expect("verified block metrics should be valid");
+        let metrics = SnapshotMetricTotals::from_block(
+            &transaction_facts,
+            &spent_utxos,
+            &Network::Mainnet,
+            height,
+            123,
+        )
+        .expect("verified block metrics should be valid");
         assert_eq!(metrics.transaction_counts[TRANSPARENT_TX_INDEX], 1);
         assert_eq!(metrics.transaction_counts[TRANSPARENT_COINBASE_TX_INDEX], 1);
         assert_eq!(metrics.pool_flows[TRANSPARENT_INFLOW_INDEX], 7);
@@ -3710,6 +5251,7 @@ mod tests {
                 &zebra_db,
                 &Network::Mainnet,
                 &finalized,
+                &transaction_facts,
                 &spent_utxos,
                 0,
                 ValueBalance::zero(),
@@ -3720,6 +5262,91 @@ mod tests {
             error,
             SnapshotAccumulatorError::MissingAtNonGenesis { height: Height(1) }
         ));
+    }
+
+    #[test]
+    fn mining_accounting_keeps_coinbase_routes_neutral_and_subsidies_separate() {
+        let network = Network::Mainnet;
+        let height = Height(1);
+        let timestamp = 1_700_000_000;
+        let subsidy = block_subsidy(height, &network).expect("test subsidy must be valid");
+        let coinbase = Arc::new(Transaction::test_v1(
+            vec![Input::Coinbase {
+                height,
+                data: Vec::new(),
+                sequence: u32::MAX,
+            }],
+            vec![Output::new(subsidy, Script::new(&[]))],
+            LockTime::unlocked(),
+        ));
+        let mut header: block::Header = zebra_test::vectors::DUMMY_HEADER
+            .as_slice()
+            .zcash_deserialize_into()
+            .expect("dummy header should deserialize");
+        header.time =
+            chrono::DateTime::from_timestamp(timestamp, 0).expect("test timestamp should be valid");
+        header.difficulty_threshold = network.target_difficulty_limit().to_compact();
+        let block = Arc::new(Block {
+            header: Arc::new(header),
+            transactions: vec![coinbase],
+        });
+        let transaction_hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let new_outputs = new_ordered_outputs_with_height(&block, height, &transaction_hashes);
+        let verified = SemanticallyVerifiedBlock {
+            block,
+            hash: block::Hash([9; 32]),
+            height,
+            new_outputs,
+            transaction_hashes,
+            block_miner_fees: Some(Amount::zero()),
+        };
+        let finalized = FinalizedBlock::from_checkpoint_verified(
+            CheckpointVerifiedBlock(verified),
+            Treestate::default(),
+            DeferredPoolBalanceChange::zero(),
+        );
+        let transaction_facts = FinalizedTransactionFacts::from_block(&finalized);
+
+        let mut metrics = SnapshotMetricTotals::from_block(
+            &transaction_facts,
+            &HashMap::new(),
+            &network,
+            height,
+            123,
+        )
+        .expect("coinbase metrics should be valid");
+        metrics
+            .add_mining_accounting(&finalized, &network, subsidy, Amount::zero())
+            .expect("mining accounting should be valid");
+
+        assert_eq!(metrics.block_count, 1);
+        assert_eq!(metrics.transaction_count, 1);
+        assert_eq!(metrics.empty_block_count, 1);
+        assert_eq!(
+            metrics.accepted_work,
+            network
+                .target_difficulty_limit()
+                .to_compact()
+                .to_work()
+                .expect("test target must have work")
+                .as_u128()
+        );
+        assert_eq!(
+            metrics.coinbase_output_transparent_zat,
+            subsidy.zatoshis() as u128
+        );
+        assert_eq!(metrics.coinbase_output_sapling_zat, 0);
+        assert_eq!(metrics.coinbase_output_orchard_zat, 0);
+        assert_eq!(metrics.coinbase_output_ironwood_zat, 0);
+        assert_eq!(metrics.coinbase_unclaimed_zat, 0);
+        assert_eq!(
+            metrics
+                .miner_subsidy_zat
+                .checked_add(metrics.founders_reward_zat),
+            Some(metrics.total_subsidy_zat)
+        );
+        assert!(metrics.founders_reward_zat > 0);
+        assert!(metrics.coinbase_output_transparent_zat > metrics.miner_subsidy_zat);
     }
 
     #[test]
@@ -3753,6 +5380,7 @@ mod tests {
             Treestate::default(),
             DeferredPoolBalanceChange::zero(),
         );
+        let transaction_facts = FinalizedTransactionFacts::from_block(&finalized);
 
         let mut batch = DiskWriteBatch::new();
         batch.prepare_block_header_and_transaction_data_batch(zebra_db.db(), &finalized);
@@ -3761,6 +5389,7 @@ mod tests {
                 &zebra_db,
                 &network,
                 &finalized,
+                &transaction_facts,
                 &HashMap::new(),
                 0,
                 ValueBalance::zero(),
@@ -4295,6 +5924,14 @@ mod tests {
                 block_count: 3,
                 ..SnapshotMetricTotals::default()
             },
+            daily_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: second_timestamp,
+                max_timestamp: realtime_timestamp,
+            },
+            realtime_header_time_range: SnapshotHeaderTimeRange {
+                min_timestamp: first_timestamp,
+                max_timestamp: realtime_timestamp,
+            },
             daily_anchor: SnapshotMetricAnchor {
                 initialized: true,
                 height: 1,
@@ -4432,6 +6069,7 @@ mod tests {
             ironwood_tx_count: 0,
             ironwood_inflow: 0,
             ironwood_outflow: 0,
+            mining_interval: None,
             ..snapshot
         };
 
@@ -4467,6 +6105,7 @@ mod tests {
             ironwood_tx_count: 0,
             ironwood_inflow: 0,
             ironwood_outflow: 0,
+            mining_interval: None,
             ..snapshot
         };
 

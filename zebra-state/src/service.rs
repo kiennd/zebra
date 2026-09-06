@@ -81,7 +81,11 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
-pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
+pub use finalized_state::{
+    OutputLocation, TransactionIndex, TransactionLocation, TurnstileCohort, TurnstileData,
+    TurnstileSourcePool, TurnstileStats, TurnstileValue, TurnstileWindow,
+    TURNSTILE_CLASSIFICATION_VERSION,
+};
 use write::NonFinalizedWriteMessage;
 
 use self::queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified, SentHashes};
@@ -1890,6 +1894,22 @@ impl Service<ReadRequest> for ReadStateService {
                 );
 
                 Ok(ReadResponse::SnapshotData { snapshots })
+            }
+            ReadRequest::TurnstileData {
+                start_date,
+                end_date,
+                limit,
+                source_pool,
+            } => {
+                let to_date_key =
+                    |(year, month, day)| finalized_state::SnapshotDateKey::new(year, month, day);
+                let data = state.db.turnstile_data(
+                    start_date.map(to_date_key),
+                    end_date.map(to_date_key),
+                    limit.min(ReadRequest::MAX_TURNSTILE_COHORT_RESULTS),
+                    source_pool,
+                )?;
+                Ok(ReadResponse::TurnstileData { data })
             }
             ReadRequest::TopAddressesByBalance { limit } => {
                 let (finalized_tip, addresses) = state

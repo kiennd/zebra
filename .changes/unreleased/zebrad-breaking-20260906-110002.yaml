@@ -1,0 +1,4 @@
+project: zebrad
+kind: breaking
+body: 'Explorer state format 31 includes complete Ironwood Upgrade Observatory history. Existing explorer state must be synced again because transaction-level migration predicates cannot be reconstructed by the bounded online migration.'
+time: 2026-09-06T11:00:02.000000000Z

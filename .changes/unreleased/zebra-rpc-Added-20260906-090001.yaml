@@ -1,0 +1,4 @@
+project: zebra-rpc
+kind: Added
+body: 'Dashboard snapshot RPC entries expose lossless decimal-string mining totals, reward composition, header-time bounds, and transparent, Sapling, Orchard, and Ironwood coinbase output routes.'
+time: 2026-09-06T09:00:01.000000000Z

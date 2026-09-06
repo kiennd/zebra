@@ -165,6 +165,15 @@ where
         self.db.zs_contains(&self.cf, key)
     }
 
+    /// Returns values for `keys` using one RocksDB batched multi-get operation.
+    ///
+    /// Results preserve key order and contain `None` for missing keys.
+    ///
+    /// If `sorted_input` is true, `keys` must be sorted by their serialized byte representation.
+    pub fn zs_multi_get(&self, keys: &[Key], sorted_input: bool) -> Vec<Option<Value>> {
+        self.db.zs_multi_get(&self.cf, keys, sorted_input)
+    }
+
     /// Returns the lowest key in this column family, and the corresponding value.
     ///
     /// Returns `None` if this column family is empty.
