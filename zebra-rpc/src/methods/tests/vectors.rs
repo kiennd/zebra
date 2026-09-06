@@ -23,7 +23,8 @@ use zebra_chain::{
         NetworkKind,
     },
     serialization::{DateTime32, ZcashDeserializeInto, ZcashSerialize},
-    transaction::{zip317, UnminedTxId, VerifiedUnminedTx},
+    transaction::{zip317, LockTime, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
+    transparent,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
 };
 use zebra_consensus::MAX_BLOCK_SIGOPS;
@@ -1895,6 +1896,452 @@ async fn rpc_getrawtransaction() {
     // The queue task should continue without errors or panics
     let rpc_tx_queue_task_result = rpc_tx_queue.now_or_never();
     assert!(rpc_tx_queue_task_result.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_gettransactiontransparentio_resolves_prevouts_once_in_input_order() {
+    let _init_guard = zebra_test::init();
+
+    let p2pkh_address = transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [7; 20]);
+    let p2sh_address = transparent::Address::from_script_hash(NetworkKind::Mainnet, [8; 20]);
+    let amount = |zatoshis| {
+        Amount::<NonNegative>::try_from(zatoshis).expect("test transparent output values are valid")
+    };
+
+    let previous_transaction = Arc::new(Transaction::test_v4(
+        vec![],
+        vec![
+            transparent::Output::new(amount(2_313_965), p2pkh_address.script()),
+            transparent::Output::new(amount(42), transparent::Script::new(&[])),
+        ],
+        LockTime::unlocked(),
+        Height::MIN,
+    ));
+    let previous_txid = previous_transaction.hash();
+    let mempool_previous_transaction = Arc::new(Transaction::test_v4(
+        vec![],
+        vec![transparent::Output::new(amount(77), p2sh_address.script())],
+        LockTime::unlocked(),
+        Height::MIN,
+    ));
+    let mempool_previous_txid = mempool_previous_transaction.hash();
+    let unavailable_txid = transaction::Hash([9; 32]);
+    let requested_transaction = Arc::new(Transaction::test_v4(
+        vec![
+            transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: previous_txid,
+                    index: 1,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            },
+            transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: previous_txid,
+                    index: 0,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            },
+            transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: unavailable_txid,
+                    index: 0,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            },
+            transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: mempool_previous_txid,
+                    index: 0,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: u32::MAX,
+            },
+        ],
+        vec![transparent::Output::new(amount(99), p2sh_address.script())],
+        LockTime::unlocked(),
+        Height::MIN,
+    ));
+    let requested_txid = requested_transaction.hash();
+
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 8),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 8),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let rpc_task = tokio::spawn(async move {
+        rpc.get_transaction_transparent_io(requested_txid.encode_hex())
+            .await
+    });
+
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId(
+            [requested_txid].into(),
+        ))
+        .await
+        .respond(mempool::Response::Transactions(vec![UnminedTx {
+            id: UnminedTxId::Legacy(requested_txid),
+            transaction: requested_transaction,
+            size: 0,
+            conventional_fee: Amount::zero(),
+        }]));
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId(
+            [previous_txid, mempool_previous_txid, unavailable_txid].into(),
+        ))
+        .await
+        .respond(mempool::Response::Transactions(vec![UnminedTx {
+            id: UnminedTxId::Legacy(mempool_previous_txid),
+            transaction: mempool_previous_transaction,
+            size: 0,
+            conventional_fee: Amount::zero(),
+        }]));
+
+    for _ in 0..2 {
+        let request = read_state
+            .try_next_request()
+            .await
+            .expect("each unique previous transaction is requested once");
+
+        match request.request() {
+            ReadRequest::AnyChainTransaction(hash) if *hash == previous_txid => {
+                request.respond(ReadResponse::AnyChainTransaction(Some(
+                    zebra_state::AnyTx::Side((previous_transaction.clone(), Hash([1; 32]))),
+                )))
+            }
+            ReadRequest::AnyChainTransaction(hash) if *hash == unavailable_txid => {
+                request.respond(ReadResponse::AnyChainTransaction(None))
+            }
+            request => panic!("unexpected previous transaction request: {request:?}"),
+        }
+    }
+
+    let response = rpc_task
+        .await
+        .expect("RPC task must not panic")
+        .expect("compact transaction IO RPC must succeed");
+
+    assert!(!response.complete);
+    assert_eq!(response.transparent_input_count, 4);
+    assert_eq!(response.transparent_output_count, 1);
+    assert_eq!(response.inputs.len(), 4);
+    assert_eq!(response.inputs[0].value_zat.as_deref(), Some("42"));
+    assert_eq!(
+        response.inputs[0].script_type.as_deref(),
+        Some("nonstandard")
+    );
+    assert_eq!(response.inputs[1].addresses, [p2pkh_address.to_string()]);
+    assert_eq!(response.inputs[1].value_zat.as_deref(), Some("2313965"));
+    assert_eq!(
+        response.inputs[2].resolution,
+        TransparentInputResolution::Unavailable
+    );
+    assert_eq!(
+        response.inputs[3].resolution,
+        TransparentInputResolution::Resolved
+    );
+    assert_eq!(response.inputs[3].value_zat.as_deref(), Some("77"));
+    assert_eq!(response.outputs[0].addresses, [p2sh_address.to_string()]);
+    assert_eq!(response.outputs[0].value_zat, "99");
+    assert_eq!(
+        response.outputs[0].script_type.as_deref(),
+        Some("scripthash")
+    );
+
+    let mut normalized = serde_json::to_value(response).expect("response must serialize");
+    normalized["txid"] = "<txid>".into();
+    for input in normalized["inputs"]
+        .as_array_mut()
+        .expect("inputs must be an array")
+    {
+        if input["previous_txid"].is_string() {
+            input["previous_txid"] = "<previous_txid>".into();
+        }
+        for address in input["addresses"]
+            .as_array_mut()
+            .expect("addresses must be an array")
+        {
+            *address = "<address>".into();
+        }
+    }
+    for output in normalized["outputs"]
+        .as_array_mut()
+        .expect("outputs must be an array")
+    {
+        for address in output["addresses"]
+            .as_array_mut()
+            .expect("addresses must be an array")
+        {
+            *address = "<address>".into();
+        }
+    }
+    insta::assert_json_snapshot!(normalized, @r###"
+    {
+      "complete": false,
+      "inputs": [
+        {
+          "addresses": [],
+          "index": 0,
+          "previous_output_index": 1,
+          "previous_txid": "<previous_txid>",
+          "resolution": "resolved",
+          "script_type": "nonstandard",
+          "value_zat": "42"
+        },
+        {
+          "addresses": [
+            "<address>"
+          ],
+          "index": 1,
+          "previous_output_index": 0,
+          "previous_txid": "<previous_txid>",
+          "resolution": "resolved",
+          "script_type": "pubkeyhash",
+          "value_zat": "2313965"
+        },
+        {
+          "addresses": [],
+          "index": 2,
+          "previous_output_index": 0,
+          "previous_txid": "<previous_txid>",
+          "resolution": "unavailable",
+          "script_type": null,
+          "value_zat": null
+        },
+        {
+          "addresses": [
+            "<address>"
+          ],
+          "index": 3,
+          "previous_output_index": 0,
+          "previous_txid": "<previous_txid>",
+          "resolution": "resolved",
+          "script_type": "scripthash",
+          "value_zat": "77"
+        }
+      ],
+      "outputs": [
+        {
+          "addresses": [
+            "<address>"
+          ],
+          "index": 0,
+          "script_type": "scripthash",
+          "value_zat": "99"
+        }
+      ],
+      "transparent_input_count": 4,
+      "transparent_output_count": 1,
+      "txid": "<txid>"
+    }
+    "###);
+
+    read_state.expect_no_requests().await;
+    rpc_tx_queue.abort();
+}
+
+#[test]
+fn transaction_transparent_io_coinbase_is_complete() {
+    let transaction = Transaction::test_v4(
+        vec![transparent::Input::Coinbase {
+            height: Height(1),
+            data: Vec::new(),
+            sequence: u32::MAX,
+        }],
+        vec![],
+        LockTime::unlocked(),
+        Height::MIN,
+    );
+
+    let response = build_transaction_transparent_io_response(
+        transaction.hash(),
+        transaction.inputs(),
+        transaction.outputs(),
+        &HashMap::new(),
+        &Mainnet,
+    );
+
+    assert!(response.complete);
+    assert_eq!(response.inputs.len(), 1);
+    assert_eq!(
+        response.inputs[0].resolution,
+        TransparentInputResolution::Coinbase
+    );
+    assert_eq!(response.inputs[0].previous_txid, None);
+    assert_eq!(response.inputs[0].previous_output_index, None);
+    assert_eq!(response.inputs[0].value_zat, None);
+}
+
+#[test]
+fn transaction_transparent_io_error_codes_are_stable() {
+    assert_eq!(
+        transaction_transparent_io_timeout_error().code(),
+        TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE
+    );
+    assert_eq!(
+        transaction_transparent_io_busy_error().code(),
+        TRANSACTION_TRANSPARENT_IO_BUSY_CODE
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_gettransactiontransparentio_finds_target_in_state() {
+    let _init_guard = zebra_test::init();
+
+    let requested_transaction = Arc::new(Transaction::test_v4(
+        vec![transparent::Input::Coinbase {
+            height: Height(1),
+            data: Vec::new(),
+            sequence: u32::MAX,
+        }],
+        vec![],
+        LockTime::unlocked(),
+        Height::MIN,
+    ));
+    let requested_txid = requested_transaction.hash();
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let rpc_task = tokio::spawn(async move {
+        rpc.get_transaction_transparent_io(requested_txid.encode_hex())
+            .await
+    });
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId(
+            [requested_txid].into(),
+        ))
+        .await
+        .respond(mempool::Response::Transactions(vec![]));
+    read_state
+        .expect_request(ReadRequest::AnyChainTransaction(requested_txid))
+        .await
+        .respond(ReadResponse::AnyChainTransaction(Some(
+            zebra_state::AnyTx::Side((requested_transaction, Hash([2; 32]))),
+        )));
+
+    let response = rpc_task
+        .await
+        .expect("RPC task must not panic")
+        .expect("state transaction must be returned");
+    assert!(response.complete);
+    assert_eq!(
+        response.inputs[0].resolution,
+        TransparentInputResolution::Coinbase
+    );
+
+    read_state.expect_no_requests().await;
+    rpc_tx_queue.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_gettransactiontransparentio_propagates_parent_state_errors() {
+    let _init_guard = zebra_test::init();
+
+    let previous_txid = transaction::Hash([3; 32]);
+    let requested_transaction = Arc::new(Transaction::test_v4(
+        vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: previous_txid,
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        vec![],
+        LockTime::unlocked(),
+        Height::MIN,
+    ));
+    let requested_txid = requested_transaction.hash();
+    let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, rpc_tx_queue) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool.clone(), 2),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let rpc_task = tokio::spawn(async move {
+        rpc.get_transaction_transparent_io(requested_txid.encode_hex())
+            .await
+    });
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId(
+            [requested_txid].into(),
+        ))
+        .await
+        .respond(mempool::Response::Transactions(vec![UnminedTx {
+            id: UnminedTxId::Legacy(requested_txid),
+            transaction: requested_transaction,
+            size: 0,
+            conventional_fee: Amount::zero(),
+        }]));
+    mempool
+        .expect_request(mempool::Request::TransactionsByMinedId(
+            [previous_txid].into(),
+        ))
+        .await
+        .respond(mempool::Response::Transactions(vec![]));
+    read_state
+        .expect_request(ReadRequest::AnyChainTransaction(previous_txid))
+        .await
+        .respond(Err(BoxError::from("injected parent lookup failure")));
+
+    assert!(
+        rpc_task.await.expect("RPC task must not panic").is_err(),
+        "state service failures must fail the RPC rather than return incomplete data"
+    );
+
+    rpc_tx_queue.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

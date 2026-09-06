@@ -44,7 +44,10 @@ pub use crate::methods::{
     GetAddressUtxosResponseObject, GetBlockHashResponse, GetBlockHeaderResponse,
     GetBlockHeightAndHashResponse, GetBlockResponse, GetBlockTransaction, GetBlockTrees,
     GetBlockchainInfoResponse, GetDeprecationInfoResponse, GetInfoResponse,
-    GetRawTransactionResponse, Hash, SendRawTransactionResponse, Utxo,
+    GetRawTransactionResponse, GetTransactionTransparentIoResponse, Hash,
+    SendRawTransactionResponse, TransactionTransparentIoInput, TransactionTransparentIoOutput,
+    TransparentInputResolution, Utxo, TRANSACTION_TRANSPARENT_IO_BUSY_CODE,
+    TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE,
 };
 
 /// Constants needed by clients of Zebra's RPC server

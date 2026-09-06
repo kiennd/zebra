@@ -51,7 +51,7 @@ use jsonrpsee_proc_macros::rpc;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use schemars::JsonSchema;
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    sync::{broadcast, mpsc, watch, Semaphore},
     task::JoinHandle,
 };
 use tower::ServiceExt;
@@ -133,7 +133,7 @@ use types::{
     peer_info::PeerInfo,
     submit_block::{SubmitBlockErrorResponse, SubmitBlockParameters, SubmitBlockResponse},
     subsidy::GetBlockSubsidyResponse,
-    transaction::TransactionObject,
+    transaction::{transparent_output_metadata, TransactionObject},
     unified_address::ZListUnifiedReceiversResponse,
     validate_address::ValidateAddressResponse,
     z_validate_address::ZValidateAddressResponse,
@@ -188,10 +188,17 @@ const DEFAULT_SNAPSHOT_DATA_RESULTS: usize = 100;
 const DEFAULT_DASHBOARD_DATA_RESULTS: usize = ReadRequest::MAX_SNAPSHOT_DATA_RESULTS;
 const DEFAULT_TURNSTILE_COHORT_RESULTS: usize = ReadRequest::MAX_TURNSTILE_COHORT_RESULTS;
 const DEFAULT_RECENT_BLOCK_SUMMARIES_RESULTS: usize = 10;
+const TRANSPARENT_IO_PREVOUT_LOOKUP_CONCURRENCY: usize = 8;
+const TRANSPARENT_IO_MAX_CONCURRENT_REQUESTS: usize = 2;
+const TRANSPARENT_IO_SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TRANSACTION_SUMMARY_PAGE_RESULTS: usize = 25;
 const STALE_EXPLORER_CURSOR_CODE: i32 = -32010;
 const STALE_EXPLORER_CURSOR_MESSAGE: &str =
     "stale explorer cursor: canonical boundary no longer matches";
+/// Error code returned when `gettransactiontransparentio` exceeds its total service deadline.
+pub const TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE: i32 = -32011;
+/// Error code returned when all `gettransactiontransparentio` expansion slots are occupied.
+pub const TRANSACTION_TRANSPARENT_IO_BUSY_CODE: i32 = -32012;
 
 fn validated_rpc_limit(
     limit: Option<usize>,
@@ -554,6 +561,22 @@ fn validate_snapshot_date_range(
 
 fn invalid_params(message: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(ErrorCode::InvalidParams.code(), message.into(), None::<()>)
+}
+
+fn transaction_transparent_io_timeout_error() -> ErrorObject<'static> {
+    ErrorObject::owned(
+        TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE,
+        "gettransactiontransparentio internal service timed out",
+        None::<()>,
+    )
+}
+
+fn transaction_transparent_io_busy_error() -> ErrorObject<'static> {
+    ErrorObject::owned(
+        TRANSACTION_TRANSPARENT_IO_BUSY_CODE,
+        "gettransactiontransparentio is busy; retry later",
+        None::<()>,
+    )
 }
 
 /// Strictly decodes and deserializes a raw transaction.
@@ -1073,6 +1096,28 @@ pub trait Rpc {
         block_hash: Option<String>,
     ) -> Result<GetRawTransactionResponse>;
 
+    /// Returns compact transparent inputs and outputs for one transaction.
+    ///
+    /// Unlike `getrawtransaction`, this explorer-oriented method resolves spent historical
+    /// prevouts and returns their address, value, and script type. Source transaction lookups are
+    /// deduplicated and bounded, so callers do not need one RPC request per input.
+    ///
+    /// This response describes transaction content only; it does not assert canonical-chain
+    /// membership. A resolved non-address script (for example `nulldata`, `pubkey`, or multisig)
+    /// legitimately has an empty `addresses` array.
+    ///
+    /// method: post
+    /// tags: transaction
+    ///
+    /// # Parameters
+    ///
+    /// - `txid`: (string, required) The transaction ID to return.
+    #[method(name = "gettransactiontransparentio")]
+    async fn get_transaction_transparent_io(
+        &self,
+        txid: String,
+    ) -> Result<GetTransactionTransparentIoResponse>;
+
     /// Returns the transaction ids made by the provided transparent addresses.
     ///
     /// zcashd reference: [`getaddresstxids`](https://zcash.github.io/rpc/getaddresstxids.html)
@@ -1547,6 +1592,9 @@ where
     /// The last warning or error event logged by the server.
     last_warn_error_log_rx: LoggedLastEvent,
 
+    /// Limits expensive transparent prevout expansion across concurrent RPC requests.
+    transparent_io_request_semaphore: Arc<Semaphore>,
+
     /// Handler for the `getblocktemplate` RPC.
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
 }
@@ -1644,6 +1692,9 @@ where
             queue_sender,
             address_book,
             last_warn_error_log_rx,
+            transparent_io_request_semaphore: Arc::new(Semaphore::new(
+                TRANSPARENT_IO_MAX_CONCURRENT_REQUESTS,
+            )),
             gbt,
         };
 
@@ -3583,6 +3634,160 @@ where
 
             _ => unreachable!("unmatched response to a `Transaction` read request"),
         }
+    }
+
+    async fn get_transaction_transparent_io(
+        &self,
+        txid: String,
+    ) -> Result<GetTransactionTransparentIoResponse> {
+        let txid = transaction::Hash::from_hex(txid)
+            .map_error(server::error::LegacyCode::InvalidAddressOrKey)?;
+        let deadline = tokio::time::Instant::now() + TRANSPARENT_IO_SERVICE_TIMEOUT;
+
+        let transaction_from_mempool = match tokio::time::timeout_at(
+            deadline,
+            self.mempool
+                .clone()
+                .oneshot(mempool::Request::TransactionsByMinedId([txid].into())),
+        )
+        .await
+        .map_err(|_| transaction_transparent_io_timeout_error())?
+        .map_misc_error()?
+        {
+            mempool::Response::Transactions(transactions) => {
+                transactions.first().map(|tx| tx.transaction.clone())
+            }
+            _ => unreachable!("unmatched response to a `TransactionsByMinedId` request"),
+        };
+
+        let (transaction, is_from_mempool) = if let Some(transaction) = transaction_from_mempool {
+            (transaction, true)
+        } else {
+            let transaction = match tokio::time::timeout_at(
+                deadline,
+                self.read_state
+                    .clone()
+                    .oneshot(ReadRequest::AnyChainTransaction(txid)),
+            )
+            .await
+            .map_err(|_| transaction_transparent_io_timeout_error())?
+            .map_misc_error()?
+            {
+                ReadResponse::AnyChainTransaction(Some(transaction)) => transaction.into(),
+                ReadResponse::AnyChainTransaction(None) => {
+                    return Err("Transaction not found in mempool or any chain")
+                        .map_error(server::error::LegacyCode::InvalidAddressOrKey);
+                }
+                _ => unreachable!("unmatched response to an `AnyChainTransaction` request"),
+            };
+
+            (transaction, false)
+        };
+
+        let transparent_inputs = transaction.inputs();
+        let mut requested_output_indexes = HashMap::<_, HashSet<_>>::new();
+        for outpoint in transparent_inputs
+            .iter()
+            .filter_map(transparent::Input::outpoint)
+        {
+            requested_output_indexes
+                .entry(outpoint.hash)
+                .or_default()
+                .insert(outpoint.index);
+        }
+        let previous_txids = requested_output_indexes
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut resolved_previous_txids = HashSet::with_capacity(previous_txids.len());
+        let mut previous_outputs = HashMap::with_capacity(transparent_inputs.len());
+        let _transparent_io_request_permit = if previous_txids.is_empty() {
+            None
+        } else {
+            Some(
+                self.transparent_io_request_semaphore
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| transaction_transparent_io_busy_error())?,
+            )
+        };
+
+        // An unmined transaction can spend another unmined transaction. Fetch every possible
+        // parent in one mempool request before falling back to historical chain storage.
+        if is_from_mempool && !previous_txids.is_empty() {
+            match tokio::time::timeout_at(
+                deadline,
+                self.mempool
+                    .clone()
+                    .oneshot(mempool::Request::TransactionsByMinedId(
+                        previous_txids.clone(),
+                    )),
+            )
+            .await
+            .map_err(|_| transaction_transparent_io_timeout_error())?
+            .map_misc_error()?
+            {
+                mempool::Response::Transactions(transactions) => {
+                    for transaction in transactions {
+                        let previous_txid = transaction.id.mined_id();
+                        collect_requested_previous_outputs(
+                            previous_txid,
+                            &transaction.transaction,
+                            &requested_output_indexes,
+                            &mut previous_outputs,
+                        );
+                        resolved_previous_txids.insert(previous_txid);
+                    }
+                }
+                _ => unreachable!("unmatched response to a `TransactionsByMinedId` request"),
+            }
+        }
+
+        let missing_previous_txids = previous_txids
+            .into_iter()
+            .filter(|previous_txid| !resolved_previous_txids.contains(previous_txid));
+        let mut previous_transaction_results =
+            futures::stream::iter(missing_previous_txids.map(|previous_txid| {
+                let read_state = self.read_state.clone();
+
+                async move {
+                    let response = read_state
+                        .oneshot(ReadRequest::AnyChainTransaction(previous_txid))
+                        .await;
+                    (previous_txid, response)
+                }
+            }))
+            .buffer_unordered(TRANSPARENT_IO_PREVOUT_LOOKUP_CONCURRENCY);
+
+        tokio::time::timeout_at(deadline, async {
+            while let Some((previous_txid, response)) = previous_transaction_results.next().await {
+                match response.map_misc_error()? {
+                    ReadResponse::AnyChainTransaction(Some(transaction)) => {
+                        let transaction: Arc<Transaction> = transaction.into();
+                        collect_requested_previous_outputs(
+                            previous_txid,
+                            &transaction,
+                            &requested_output_indexes,
+                            &mut previous_outputs,
+                        );
+                    }
+                    ReadResponse::AnyChainTransaction(None) => {}
+                    _ => unreachable!("unmatched response to an `AnyChainTransaction` request"),
+                }
+            }
+
+            Result::Ok(())
+        })
+        .await
+        .map_err(|_| transaction_transparent_io_timeout_error())??;
+
+        Ok(build_transaction_transparent_io_response(
+            txid,
+            transparent_inputs,
+            transaction.outputs(),
+            &previous_outputs,
+            &self.network,
+        ))
     }
 
     async fn z_get_treestate(&self, hash_or_height: String) -> Result<GetTreestateResponse> {
@@ -7294,6 +7499,191 @@ pub enum GetRawTransactionResponse {
     Raw(#[serde(with = "hex")] SerializedTransaction),
     /// The transaction object.
     Object(Box<TransactionObject>),
+}
+
+/// Resolution status for one transparent transaction input.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TransparentInputResolution {
+    /// The referenced output was found and decoded.
+    Resolved,
+    /// This is a coinbase input and therefore has no referenced output.
+    Coinbase,
+    /// The referenced transaction or output was not available.
+    Unavailable,
+}
+
+/// One compact transparent input returned by `gettransactiontransparentio`.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct TransactionTransparentIoInput {
+    /// The zero-based input index in the requested transaction.
+    pub index: u32,
+    /// The display-order transaction ID containing the spent output.
+    pub previous_txid: Option<String>,
+    /// The zero-based output index in the previous transaction.
+    pub previous_output_index: Option<u32>,
+    /// Recognized destination addresses for the spent output. P2PKH scripts use their canonical
+    /// t-address encoding because the chain does not preserve whether a receiver was presented as
+    /// a TEX address.
+    pub addresses: Vec<String>,
+    /// The spent output value in zatoshis, encoded as a lossless decimal string.
+    pub value_zat: Option<String>,
+    /// The standard transparent script type, or `None` when no output was resolved.
+    pub script_type: Option<String>,
+    /// Whether this input was resolved, is coinbase, or is unavailable.
+    pub resolution: TransparentInputResolution,
+}
+
+/// One compact transparent output returned by `gettransactiontransparentio`.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct TransactionTransparentIoOutput {
+    /// The zero-based output index in the requested transaction.
+    pub index: u32,
+    /// Recognized destination addresses for this output. P2PKH scripts use their canonical
+    /// t-address encoding because the chain does not preserve whether a receiver was presented as
+    /// a TEX address.
+    pub addresses: Vec<String>,
+    /// This output's value in zatoshis, encoded as a lossless decimal string.
+    pub value_zat: String,
+    /// The standard transparent script type.
+    pub script_type: Option<String>,
+}
+
+/// Response to a `gettransactiontransparentio` RPC request.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub struct GetTransactionTransparentIoResponse {
+    /// The canonical display-order transaction ID.
+    pub txid: String,
+    /// The total transparent input count in the transaction.
+    pub transparent_input_count: u32,
+    /// The total transparent output count in the transaction.
+    pub transparent_output_count: u32,
+    /// Transparent inputs in transaction order.
+    pub inputs: Vec<TransactionTransparentIoInput>,
+    /// Transparent outputs in transaction order.
+    pub outputs: Vec<TransactionTransparentIoOutput>,
+    /// Whether every non-coinbase transparent input was resolved.
+    pub complete: bool,
+}
+
+fn collect_requested_previous_outputs(
+    previous_txid: transaction::Hash,
+    transaction: &Transaction,
+    requested_output_indexes: &HashMap<transaction::Hash, HashSet<u32>>,
+    previous_outputs: &mut HashMap<transparent::OutPoint, transparent::Output>,
+) {
+    let Some(output_indexes) = requested_output_indexes.get(&previous_txid) else {
+        return;
+    };
+    let transaction_outputs = transaction.outputs();
+
+    for output_index in output_indexes {
+        let Some(output) = usize::try_from(*output_index)
+            .ok()
+            .and_then(|output_index| transaction_outputs.get(output_index))
+        else {
+            continue;
+        };
+
+        previous_outputs.insert(
+            transparent::OutPoint {
+                hash: previous_txid,
+                index: *output_index,
+            },
+            output.clone(),
+        );
+    }
+}
+
+fn build_transaction_transparent_io_response(
+    txid: transaction::Hash,
+    inputs: Vec<transparent::Input>,
+    outputs: Vec<transparent::Output>,
+    previous_outputs: &HashMap<transparent::OutPoint, transparent::Output>,
+    network: &Network,
+) -> GetTransactionTransparentIoResponse {
+    let mut complete = true;
+    let transparent_input_count = inputs
+        .len()
+        .try_into()
+        .expect("transparent input counts fit in u32 due to the transaction size limit");
+    let transparent_output_count = outputs
+        .len()
+        .try_into()
+        .expect("transparent output counts fit in u32 due to the transaction size limit");
+    let inputs = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let index = index
+                .try_into()
+                .expect("transparent input indexes fit in u32 due to the transaction size limit");
+
+            match input {
+                transparent::Input::Coinbase { .. } => TransactionTransparentIoInput {
+                    index,
+                    previous_txid: None,
+                    previous_output_index: None,
+                    addresses: Vec::new(),
+                    value_zat: None,
+                    script_type: None,
+                    resolution: TransparentInputResolution::Coinbase,
+                },
+                transparent::Input::PrevOut { outpoint, .. } => {
+                    if let Some(output) = previous_outputs.get(&outpoint) {
+                        let (addresses, script_type) = transparent_output_metadata(output, network);
+
+                        TransactionTransparentIoInput {
+                            index,
+                            previous_txid: Some(outpoint.hash.encode_hex()),
+                            previous_output_index: Some(outpoint.index),
+                            addresses: addresses.unwrap_or_default(),
+                            value_zat: Some(output.value.zatoshis().to_string()),
+                            script_type: Some(script_type),
+                            resolution: TransparentInputResolution::Resolved,
+                        }
+                    } else {
+                        complete = false;
+                        TransactionTransparentIoInput {
+                            index,
+                            previous_txid: Some(outpoint.hash.encode_hex()),
+                            previous_output_index: Some(outpoint.index),
+                            addresses: Vec::new(),
+                            value_zat: None,
+                            script_type: None,
+                            resolution: TransparentInputResolution::Unavailable,
+                        }
+                    }
+                }
+            }
+        })
+        .collect();
+    let outputs = outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let index = index
+                .try_into()
+                .expect("transparent output indexes fit in u32 due to the transaction size limit");
+            let (addresses, script_type) = transparent_output_metadata(output, network);
+
+            TransactionTransparentIoOutput {
+                index,
+                addresses: addresses.unwrap_or_default(),
+                value_zat: output.value.zatoshis().to_string(),
+                script_type: Some(script_type),
+            }
+        })
+        .collect();
+
+    GetTransactionTransparentIoResponse {
+        txid: txid.encode_hex(),
+        transparent_input_count,
+        transparent_output_count,
+        inputs,
+        outputs,
+        complete,
+    }
 }
 
 #[deprecated(note = "Use `GetRawTransactionResponse` instead")]

@@ -32,12 +32,15 @@ use zebra_rpc::client::{
     GetBlockTransaction, GetBlockTrees, GetBlockchainInfoBalance, GetBlockchainInfoResponse,
     GetDeprecationInfoResponse, GetInfoResponse, GetMiningInfoResponse, GetNetworkInfoResponse,
     GetPeerInfoResponse, GetRawMempoolResponse, GetRawTransactionResponse,
-    GetSubtreesByIndexResponse, GetTreestateResponse, GetZip317FeeParametersResponse, Hash, Input,
-    JoinSplit, MempoolObject, Orchard, OrchardAction, OrchardFlags, Output, ScriptPubKey,
-    ScriptSig, SendRawTransactionResponse, ShieldedOutput, ShieldedSpend, SubmitBlockErrorResponse,
-    SubmitBlockResponse, SubtreeRpcData, TransactionObject, TransactionTemplate, Treestate, Utxo,
+    GetSubtreesByIndexResponse, GetTransactionTransparentIoResponse, GetTreestateResponse,
+    GetZip317FeeParametersResponse, Hash, Input, JoinSplit, MempoolObject, Orchard, OrchardAction,
+    OrchardFlags, Output, ScriptPubKey, ScriptSig, SendRawTransactionResponse, ShieldedOutput,
+    ShieldedSpend, SubmitBlockErrorResponse, SubmitBlockResponse, SubtreeRpcData,
+    TransactionObject, TransactionTemplate, TransactionTransparentIoInput,
+    TransactionTransparentIoOutput, TransparentInputResolution, Treestate, Utxo,
     ValidateAddressResponse, ZListUnifiedReceiversResponse, ZValidateAddressResponse,
-    Zip317FeeAnalysis,
+    Zip317FeeAnalysis, TRANSACTION_TRANSPARENT_IO_BUSY_CODE,
+    TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE,
 };
 
 #[test]
@@ -986,6 +989,90 @@ fn test_get_raw_transaction_true() -> Result<(), Box<dyn std::error::Error>> {
     )));
 
     assert_eq!(obj, new_obj);
+
+    Ok(())
+}
+
+#[test]
+fn test_get_transaction_transparent_io() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(TRANSACTION_TRANSPARENT_IO_TIMEOUT_CODE, -32011);
+    assert_eq!(TRANSACTION_TRANSPARENT_IO_BUSY_CODE, -32012);
+
+    let json = r#"
+{
+  "txid": "0123",
+  "transparent_input_count": 2,
+  "transparent_output_count": 1,
+  "inputs": [
+    {
+      "index": 0,
+      "previous_txid": "4567",
+      "previous_output_index": 2,
+      "addresses": ["t1example"],
+      "value_zat": "9007199254740993",
+      "script_type": "pubkeyhash",
+      "resolution": "resolved"
+    },
+    {
+      "index": 1,
+      "previous_txid": null,
+      "previous_output_index": null,
+      "addresses": [],
+      "value_zat": null,
+      "script_type": null,
+      "resolution": "coinbase"
+    }
+  ],
+  "outputs": [
+    {
+      "index": 0,
+      "addresses": [],
+      "value_zat": "42",
+      "script_type": "nonstandard"
+    }
+  ],
+  "complete": true
+}
+"#;
+    let response: GetTransactionTransparentIoResponse = serde_json::from_str(json)?;
+
+    assert_eq!(response.txid, "0123");
+    assert_eq!(response.transparent_input_count, 2);
+    assert_eq!(response.transparent_output_count, 1);
+    assert_eq!(
+        response.inputs[0].value_zat.as_deref(),
+        Some("9007199254740993")
+    );
+    assert_eq!(
+        response.inputs[0].resolution,
+        TransparentInputResolution::Resolved
+    );
+    assert_eq!(
+        response.inputs[1],
+        TransactionTransparentIoInput {
+            index: 1,
+            previous_txid: None,
+            previous_output_index: None,
+            addresses: vec![],
+            value_zat: None,
+            script_type: None,
+            resolution: TransparentInputResolution::Coinbase,
+        }
+    );
+    assert_eq!(
+        response.outputs[0],
+        TransactionTransparentIoOutput {
+            index: 0,
+            addresses: vec![],
+            value_zat: "42".to_string(),
+            script_type: Some("nonstandard".to_string()),
+        }
+    );
+    assert!(response.complete);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(json)?,
+        serde_json::to_value(response)?
+    );
 
     Ok(())
 }

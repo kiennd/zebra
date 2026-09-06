@@ -489,6 +489,36 @@ pub struct OutputObject {
     version: u32,
     coinbase: bool,
 }
+
+/// Returns the destination addresses and standard script type for a transparent output.
+///
+/// This helper keeps compact explorer responses consistent with `getrawtransaction` and
+/// `gettxout` without constructing a complete [`TransactionObject`].
+pub(in crate::methods) fn transparent_output_metadata(
+    output: &zebra_chain::transparent::Output,
+    network: &Network,
+) -> (Option<Vec<String>>, String) {
+    let addresses = output
+        .address(network)
+        .map(|address| vec![address.to_string()]);
+    let script_type = zcash_script::script::Code(output.lock_script.as_raw_bytes().to_vec())
+        .to_component()
+        .ok()
+        .and_then(|component| component.refine().ok())
+        .and_then(|component| zcash_script::solver::standard(&component))
+        .map(|kind| match kind {
+            zcash_script::solver::ScriptKind::PubKeyHash { .. } => "pubkeyhash",
+            zcash_script::solver::ScriptKind::ScriptHash { .. } => "scripthash",
+            zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
+            zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
+            zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
+        })
+        .unwrap_or("nonstandard")
+        .to_string();
+
+    (addresses, script_type)
+}
+
 impl OutputObject {
     pub fn from_output(
         output: &zebra_chain::transparent::Output,
@@ -499,27 +529,19 @@ impl OutputObject {
         network: &Network,
     ) -> Self {
         let lock_script = &output.lock_script;
-        let addresses = output.address(network).map(|addr| vec![addr.to_string()]);
-        let req_sigs = addresses.as_ref().map(|a| a.len() as u32);
+        let (addresses, script_type) = transparent_output_metadata(output, network);
+        let req_sigs = addresses.as_ref().map(|addresses| {
+            addresses
+                .len()
+                .try_into()
+                .expect("recognized transparent outputs contain at most one address")
+        });
 
         let script_pub_key = ScriptPubKey::new(
             zcash_script::script::Code(lock_script.as_raw_bytes().to_vec()).to_asm(false),
             lock_script.clone(),
             req_sigs,
-            zcash_script::script::Code(lock_script.as_raw_bytes().to_vec())
-                .to_component()
-                .ok()
-                .and_then(|c| c.refine().ok())
-                .and_then(|component| zcash_script::solver::standard(&component))
-                .map(|kind| match kind {
-                    zcash_script::solver::ScriptKind::PubKeyHash { .. } => "pubkeyhash",
-                    zcash_script::solver::ScriptKind::ScriptHash { .. } => "scripthash",
-                    zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
-                    zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
-                    zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
-                })
-                .unwrap_or("nonstandard")
-                .to_string(),
+            script_type,
             addresses,
         );
 
@@ -911,11 +933,13 @@ impl TransactionObject {
                 .enumerate()
                 .map(|output| {
                     // Parse the scriptPubKey to find destination addresses.
-                    let (addresses, req_sigs) = output
-                        .1
-                        .address(network)
-                        .map(|address| (vec![address.to_string()], 1))
-                        .unzip();
+                    let (addresses, script_type) = transparent_output_metadata(output.1, network);
+                    let req_sigs = addresses.as_ref().map(|addresses| {
+                        addresses
+                            .len()
+                            .try_into()
+                            .expect("recognized transparent outputs contain at most one address")
+                    });
 
                     Output {
                         value: Zec::from(output.1.value).lossy_zec(),
@@ -930,22 +954,7 @@ impl TransactionObject {
                             .to_asm(false),
                             hex: output.1.lock_script.clone(),
                             req_sigs,
-                            r#type: zcash_script::script::Code(
-                                output.1.lock_script.as_raw_bytes().to_vec(),
-                            )
-                            .to_component()
-                            .ok()
-                            .and_then(|c| c.refine().ok())
-                            .and_then(|component| zcash_script::solver::standard(&component))
-                            .map(|kind| match kind {
-                                zcash_script::solver::ScriptKind::PubKeyHash { .. } => "pubkeyhash",
-                                zcash_script::solver::ScriptKind::ScriptHash { .. } => "scripthash",
-                                zcash_script::solver::ScriptKind::MultiSig { .. } => "multisig",
-                                zcash_script::solver::ScriptKind::NullData { .. } => "nulldata",
-                                zcash_script::solver::ScriptKind::PubKey { .. } => "pubkey",
-                            })
-                            .unwrap_or("nonstandard")
-                            .to_string(),
+                            r#type: script_type,
                             addresses,
                         },
                     }
