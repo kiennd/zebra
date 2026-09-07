@@ -38,7 +38,8 @@ use crate::{
             transparent::{
                 AddressBalanceIndex, AddressBalanceLocation, AddressBalanceLocationChange,
                 AddressBalanceLocationInner, AddressBalanceLocationUpdates, AddressLocation,
-                AddressTransaction, AddressUnspentOutput, OutputLocation,
+                AddressTransaction, AddressTransactionBalance, AddressUnspentOutput,
+                OutputLocation,
             },
             TransactionLocation,
         },
@@ -57,6 +58,9 @@ pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 
 /// The name of the balance-ordered funded transparent address column family.
 pub const TRANSPARENT_ADDR_BY_BALANCE: &str = "transparent_addr_by_balance";
+
+/// The name of the per-address received and spent amounts by transaction column family.
+pub const TRANSPARENT_TX_BALANCE_BY_ADDR_LOC: &str = "transparent_tx_balance_by_addr_loc";
 
 /// The name of the [`BALANCE_BY_TRANSPARENT_ADDR`] column family's merge operator
 pub const BALANCE_BY_TRANSPARENT_ADDR_MERGE_OP: &str = "fetch_add_balance_and_received";
@@ -96,6 +100,10 @@ pub fn fetch_add_balance_and_received(
 pub type TransactionLocationBySpentOutputLocationCf<'cf> =
     TypedColumnFamily<'cf, OutputLocation, TransactionLocation>;
 
+/// The typed per-address received and spent amounts by transaction column family.
+pub type TransparentTransactionBalanceByAddressLocationCf<'cf> =
+    TypedColumnFamily<'cf, AddressTransaction, AddressTransactionBalance>;
+
 impl ZebraDb {
     // Column family convenience methods
 
@@ -105,6 +113,17 @@ impl ZebraDb {
     ) -> TransactionLocationBySpentOutputLocationCf<'_> {
         TransactionLocationBySpentOutputLocationCf::new(&self.db, TX_LOC_BY_SPENT_OUT_LOC)
             .expect("column family was created when database was created")
+    }
+
+    /// Returns a typed handle to the per-address transaction balance column family.
+    pub(crate) fn transparent_tx_balance_by_addr_loc_cf(
+        &self,
+    ) -> TransparentTransactionBalanceByAddressLocationCf<'_> {
+        TransparentTransactionBalanceByAddressLocationCf::new(
+            &self.db,
+            TRANSPARENT_TX_BALANCE_BY_ADDR_LOC,
+        )
+        .expect("column family was created when database was created")
     }
 
     // Read transparent methods
@@ -395,6 +414,25 @@ impl ZebraDb {
         before: Option<TransactionLocation>,
         limit: usize,
     ) -> Vec<TransactionLocation> {
+        self.address_transaction_balances_reverse(address, end_height, before, limit)
+            .into_iter()
+            .map(|(location, _balance)| location)
+            .collect()
+    }
+
+    /// Returns up to `limit` finalized transaction locations and exact address balance activity,
+    /// newest first.
+    ///
+    /// A missing balance means the address-transaction entry predates the balance index and still
+    /// needs to be backfilled. The transaction location index remains the source of pagination
+    /// truth, so a partial backfill never hides transactions.
+    pub(crate) fn address_transaction_balances_reverse(
+        &self,
+        address: &transparent::Address,
+        end_height: Height,
+        before: Option<TransactionLocation>,
+        limit: usize,
+    ) -> Vec<(TransactionLocation, Option<AddressTransactionBalance>)> {
         let Some(address_location) = self.address_location(address) else {
             return Vec::new();
         };
@@ -420,13 +458,23 @@ impl ZebraDb {
             _ => Included(last),
         };
 
-        self.db
+        let address_transactions: Vec<_> = self
+            .db
             .zs_reverse_range_iter(
                 &tx_loc_by_transparent_addr_loc,
                 (Included(first), upper_bound),
             )
-            .map(|(address_tx, ())| address_tx.transaction_location())
             .take(limit)
+            .map(|(address_tx, ())| address_tx)
+            .collect();
+        let balances = self
+            .transparent_tx_balance_by_addr_loc_cf()
+            .zs_multi_get(&address_transactions, false);
+
+        address_transactions
+            .into_iter()
+            .zip(balances)
+            .map(|(address_tx, balance)| (address_tx.transaction_location(), balance))
             .collect()
     }
 
@@ -644,15 +692,21 @@ impl DiskWriteBatch {
         for (tx_index, transaction) in block.transactions.iter().enumerate() {
             let spending_tx_location = TransactionLocation::from_usize(*height, tx_index);
 
-            self.prepare_spending_transparent_tx_ids_batch(
+            self.prepare_transparent_transaction_balances_batch(
                 zebra_db,
                 network,
                 spending_tx_location,
                 transaction,
                 spent_utxos_by_outpoint,
-                #[cfg(feature = "indexer")]
-                out_loc_by_outpoint,
                 &address_balances,
+            );
+
+            #[cfg(feature = "indexer")]
+            self.prepare_spending_transparent_output_locations_batch(
+                zebra_db,
+                spending_tx_location,
+                transaction,
+                out_loc_by_outpoint,
             );
         }
 
@@ -751,7 +805,6 @@ impl DiskWriteBatch {
     /// Adds the following changes to this batch:
     /// - insert created UTXOs,
     /// - insert transparent address UTXO index entries, and
-    /// - insert transparent address transaction entries,
     ///
     /// without actually writing anything.
     ///
@@ -774,8 +827,6 @@ impl DiskWriteBatch {
         let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
         let utxo_loc_by_transparent_addr_loc =
             db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap();
-        let tx_loc_by_transparent_addr_loc =
-            db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap();
 
         // Index all new transparent outputs
         for (new_output_location, utxo) in new_outputs_by_out_loc {
@@ -802,14 +853,6 @@ impl DiskWriteBatch {
                     address_unspent_output,
                     (),
                 );
-
-                // Create a link from the AddressLocation to the new TransactionLocation in the database.
-                // Unlike the OutputLocation link, this will never be deleted.
-                let address_transaction = AddressTransaction::new(
-                    receiving_address_location,
-                    new_output_location.transaction_location(),
-                );
-                self.zs_insert(&tx_loc_by_transparent_addr_loc, address_transaction, ());
             }
 
             // Use the OutputLocation to store a copy of the new Output in the database.
@@ -879,11 +922,11 @@ impl DiskWriteBatch {
         }
     }
 
-    /// Prepare a database batch indexing the transparent addresses that spent in this transaction.
+    /// Prepare a database batch indexing exact per-address transparent activity in one transaction.
     ///
     /// Adds the following changes to this batch:
-    /// - index spending transactions for each spent transparent output
-    ///   (this is different from the transaction that created the output),
+    /// - link each receiving or spending address to the transaction, and
+    /// - store the total value received and spent by that address in the transaction,
     ///
     /// without actually writing anything.
     ///
@@ -891,66 +934,91 @@ impl DiskWriteBatch {
     ///
     /// - This method doesn't currently return any errors, but it might in future
     #[allow(clippy::unwrap_in_result, clippy::too_many_arguments)]
-    pub fn prepare_spending_transparent_tx_ids_batch(
+    pub fn prepare_transparent_transaction_balances_batch(
         &mut self,
         zebra_db: &ZebraDb,
         network: &Network,
-        spending_tx_location: TransactionLocation,
+        transaction_location: TransactionLocation,
         transaction: &Transaction,
         spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
-        #[cfg(feature = "indexer")] out_loc_by_outpoint: &HashMap<
-            transparent::OutPoint,
-            OutputLocation,
-        >,
         address_balances: &AddressBalanceLocationUpdates,
     ) {
         let db = &zebra_db.db;
         let tx_loc_by_transparent_addr_loc =
             db.cf_handle("tx_loc_by_transparent_addr_loc").unwrap();
+        let mut transaction_balances = HashMap::<transparent::Address, (u64, u64)>::with_capacity(
+            transaction
+                .inputs()
+                .len()
+                .saturating_add(transaction.outputs().len()),
+        );
 
-        // Index the transparent addresses that spent in this transaction.
-        //
-        // Coinbase inputs represent new coins, so there are no UTXOs to mark as spent.
+        // Coinbase inputs represent new coins, so `filter_map(Input::outpoint)` skips them.
         for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
             let spent_utxo = spent_utxos_by_outpoint
                 .get(&spent_outpoint)
                 .expect("unexpected missing spent output");
-            let sending_address = spent_utxo.output.address(network);
-
-            // Fetch the balance, and the link from the address to the AddressLocation, from memory.
-            if let Some(sending_address) = sending_address {
-                let sending_address_location = match address_balances {
-                    AddressBalanceLocationUpdates::Merge(balance_changes) => balance_changes
-                        .get(&sending_address)
-                        .expect("spent outputs must already have an address balance")
-                        .address_location(),
-                    AddressBalanceLocationUpdates::Insert(balances) => balances
-                        .get(&sending_address)
-                        .expect("spent outputs must already have an address balance")
-                        .address_location(),
-                };
-
-                // Create a link from the AddressLocation to the spent TransactionLocation in the database.
-                // Unlike the OutputLocation link, this will never be deleted.
-                //
-                // The value is the location of this transaction,
-                // not the transaction the spent output is from.
-                let address_transaction =
-                    AddressTransaction::new(sending_address_location, spending_tx_location);
-                self.zs_insert(&tx_loc_by_transparent_addr_loc, address_transaction, ());
+            if let Some(sending_address) = spent_utxo.output.address(network) {
+                let (_received_zat, spent_zat) =
+                    transaction_balances.entry(sending_address).or_default();
+                *spent_zat = spent_zat
+                    .checked_add(u64::from(spent_utxo.output.value()))
+                    .expect("verified per-transaction transparent spends must fit in u64");
             }
+        }
 
-            #[cfg(feature = "indexer")]
-            {
-                let spent_output_location = out_loc_by_outpoint
-                    .get(&spent_outpoint)
-                    .expect("spent outpoints must already have output locations");
-
-                let _ = zebra_db
-                    .tx_loc_by_spent_output_loc_cf()
-                    .with_batch_for_writing(self)
-                    .zs_insert(spent_output_location, &spending_tx_location);
+        for output in transaction.outputs() {
+            if let Some(receiving_address) = output.address(network) {
+                let (received_zat, _spent_zat) =
+                    transaction_balances.entry(receiving_address).or_default();
+                *received_zat = received_zat
+                    .checked_add(u64::from(output.value()))
+                    .expect("verified per-transaction transparent receipts must fit in u64");
             }
+        }
+
+        for (address, (received_zat, spent_zat)) in transaction_balances {
+            let address_location = match address_balances {
+                AddressBalanceLocationUpdates::Merge(balance_changes) => balance_changes
+                    .get(&address)
+                    .expect("transaction addresses must already have an address balance")
+                    .address_location(),
+                AddressBalanceLocationUpdates::Insert(balances) => balances
+                    .get(&address)
+                    .expect("transaction addresses must already have an address balance")
+                    .address_location(),
+            };
+            let address_transaction =
+                AddressTransaction::new(address_location, transaction_location);
+            let transaction_balance = AddressTransactionBalance::new(received_zat, spent_zat);
+
+            // Write exactly once per (address, transaction), so self-transfers preserve both sides.
+            self.zs_insert(&tx_loc_by_transparent_addr_loc, address_transaction, ());
+            let _ = zebra_db
+                .transparent_tx_balance_by_addr_loc_cf()
+                .with_batch_for_writing(self)
+                .zs_insert(&address_transaction, &transaction_balance);
+        }
+    }
+
+    /// Index which finalized transaction spent each transparent output.
+    #[cfg(feature = "indexer")]
+    pub fn prepare_spending_transparent_output_locations_batch(
+        &mut self,
+        zebra_db: &ZebraDb,
+        spending_tx_location: TransactionLocation,
+        transaction: &Transaction,
+        out_loc_by_outpoint: &HashMap<transparent::OutPoint, OutputLocation>,
+    ) {
+        for spent_outpoint in transaction.inputs().iter().filter_map(Input::outpoint) {
+            let spent_output_location = out_loc_by_outpoint
+                .get(&spent_outpoint)
+                .expect("spent outpoints must already have output locations");
+
+            let _ = zebra_db
+                .tx_loc_by_spent_output_loc_cf()
+                .with_batch_for_writing(self)
+                .zs_insert(spent_output_location, &spending_tx_location);
         }
     }
 

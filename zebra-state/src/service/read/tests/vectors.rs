@@ -486,10 +486,13 @@ async fn address_transaction_summary_pages_are_bounded_and_cursor_paginated() ->
     };
     assert!(all_transactions
         .iter()
-        .any(|summary| summary.hash == expected_hash));
+        .any(|summary| summary.transaction.hash == expected_hash));
     assert!(all_transactions
         .windows(2)
-        .all(|pair| pair[0].location > pair[1].location));
+        .all(|pair| pair[0].transaction.location > pair[1].transaction.location));
+    assert!(all_transactions
+        .iter()
+        .all(|summary| { summary.received_zat.is_some() && summary.spent_zat.is_some() }));
 
     let response = read_state
         .clone()
@@ -511,8 +514,8 @@ async fn address_transaction_summary_pages_are_bounded_and_cursor_paginated() ->
     };
     assert_eq!(first_page, all_transactions[..1]);
 
-    let cursor = first_page[0].location;
-    let cursor_hash = first_page[0].block_hash;
+    let cursor = first_page[0].transaction.location;
+    let cursor_hash = first_page[0].transaction.block_hash;
     let response = read_state
         .oneshot(ReadRequest::AddressTransactionSummaryPage {
             address,
@@ -531,7 +534,9 @@ async fn address_transaction_summary_pages_are_bounded_and_cursor_paginated() ->
         panic!("unexpected response to cursor address transaction page request")
     };
     assert_eq!(second_page, all_transactions.get(1..2).unwrap_or_default());
-    assert!(second_page.iter().all(|summary| summary.location < cursor));
+    assert!(second_page
+        .iter()
+        .all(|summary| summary.transaction.location < cursor));
 
     Ok(())
 }

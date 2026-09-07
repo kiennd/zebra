@@ -45,6 +45,9 @@ const DATABASE_FORMAT_VERSION: u64 = 32;
 /// - breaking changes with compatibility code in all supported Zebra versions.
 ///
 /// Version history:
+/// - 32.1.0: adds an optional, backwards-compatible per-address transaction balance index. New
+///   finalized transactions populate exact received and spent amounts atomically; existing rows
+///   remain readable as unavailable until a dedicated resumable backfill is run.
 /// - 32.0.0: corrects Turnstile cohort dates, age windows, and maturity to use consensus
 ///   median-time-past; classifies shielded sources exclusively by net pool debit; and removes
 ///   spent output markers after their first-spend facts are aggregated. Existing v31 Turnstile
@@ -75,7 +78,7 @@ const DATABASE_FORMAT_VERSION: u64 = 32;
 ///   new records use 212 bytes. New CFs are created and the wider records are read in place when the
 ///   database is opened, so this is a major bump that is restorable from the previous major database
 ///   format version (no resync or data migration).
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.

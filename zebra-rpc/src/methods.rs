@@ -3074,7 +3074,7 @@ where
             .then(|| {
                 transactions
                     .last()
-                    .map(|summary| (summary.location, summary.block_hash))
+                    .map(|summary| (summary.transaction.location, summary.transaction.block_hash))
             })
             .flatten()
             .filter(|(location, _hash)| *location != TransactionLocation::MIN)
@@ -5820,6 +5820,41 @@ pub struct ExplorerTransactionSummaryEntry {
     pub finalized: bool,
 }
 
+/// A lightweight explorer transaction summary with activity for one transparent address.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct ExplorerAddressTransactionSummaryEntry {
+    /// The address-independent transaction fields.
+    #[serde(flatten)]
+    pub transaction: ExplorerTransactionSummaryEntry,
+    /// Exact value received by the queried address, in zatoshis.
+    pub received_zat: Option<String>,
+    /// Exact value spent by the queried address, in zatoshis.
+    pub spent_zat: Option<String>,
+    /// Signed net balance change in zatoshis, encoded as a decimal string.
+    pub net_balance_change_zat: Option<String>,
+}
+
+impl From<zebra_state::ExplorerAddressTransactionSummary>
+    for ExplorerAddressTransactionSummaryEntry
+{
+    fn from(summary: zebra_state::ExplorerAddressTransactionSummary) -> Self {
+        let net_balance_change_zat =
+            summary
+                .received_zat
+                .zip(summary.spent_zat)
+                .map(|(received_zat, spent_zat)| {
+                    (i128::from(received_zat) - i128::from(spent_zat)).to_string()
+                });
+
+        Self {
+            transaction: summary.transaction.into(),
+            received_zat: summary.received_zat.map(|value| value.to_string()),
+            spent_zat: summary.spent_zat.map(|value| value.to_string()),
+            net_balance_change_zat,
+        }
+    }
+}
+
 impl From<zebra_state::ExplorerTransactionSummary> for ExplorerTransactionSummaryEntry {
     fn from(summary: zebra_state::ExplorerTransactionSummary) -> Self {
         Self {
@@ -5879,7 +5914,7 @@ pub struct GetAddressTransactionSummaryPageResponse {
     #[getter(copy)]
     pub finalized_height: Option<u32>,
     /// Address transactions ordered newest first by chain location.
-    pub transactions: Vec<ExplorerTransactionSummaryEntry>,
+    pub transactions: Vec<ExplorerAddressTransactionSummaryEntry>,
     /// Opaque exclusive cursor for the next page, or `None` when exhausted.
     pub next_cursor: Option<String>,
     /// Whether every anchor in the inbound opaque cursor was finalized for this request.

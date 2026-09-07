@@ -1266,8 +1266,13 @@ async fn explorer_list_rpcs_forward_cursors_and_map_current_forks() {
         zebra_chain::transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x42; 20]);
     let address_string = address.to_string();
     let address_cursor = format!("v1:a:{address}:9:{session_hash}:8:{cursor_block_hash}:0");
-    let mut address_transaction_summary = transaction_summary.clone();
-    address_transaction_summary.finalized = false;
+    let mut address_transaction = transaction_summary.clone();
+    address_transaction.finalized = false;
+    let address_transaction_summary = zebra_state::ExplorerAddressTransactionSummary {
+        transaction: address_transaction,
+        received_zat: Some(20),
+        spent_zat: Some(50),
+    };
     let rpc_clone = rpc.clone();
     let address_string_for_request = address_string.clone();
     let address_transactions_future = tokio::spawn(async move {
@@ -1308,9 +1313,36 @@ async fn explorer_list_rpcs_forward_cursors_and_map_current_forks() {
     );
     assert!(!address_transactions.request_cursor_finalized);
     assert_eq!(
-        address_transactions.transactions[0].txid,
+        address_transactions.transactions[0].transaction.txid,
         transaction_hash.to_string()
     );
+    assert_eq!(
+        address_transactions.transactions[0].received_zat.as_deref(),
+        Some("20")
+    );
+    assert_eq!(
+        address_transactions.transactions[0].spent_zat.as_deref(),
+        Some("50")
+    );
+    assert_eq!(
+        address_transactions.transactions[0]
+            .net_balance_change_zat
+            .as_deref(),
+        Some("-30")
+    );
+    let serialized_activity = serde_json::to_value(&address_transactions.transactions[0]).unwrap();
+    assert_eq!(serialized_activity["received_zat"], "20");
+    assert_eq!(serialized_activity["spent_zat"], "50");
+    assert_eq!(serialized_activity["net_balance_change_zat"], "-30");
+
+    let mut unavailable_activity = address_transactions.transactions[0].clone();
+    unavailable_activity.received_zat = None;
+    unavailable_activity.spent_zat = None;
+    unavailable_activity.net_balance_change_zat = None;
+    let serialized_unavailable = serde_json::to_value(unavailable_activity).unwrap();
+    assert!(serialized_unavailable["received_zat"].is_null());
+    assert!(serialized_unavailable["spent_zat"].is_null());
+    assert!(serialized_unavailable["net_balance_change_zat"].is_null());
 
     let utxo_location = zebra_state::OutputLocation::from_output_index(transaction_location, 3);
     let utxo_summary = zebra_state::ExplorerAddressUtxoSummary {

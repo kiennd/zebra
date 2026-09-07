@@ -28,7 +28,10 @@ use zebra_chain::{
 };
 
 use crate::{
-    response::{AnyTx, ExplorerChainTip, ExplorerTransactionSummary, MinedTx, RecentBlockSummary},
+    response::{
+        AnyTx, ExplorerAddressTransactionSummary, ExplorerChainTip, ExplorerTransactionSummary,
+        MinedTx, RecentBlockSummary,
+    },
     service::{
         finalized_state::ZebraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -662,7 +665,7 @@ pub fn address_transaction_summary_page<C>(
 ) -> (
     Option<(Height, block::Hash)>,
     Option<(Height, block::Hash)>,
-    Vec<ExplorerTransactionSummary>,
+    Vec<ExplorerAddressTransactionSummary>,
 )
 where
     C: AsRef<Chain> + Clone,
@@ -722,13 +725,23 @@ where
                     };
                     debug_assert_eq!(tx.hash(), expected_hash);
 
-                    summaries.push(explorer_transaction_summary(
-                        location,
+                    let (received_zat, spent_zat) = non_finalized_address_transaction_balance(
                         tx,
-                        contextual.hash,
-                        contextual.block.header.time,
-                        false,
-                    ));
+                        &address,
+                        db.network(),
+                        &contextual.spent_outputs,
+                    );
+                    summaries.push(ExplorerAddressTransactionSummary {
+                        transaction: explorer_transaction_summary(
+                            location,
+                            tx,
+                            contextual.hash,
+                            contextual.block.header.time,
+                            false,
+                        ),
+                        received_zat: Some(received_zat),
+                        spent_zat: Some(spent_zat),
+                    });
                     if summaries.len() == limit {
                         return (best_tip, finalized_tip, summaries);
                     }
@@ -742,10 +755,10 @@ where
     };
     let remaining = limit - summaries.len();
     let locations =
-        db.address_transaction_locations_reverse(&address, finalized_height, before, remaining);
+        db.address_transaction_balances_reverse(&address, finalized_height, before, remaining);
     let mut cached_block = None;
 
-    for location in locations {
+    for (location, balance) in locations {
         let Some(tx) = db.transaction_by_location(location) else {
             continue;
         };
@@ -764,12 +777,50 @@ where
             }
         };
 
-        summaries.push(explorer_transaction_summary(
-            location, &tx, block_hash, block_time, true,
-        ));
+        summaries.push(ExplorerAddressTransactionSummary {
+            transaction: explorer_transaction_summary(location, &tx, block_hash, block_time, true),
+            received_zat: balance.map(|balance| balance.received_zat()),
+            spent_zat: balance.map(|balance| balance.spent_zat()),
+        });
     }
 
     (best_tip, finalized_tip, summaries)
+}
+
+/// Returns exact transparent value received and spent by `address` in a non-finalized transaction.
+fn non_finalized_address_transaction_balance(
+    transaction: &Transaction,
+    address: &transparent::Address,
+    network: zebra_chain::parameters::Network,
+    spent_outputs: &std::collections::HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+) -> (u64, u64) {
+    let received_zat = transaction
+        .outputs()
+        .iter()
+        .filter(|output| output.address(&network) == Some(*address))
+        .try_fold(0u64, |total, output| {
+            total.checked_add(u64::from(output.value()))
+        })
+        .expect("verified per-transaction transparent receipts must fit in u64");
+    let spent_zat = transaction
+        .inputs()
+        .iter()
+        .filter_map(transparent::Input::outpoint)
+        .map(|outpoint| {
+            spent_outputs.get(&outpoint).unwrap_or_else(|| {
+                panic!(
+                    "contextually verified non-finalized transaction is missing spent output \
+                     {outpoint:?}"
+                )
+            })
+        })
+        .filter(|ordered_utxo| ordered_utxo.utxo.output.address(&network) == Some(*address))
+        .try_fold(0u64, |total, ordered_utxo| {
+            total.checked_add(u64::from(ordered_utxo.utxo.output.value()))
+        })
+        .expect("verified per-transaction transparent spends must fit in u64");
+
+    (received_zat, spent_zat)
 }
 
 /// Returns the active chain and every currently tracked, contextually valid side-chain tip.
@@ -934,10 +985,18 @@ fn explorer_transaction_summary(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, collections::HashMap};
 
-    use super::common_ancestor_in_non_finalized_overlap;
-    use zebra_chain::block::{Hash, Height};
+    use super::{
+        common_ancestor_in_non_finalized_overlap, non_finalized_address_transaction_balance,
+    };
+    use zebra_chain::{
+        amount::{Amount, NonNegative},
+        block::{Hash, Height},
+        parameters::{Network, NetworkKind},
+        transaction::{LockTime, Transaction},
+        transparent::{Address, Input, OrderedUtxo, OutPoint, Output, Script},
+    };
 
     #[test]
     fn disjoint_non_finalized_roots_do_not_scan_below_the_rollback_window() {
@@ -967,6 +1026,67 @@ mod tests {
             probes.get(),
             (common_tip_height.0 - side_root.0 + 1) as usize,
             "the search must stop at the highest non-finalized root"
+        );
+    }
+
+    #[test]
+    fn non_finalized_self_spend_reports_exact_received_and_spent_values() {
+        let address = Address::from_pub_key_hash(NetworkKind::Mainnet, [0x42; 20]);
+        let outpoint = OutPoint {
+            hash: zebra_chain::transaction::Hash([0x11; 32]),
+            index: 0,
+        };
+        let amount = |value| Amount::<NonNegative>::try_from(value).expect("valid test amount");
+        let transaction = Transaction::test_v1(
+            vec![Input::PrevOut {
+                outpoint,
+                unlock_script: Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            vec![
+                Output::new(amount(3), address.script()),
+                Output::new(amount(5), address.script()),
+            ],
+            LockTime::unlocked(),
+        );
+        let spent_outputs = HashMap::from([(
+            outpoint,
+            OrderedUtxo::new(Output::new(amount(7), address.script()), Height(0), 1),
+        )]);
+
+        assert_eq!(
+            non_finalized_address_transaction_balance(
+                &transaction,
+                &address,
+                Network::Mainnet,
+                &spent_outputs,
+            ),
+            (8, 7),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "missing spent output")]
+    fn non_finalized_activity_rejects_missing_contextual_prevout() {
+        let address = Address::from_script_hash(NetworkKind::Mainnet, [0x24; 20]);
+        let transaction = Transaction::test_v1(
+            vec![Input::PrevOut {
+                outpoint: OutPoint {
+                    hash: zebra_chain::transaction::Hash([0x22; 32]),
+                    index: 0,
+                },
+                unlock_script: Script::new(&[]),
+                sequence: u32::MAX,
+            }],
+            Vec::new(),
+            LockTime::unlocked(),
+        );
+
+        let _ = non_finalized_address_transaction_balance(
+            &transaction,
+            &address,
+            Network::Mainnet,
+            &HashMap::new(),
         );
     }
 }

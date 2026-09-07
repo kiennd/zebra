@@ -32,7 +32,8 @@ use crate::{
     service::finalized_state::{
         disk_db::DiskWriteBatch,
         disk_format::transparent::{
-            AddressBalanceLocation, AddressBalanceLocationUpdates, OutputLocation,
+            AddressBalanceLocation, AddressBalanceLocationUpdates, AddressTransaction,
+            OutputLocation,
         },
         ZebraDb, STATE_COLUMN_FAMILIES_IN_CODE,
     },
@@ -182,7 +183,10 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         &spent_utxos_by_outpoint,
         &spent_utxos_by_out_loc,
         #[cfg(feature = "indexer")]
-        &HashMap::new(),
+        &HashMap::from([
+            (existing_outpoint, existing_output_location),
+            (t0_output_outpoint, t0_output_location),
+        ]),
         address_balances,
         vec![(address, value, value)],
     );
@@ -202,6 +206,144 @@ fn intra_block_self_spend_chain_in_finalized_state() {
         u64::from(value).saturating_mul(3),
         "received counts the existing V plus two intra-block credits of V",
     );
+
+    let address_location = zebra_db
+        .address_location(&address)
+        .expect("address location is indexed");
+    for tx_index in 0..=1 {
+        let key = AddressTransaction::new(
+            address_location,
+            crate::TransactionLocation::from_usize(height, tx_index),
+        );
+        let activity = zebra_db
+            .transparent_tx_balance_by_addr_loc_cf()
+            .zs_get(&key)
+            .expect("self-spend transaction activity is indexed");
+        assert_eq!(activity.received_zat(), u64::from(value));
+        assert_eq!(activity.spent_zat(), u64::from(value));
+    }
+
+    // A missing value in the optional CF represents a legacy row that still needs backfill; the
+    // original unit-valued transaction index remains readable and authoritative.
+    let legacy_key = AddressTransaction::new(
+        address_location,
+        crate::TransactionLocation::from_usize(height, 0),
+    );
+    zebra_db
+        .transparent_tx_balance_by_addr_loc_cf()
+        .new_batch_for_writing()
+        .zs_delete(&legacy_key)
+        .write_batch()
+        .expect("test can remove the optional activity value");
+    let indexed = zebra_db.address_transaction_balances_reverse(&address, height, None, 2);
+    assert!(indexed.iter().any(|(location, activity)| {
+        *location == crate::TransactionLocation::from_usize(height, 0) && activity.is_none()
+    }));
+}
+
+/// Per-address transaction activity aggregates every matching input and output exactly once.
+#[test]
+fn transparent_transaction_balances_aggregate_inputs_outputs_and_coinbase() {
+    let _init_guard = zebra_test::init();
+
+    let network = Network::Mainnet;
+    let height = Height(1);
+    let p2pkh = Address::from_pub_key_hash(NetworkKind::Mainnet, [0x11; 20]);
+    let p2sh = Address::from_script_hash(NetworkKind::Mainnet, [0x22; 20]);
+    let amount = |value| Amount::<NonNegative>::try_from(value).expect("test amount is valid");
+    let prevout = |tag, index| OutPoint {
+        hash: transaction::Hash([tag; 32]),
+        index,
+    };
+    let input = |outpoint| Input::PrevOut {
+        outpoint,
+        unlock_script: Script::new(&[]),
+        sequence: u32::MAX,
+    };
+    let first_outpoint = prevout(1, 0);
+    let second_outpoint = prevout(2, 1);
+    let transfer = Transaction::test_v1(
+        vec![input(first_outpoint), input(second_outpoint)],
+        vec![
+            Output::new(amount(5), p2pkh.script()),
+            Output::new(amount(3), p2pkh.script()),
+            Output::new(amount(4), p2sh.script()),
+            Output::new(amount(6), p2sh.script()),
+        ],
+        LockTime::unlocked(),
+    );
+    let max_first = MAX_MONEY / 2;
+    let max_second = MAX_MONEY - max_first;
+    let coinbase = Transaction::test_v1(
+        vec![Input::Coinbase {
+            height,
+            data: vec![0, 0],
+            sequence: u32::MAX,
+        }],
+        vec![
+            Output::new(amount(max_first), p2sh.script()),
+            Output::new(amount(max_second), p2sh.script()),
+        ],
+        LockTime::unlocked(),
+    );
+    let spent_utxos = HashMap::from([
+        (
+            first_outpoint,
+            transparent::Utxo::new(Output::new(amount(7), p2pkh.script()), Height(0), false),
+        ),
+        (
+            second_outpoint,
+            transparent::Utxo::new(Output::new(amount(11), p2pkh.script()), Height(0), false),
+        ),
+    ]);
+    let p2pkh_location = OutputLocation::from_usize(Height(0), 0, 0);
+    let p2sh_location = OutputLocation::from_usize(height, 0, 2);
+    let address_balances = AddressBalanceLocationUpdates::Insert(HashMap::from([
+        (p2pkh, AddressBalanceLocation::new(p2pkh_location)),
+        (p2sh, AddressBalanceLocation::new(p2sh_location)),
+    ]));
+    let zebra_db = new_ephemeral_zebra_db(&network);
+    let mut batch = DiskWriteBatch::new();
+
+    batch.prepare_transparent_transaction_balances_batch(
+        &zebra_db,
+        &network,
+        crate::TransactionLocation::from_usize(height, 0),
+        &transfer,
+        &spent_utxos,
+        &address_balances,
+    );
+    batch.prepare_transparent_transaction_balances_batch(
+        &zebra_db,
+        &network,
+        crate::TransactionLocation::from_usize(height, 1),
+        &coinbase,
+        &HashMap::new(),
+        &address_balances,
+    );
+    zebra_db.write_batch(batch).expect("activity batch writes");
+
+    let activity = |address_location, tx_index| {
+        zebra_db
+            .transparent_tx_balance_by_addr_loc_cf()
+            .zs_get(&AddressTransaction::new(
+                address_location,
+                crate::TransactionLocation::from_usize(height, tx_index),
+            ))
+            .expect("expected transaction activity")
+    };
+    let p2pkh_transfer = activity(p2pkh_location, 0);
+    assert_eq!(p2pkh_transfer.received_zat(), 8);
+    assert_eq!(p2pkh_transfer.spent_zat(), 18);
+    let p2sh_transfer = activity(p2sh_location, 0);
+    assert_eq!(p2sh_transfer.received_zat(), 10);
+    assert_eq!(p2sh_transfer.spent_zat(), 0);
+    let p2sh_coinbase = activity(p2sh_location, 1);
+    assert_eq!(
+        p2sh_coinbase.received_zat(),
+        u64::try_from(MAX_MONEY).expect("MAX_MONEY is non-negative"),
+    );
+    assert_eq!(p2sh_coinbase.spent_zat(), 0);
 }
 
 /// Address and holder counts represent addresses with spendable balances, rather than every

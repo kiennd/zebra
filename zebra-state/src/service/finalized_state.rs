@@ -29,7 +29,8 @@ use zebra_chain::{
 use zebra_db::{
     chain::BLOCK_INFO,
     transparent::{
-        BALANCE_BY_TRANSPARENT_ADDR, TRANSPARENT_ADDR_BY_BALANCE, TX_LOC_BY_SPENT_OUT_LOC,
+        BALANCE_BY_TRANSPARENT_ADDR, TRANSPARENT_ADDR_BY_BALANCE,
+        TRANSPARENT_TX_BALANCE_BY_ADDR_LOC, TX_LOC_BY_SPENT_OUT_LOC,
     },
     turnstile::{TURNSTILE_COHORTS, TURNSTILE_OUTPUTS},
 };
@@ -95,6 +96,7 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     "utxo_by_out_loc",
     "utxo_loc_by_transparent_addr_loc",
     TX_LOC_BY_SPENT_OUT_LOC,
+    TRANSPARENT_TX_BALANCE_BY_ADDR_LOC,
     TURNSTILE_OUTPUTS,
     TURNSTILE_COHORTS,
     // Sprout

@@ -59,6 +59,9 @@ pub const MAX_ON_DISK_OUTPUT_INDEX: OutputIndex =
 pub const OUTPUT_LOCATION_DISK_BYTES: usize =
     TRANSACTION_LOCATION_DISK_BYTES + OUTPUT_INDEX_DISK_BYTES;
 
+/// Per-address received and spent amounts are each stored as an 8 byte integer.
+pub const ADDRESS_TRANSACTION_BALANCE_DISK_BYTES: usize = 2 * BALANCE_DISK_BYTES;
+
 // Transparent types
 
 /// A transparent output's location in the chain, by block height and transaction index.
@@ -546,6 +549,36 @@ pub struct AddressTransaction {
     transaction_location: TransactionLocation,
 }
 
+/// The exact transparent value received and spent by one address in one transaction.
+///
+/// The address and transaction are identified by the [`AddressTransaction`] column-family key.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
+pub struct AddressTransactionBalance {
+    received_zat: u64,
+    spent_zat: u64,
+}
+
+impl AddressTransactionBalance {
+    /// Construct a complete per-address transaction balance record.
+    pub fn new(received_zat: u64, spent_zat: u64) -> Self {
+        Self {
+            received_zat,
+            spent_zat,
+        }
+    }
+
+    /// Returns the exact amount received by the address.
+    pub fn received_zat(&self) -> u64 {
+        self.received_zat
+    }
+
+    /// Returns the exact amount spent by the address.
+    pub fn spent_zat(&self) -> u64 {
+        self.spent_zat
+    }
+}
+
 impl AddressTransaction {
     /// Create a new [`AddressTransaction`] from an address location,
     /// and a transaction location.
@@ -957,6 +990,42 @@ impl FromDisk for AddressTransaction {
         let transaction_location = TransactionLocation::from_bytes(transaction_location_bytes);
 
         AddressTransaction::new(address_location, transaction_location)
+    }
+}
+
+impl IntoDisk for AddressTransactionBalance {
+    type Bytes = [u8; ADDRESS_TRANSACTION_BALANCE_DISK_BYTES];
+
+    fn as_bytes(&self) -> Self::Bytes {
+        let mut bytes = [0; ADDRESS_TRANSACTION_BALANCE_DISK_BYTES];
+        bytes[..BALANCE_DISK_BYTES].copy_from_slice(&self.received_zat.to_be_bytes());
+        bytes[BALANCE_DISK_BYTES..].copy_from_slice(&self.spent_zat.to_be_bytes());
+        bytes
+    }
+}
+
+impl FromDisk for AddressTransactionBalance {
+    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        let bytes = bytes.as_ref();
+        assert_eq!(
+            bytes.len(),
+            ADDRESS_TRANSACTION_BALANCE_DISK_BYTES,
+            "unexpected address transaction balance size"
+        );
+        let (received_zat, spent_zat) = bytes.split_at(BALANCE_DISK_BYTES);
+
+        Self::new(
+            u64::from_be_bytes(
+                received_zat
+                    .try_into()
+                    .expect("received amount has already been length checked"),
+            ),
+            u64::from_be_bytes(
+                spent_zat
+                    .try_into()
+                    .expect("spent amount has already been length checked"),
+            ),
+        )
     }
 }
 

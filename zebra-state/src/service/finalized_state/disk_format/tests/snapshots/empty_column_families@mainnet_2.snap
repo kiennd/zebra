@@ -12,5 +12,6 @@ expression: empty_column_families
   "sapling_nullifiers: no entries",
   "snapshot_data_by_date: no entries",
   "sprout_nullifiers: no entries",
+  "turnstile_outputs: no entries",
   "tx_loc_by_spent_out_loc: no entries",
 ]

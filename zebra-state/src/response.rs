@@ -88,6 +88,17 @@ pub struct ExplorerTransactionSummary {
     pub finalized: bool,
 }
 
+/// A transaction summary with exact activity for one transparent address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplorerAddressTransactionSummary {
+    /// The address-independent transaction summary.
+    pub transaction: ExplorerTransactionSummary,
+    /// Exact value received by the queried address, or `None` until a legacy row is backfilled.
+    pub received_zat: Option<u64>,
+    /// Exact value spent by the queried address, or `None` until a legacy row is backfilled.
+    pub spent_zat: Option<u64>,
+}
+
 /// A lightweight unspent transparent output summary for explorer address pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExplorerAddressUtxoSummary {
@@ -520,7 +531,7 @@ pub enum ReadResponse {
         /// The current finalized tip.
         finalized_tip: Option<(block::Height, block::Hash)>,
         /// Address transactions ordered newest-first by chain location.
-        transactions: Vec<ExplorerTransactionSummary>,
+        transactions: Vec<ExplorerAddressTransactionSummary>,
         /// Whether the supplied pagination boundary is still canonical.
         cursor_valid: bool,
     },
