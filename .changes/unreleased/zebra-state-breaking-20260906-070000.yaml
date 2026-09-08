@@ -1,4 +1,0 @@
-project: zebra-state
-kind: breaking
-body: 'State database format 31 adds complete finalized-chain indexes for eligible post-deshield transparent outputs, their first spends, and daily maturity cohorts. Existing format-30 state must be synced again because historical lifecycle facts cannot be populated by a bounded online migration.'
-time: 2026-09-06T07:00:00.000000000Z
