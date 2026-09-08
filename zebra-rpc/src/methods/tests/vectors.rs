@@ -1219,11 +1219,14 @@ async fn explorer_list_rpcs_forward_cursors_and_map_current_forks() {
         coinbase: false,
         transparent_input_count: 1,
         transparent_output_count: 2,
+        positive_transparent_output_count: 2,
         sprout_joinsplit_count: 0,
         sapling_spend_count: 3,
         sapling_output_count: 4,
         orchard_action_count: 5,
         ironwood_action_count: 0,
+        shielded_credit_zat: 7,
+        shielded_debit_zat: 11,
         finalized: true,
     };
     let rpc_clone = rpc.clone();
@@ -1260,7 +1263,13 @@ async fn explorer_list_rpcs_forward_cursors_and_map_current_forks() {
         transaction_hash.to_string()
     );
     assert_eq!(transactions.transactions[0].tx_index, 2);
+    assert_eq!(
+        transactions.transactions[0].positive_transparent_output_count,
+        2
+    );
     assert_eq!(transactions.transactions[0].sapling_output_count, 4);
+    assert_eq!(transactions.transactions[0].shielded_credit_zat, "7");
+    assert_eq!(transactions.transactions[0].shielded_debit_zat, "11");
 
     let address =
         zebra_chain::transparent::Address::from_pub_key_hash(NetworkKind::Mainnet, [0x42; 20]);

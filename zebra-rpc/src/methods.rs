@@ -5800,6 +5800,9 @@ pub struct ExplorerTransactionSummaryEntry {
     /// The number of transparent outputs.
     #[getter(copy)]
     pub transparent_output_count: u32,
+    /// The number of transparent outputs with a positive value.
+    #[getter(copy)]
+    pub positive_transparent_output_count: u32,
     /// The number of Sprout JoinSplit descriptions.
     #[getter(copy)]
     pub sprout_joinsplit_count: u32,
@@ -5815,6 +5818,10 @@ pub struct ExplorerTransactionSummaryEntry {
     /// The number of Ironwood actions.
     #[getter(copy)]
     pub ironwood_action_count: u32,
+    /// Gross public value entering shielded pools, encoded as decimal zatoshis.
+    pub shielded_credit_zat: String,
+    /// Gross public value leaving shielded pools, encoded as decimal zatoshis.
+    pub shielded_debit_zat: String,
     /// Whether the containing block is finalized.
     #[getter(copy)]
     pub finalized: bool,
@@ -5868,11 +5875,14 @@ impl From<zebra_state::ExplorerTransactionSummary> for ExplorerTransactionSummar
             coinbase: summary.coinbase,
             transparent_input_count: summary.transparent_input_count,
             transparent_output_count: summary.transparent_output_count,
+            positive_transparent_output_count: summary.positive_transparent_output_count,
             sprout_joinsplit_count: summary.sprout_joinsplit_count,
             sapling_spend_count: summary.sapling_spend_count,
             sapling_output_count: summary.sapling_output_count,
             orchard_action_count: summary.orchard_action_count,
             ironwood_action_count: summary.ironwood_action_count,
+            shielded_credit_zat: summary.shielded_credit_zat.to_string(),
+            shielded_debit_zat: summary.shielded_debit_zat.to_string(),
             finalized: summary.finalized,
         }
     }

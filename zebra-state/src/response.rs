@@ -74,6 +74,8 @@ pub struct ExplorerTransactionSummary {
     pub transparent_input_count: u32,
     /// The number of transparent outputs.
     pub transparent_output_count: u32,
+    /// The number of transparent outputs with a positive value.
+    pub positive_transparent_output_count: u32,
     /// The number of Sprout JoinSplit descriptions.
     pub sprout_joinsplit_count: u32,
     /// The number of Sapling spends.
@@ -84,6 +86,18 @@ pub struct ExplorerTransactionSummary {
     pub orchard_action_count: u32,
     /// The number of Ironwood actions.
     pub ironwood_action_count: u32,
+    /// Gross public value entering shielded pools, in zatoshis.
+    ///
+    /// This is the sum of Sprout `vpub_old` values and negative Sapling,
+    /// Orchard, and Ironwood value balances. It does not reveal individual
+    /// shielded note values or shielded-to-shielded transfer amounts.
+    pub shielded_credit_zat: u64,
+    /// Gross public value leaving shielded pools, in zatoshis.
+    ///
+    /// This is the sum of Sprout `vpub_new` values and positive Sapling,
+    /// Orchard, and Ironwood value balances. It does not reveal individual
+    /// shielded note values or shielded-to-shielded transfer amounts.
+    pub shielded_debit_zat: u64,
     /// Whether this transaction is already in finalized state.
     pub finalized: bool,
 }

@@ -964,6 +964,37 @@ fn explorer_transaction_summary(
         })
     };
 
+    let sum_non_negative = |values: Vec<i64>, field: &'static str| {
+        values.into_iter().fold(0u64, |total, value| {
+            let value = u64::try_from(value)
+                .unwrap_or_else(|_| panic!("{field} is a non-negative Zcash amount"));
+            total
+                .checked_add(value)
+                .unwrap_or_else(|| panic!("{field} total fits in u64"))
+        })
+    };
+
+    // These are gross public pool-boundary values, not hidden note values.
+    // Keeping credits and debits separate preserves cross-pool activity that
+    // would disappear if the balances were reduced to one net value.
+    let mut shielded_credit_zat = sum_non_negative(tx.output_values_to_sprout(), "Sprout credit");
+    let mut shielded_debit_zat = sum_non_negative(tx.input_values_from_sprout(), "Sprout debit");
+    for value_balance in [
+        tx.sapling_value_balance().sapling_amount().zatoshis(),
+        tx.orchard_value_balance().orchard_amount().zatoshis(),
+        tx.ironwood_value_balance().ironwood_amount().zatoshis(),
+    ] {
+        let magnitude = value_balance.unsigned_abs();
+        let total = if value_balance < 0 {
+            &mut shielded_credit_zat
+        } else {
+            &mut shielded_debit_zat
+        };
+        *total = total
+            .checked_add(magnitude)
+            .expect("gross shielded pool-boundary value fits in u64");
+    }
+
     ExplorerTransactionSummary {
         location,
         hash: tx.hash(),
@@ -974,11 +1005,20 @@ fn explorer_transaction_summary(
         coinbase: tx.is_coinbase(),
         transparent_input_count: count(tx.inputs().len(), "transparent input count"),
         transparent_output_count: count(tx.outputs().len(), "transparent output count"),
+        positive_transparent_output_count: count(
+            tx.outputs()
+                .iter()
+                .filter(|output| output.value().zatoshis() > 0)
+                .count(),
+            "positive transparent output count",
+        ),
         sprout_joinsplit_count: count(tx.joinsplit_count(), "Sprout JoinSplit count"),
         sapling_spend_count: count(tx.sapling_spends_count(), "Sapling spend count"),
         sapling_output_count: count(tx.sapling_outputs().count(), "Sapling output count"),
         orchard_action_count: count(tx.orchard_actions().count(), "Orchard action count"),
         ironwood_action_count: count(tx.ironwood_actions().count(), "Ironwood action count"),
+        shielded_credit_zat,
+        shielded_debit_zat,
         finalized,
     }
 }

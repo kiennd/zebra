@@ -397,6 +397,46 @@ async fn transaction_summary_pages_are_ordered_and_cursor_paginated() -> Result<
         assert_eq!(summary.size, tx.zcash_serialized_size() as u32);
         assert_eq!(summary.version, tx.version());
         assert_eq!(summary.coinbase, tx.is_coinbase());
+        assert_eq!(
+            summary.positive_transparent_output_count,
+            u32::try_from(
+                tx.outputs()
+                    .iter()
+                    .filter(|output| output.value().zatoshis() > 0)
+                    .count()
+            )
+            .expect("transparent output count is bounded by transaction bytes")
+        );
+        let expected_credit_zat = tx
+            .output_values_to_sprout()
+            .into_iter()
+            .map(|value| u64::try_from(value).unwrap())
+            .sum::<u64>()
+            + [
+                tx.sapling_value_balance().sapling_amount().zatoshis(),
+                tx.orchard_value_balance().orchard_amount().zatoshis(),
+                tx.ironwood_value_balance().ironwood_amount().zatoshis(),
+            ]
+            .into_iter()
+            .filter(|value| *value < 0)
+            .map(i64::unsigned_abs)
+            .sum::<u64>();
+        let expected_debit_zat = tx
+            .input_values_from_sprout()
+            .into_iter()
+            .map(|value| u64::try_from(value).unwrap())
+            .sum::<u64>()
+            + [
+                tx.sapling_value_balance().sapling_amount().zatoshis(),
+                tx.orchard_value_balance().orchard_amount().zatoshis(),
+                tx.ironwood_value_balance().ironwood_amount().zatoshis(),
+            ]
+            .into_iter()
+            .filter(|value| *value > 0)
+            .map(i64::unsigned_abs)
+            .sum::<u64>();
+        assert_eq!(summary.shielded_credit_zat, expected_credit_zat);
+        assert_eq!(summary.shielded_debit_zat, expected_debit_zat);
         assert!(summary.finalized);
     }
 
