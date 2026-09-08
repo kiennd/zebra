@@ -1,4 +1,0 @@
-project: zebra-state
-kind: breaking
-body: 'Finalized analytics snapshots now persist independent v6, Orchard, and Ironwood activity; exact observable Orchard-to-Ironwood crossings; and versioned ZIP-318 Draft public-shape stages and denomination counts. A fresh sync is required to populate complete historical observatory intervals.'
-time: 2026-09-06T11:00:00.000000000Z

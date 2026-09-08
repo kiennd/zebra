@@ -1,4 +1,0 @@
-project: zebra-rpc
-kind: Added
-body: 'The explorer-oriented `gettransactiontransparentio` RPC returns compact ordered transparent inputs and outputs, resolving historical spent prevouts with bounded and deduplicated lookups.'
-time: 2026-09-06T15:00:00.000000000Z

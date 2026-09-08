@@ -1,4 +1,0 @@
-project: zebra-rpc
-kind: Added
-body: 'Dashboard snapshot RPC entries expose independent Ironwood observatory counters, direct observable Orchard-to-Ironwood value, and versioned ZIP-318 Draft public-shape stages without inferring users or hidden shielded activity.'
-time: 2026-09-06T11:00:01.000000000Z
